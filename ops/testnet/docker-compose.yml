@@ -1,0 +1,121 @@
+# Canton x402 facilitator — TestNet overlay for co-resident deploy
+# on a Splice TestNet validator box.
+#
+# STRUCTURALLY IDENTICAL to ops/devnet/docker-compose.yml — the facilitator
+# is fully network-driven by env (CANTON_NETWORK, CANTON_SCAN_URL,
+# CANTON_SYNCHRONIZER_ID, OIDC_*). Nothing about the container changes
+# between DevNet and TestNet; only the values in .env do. This file exists
+# so the two deploys stay isolated (separate .env, separate folder) rather
+# than sharing one compose with a swapped env-file.
+#
+# DIFFERENCES from packages/facilitator/docker-compose.production.yml:
+#   - Image referenced by tag, not built. Built locally via
+#     scripts/build-deploy-image.sh, `docker save`d, shipped as a .tar.gz,
+#     and `docker load`ed on the box. The monorepo never lives on the box.
+#   - Joins the EXISTING external docker network
+#     `splice-validator_splice_validator` so the facilitator reaches the
+#     Splice participant by service name (`http://participant:7575`). The
+#     Splice compose project is untouched. (If the TestNet validator uses a
+#     different compose project name, update the external network name at
+#     the bottom of this file and CANTON_PARTICIPANT_URL in .env.)
+#   - 4022 bound on 127.0.0.1 only; Caddy on :443 is the public ingress.
+#   - JWT_ISSUER defaults to `oidc`; OIDC_* + LEDGER_API_AUDIENCE are
+#     validated at startup by packages/facilitator/src/config.ts so a
+#     missing var fails fast before the first ledger call.
+#   - CANTON_SCAN_FLAVOR defaults to `sv` (public SV Scan, no auth).
+#
+# Runbook: ops/testnet/MIGRATION.md.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: canton-x402-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-x402}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-x402}
+    volumes:
+      - ${POSTGRES_DATA_DIR:-./postgres-data}:/var/lib/postgresql/data
+    networks:
+      - x402-db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-x402}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  facilitator:
+    # Loaded onto the box via `docker load < canton-x402-facilitator-<sha>.tar.gz`.
+    # Tag is overridable via .env IMAGE_TAG for staged rollouts.
+    image: ${IMAGE_TAG:-canton-x402-facilitator:latest}
+    container_name: canton-x402-facilitator
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "4022"
+      # Required. Fail-fast if missing.
+      CANTON_NETWORK: ${CANTON_NETWORK:?missing CANTON_NETWORK}
+      CANTON_PARTICIPANT_URL: ${CANTON_PARTICIPANT_URL:?missing CANTON_PARTICIPANT_URL}
+      CANTON_FACILITATOR_PARTY: ${CANTON_FACILITATOR_PARTY:?missing CANTON_FACILITATOR_PARTY}
+      CANTON_SYNCHRONIZER_ID: ${CANTON_SYNCHRONIZER_ID:?missing CANTON_SYNCHRONIZER_ID}
+      CANTON_SCAN_URL: ${CANTON_SCAN_URL:?missing CANTON_SCAN_URL}
+      CANTON_SCAN_FLAVOR: ${CANTON_SCAN_FLAVOR:-sv}
+      DATABASE_URL: postgres://${POSTGRES_USER:-x402}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-x402}
+      # OIDC is the only safe issuer for a real participant. unsafe-hmac
+      # (with JWT_SECRET) is LocalNet-only and never appropriate here.
+      JWT_ISSUER: ${JWT_ISSUER:-oidc}
+      OIDC_TOKEN_ENDPOINT: ${OIDC_TOKEN_ENDPOINT:?missing OIDC_TOKEN_ENDPOINT (Auth0 /oauth/token)}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?missing OIDC_CLIENT_ID}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?missing OIDC_CLIENT_SECRET}
+      OIDC_SCOPE: ${OIDC_SCOPE:-daml_ledger_api}
+      LEDGER_API_AUDIENCE: ${LEDGER_API_AUDIENCE:?missing LEDGER_API_AUDIENCE}
+      CANTON_USER_ID: ${CANTON_USER_ID:-facilitator-deploy@clients}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Agent-wallet relay (skill). MUST be in this block to reach the container.
+      CANTON_X402_ENABLE_AGENT_WALLET: ${CANTON_X402_ENABLE_AGENT_WALLET:-false}
+    networks:
+      # Reach Postgres on the dedicated x402-db network.
+      x402-db: {}
+      # Join the EXISTING Splice external network so we can reach the
+      # participant by service name. Created by the splice-validator compose
+      # project — we just attach.
+      splice-validator:
+        aliases: [canton-x402-facilitator]
+    ports:
+      # 127.0.0.1-only: Caddy on :443 is the public ingress.
+      - "${FACILITATOR_BIND:-127.0.0.1}:4022:4022"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  # Private network for facilitator <-> Postgres traffic.
+  x402-db:
+    driver: bridge
+  # Reference the existing Splice network as external — `docker compose up`
+  # will NOT touch it (no create, no remove). If the TestNet validator's
+  # compose project is named differently, change `name` below to match
+  # `docker network ls | grep splice`.
+  splice-validator:
+    external: true
+    name: splice-validator_splice_validator
