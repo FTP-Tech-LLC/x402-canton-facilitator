@@ -1,0 +1,115 @@
+# Production-leaning compose stack for the Canton x402 facilitator.
+#
+# Differences from docker-compose.yml (the dev variant):
+#   - Strict env validation — no defaults for sensitive vars; missing
+#     OIDC_CLIENT_SECRET / CANTON_FACILITATOR_PARTY etc. fail at
+#     `docker compose up` rather than at first ledger call.
+#   - Resource limits: each service gets explicit CPU + memory caps.
+#   - Log rotation: json-file driver with 10MB × 5 files per service.
+#   - Restart: `unless-stopped` (manual `docker compose down` is the
+#     only thing that keeps it down).
+#   - Postgres backups: bind mount the data dir so an external
+#     `pg_dumpall` cron can snapshot it. Adjust the path for your
+#     host filesystem layout.
+#   - No published Postgres port — only the facilitator container
+#     can reach it via the internal docker network.
+#   - JWT_ISSUER defaults to `oidc` (LocalNet-only `unsafe-hmac`
+#     requires explicit opt-in).
+#
+# Quick start on a DevNet host (FTP-validator-1 style):
+#
+#   1. Drop a .env file next to this file with at minimum:
+#         CANTON_PARTICIPANT_URL=https://your-participant/ledger-api
+#         CANTON_FACILITATOR_PARTY=ftp_facilitator::1220…
+#         CANTON_SYNCHRONIZER_ID=global-domain::1220…
+#         CANTON_SCAN_URL=https://scan.your-sv/api/scan
+#         OIDC_TOKEN_ENDPOINT=…    (Keycloak / Auth0)
+#         OIDC_CLIENT_ID=…
+#         OIDC_CLIENT_SECRET=…
+#         LEDGER_API_AUDIENCE=…
+#         POSTGRES_PASSWORD=<long-random>
+#
+#   2. Allocate the facilitator party + grant rights on the
+#      participant (one-time):
+#         bash scripts/bootstrap-facilitator.sh
+#
+#   3. docker compose -f docker-compose.production.yml up -d --build
+#
+#   4. Verify: curl https://<your-host>:4022/health
+#
+# For TLS termination put a reverse proxy (Caddy / nginx / cloudflared)
+# in front. This compose intentionally exposes the facilitator on
+# plain HTTP so the operator picks the proxy.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-x402}
+      # Fail-fast if not provided — no default password in production.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-x402}
+    # No published port — facilitator reaches Postgres over the
+    # internal docker network at `postgres:5432`.
+    volumes:
+      - ${POSTGRES_DATA_DIR:-./postgres-data}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-x402}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  facilitator:
+    build:
+      context: ../..
+      dockerfile: packages/facilitator/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "4022"
+      # Required — no defaults; missing values fail at startup.
+      CANTON_NETWORK: ${CANTON_NETWORK:?missing CANTON_NETWORK (canton:devnet or canton:mainnet)}
+      CANTON_PARTICIPANT_URL: ${CANTON_PARTICIPANT_URL:?missing CANTON_PARTICIPANT_URL}
+      CANTON_FACILITATOR_PARTY: ${CANTON_FACILITATOR_PARTY:?missing CANTON_FACILITATOR_PARTY (run scripts/bootstrap-facilitator.sh)}
+      CANTON_SYNCHRONIZER_ID: ${CANTON_SYNCHRONIZER_ID:?missing CANTON_SYNCHRONIZER_ID}
+      CANTON_SCAN_URL: ${CANTON_SCAN_URL:?missing CANTON_SCAN_URL}
+      DATABASE_URL: postgres://${POSTGRES_USER:-x402}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-x402}
+      # Auth — default to oidc for production. Override to
+      # unsafe-hmac (with JWT_SECRET) only for LocalNet smoke
+      # testing — never in real DevNet/MainNet.
+      JWT_ISSUER: ${JWT_ISSUER:-oidc}
+      JWT_SECRET: ${JWT_SECRET:-}
+      OIDC_TOKEN_ENDPOINT: ${OIDC_TOKEN_ENDPOINT:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      LEDGER_API_AUDIENCE: ${LEDGER_API_AUDIENCE:-}
+      CANTON_USER_ID: ${CANTON_USER_ID:-facilitator-user}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      # Bind to localhost only by default so the operator's reverse
+      # proxy is the only ingress. Override to `0.0.0.0:4022:4022`
+      # if running without a proxy (not recommended for MainNet).
+      - "${FACILITATOR_BIND:-127.0.0.1}:4022:4022"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

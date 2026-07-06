@@ -1,0 +1,58 @@
+# Local-development compose stack for the Canton x402 facilitator.
+#
+# Brings up:
+#   - Postgres for merchant-registry mirror + per-payment audit log
+#   - The facilitator pointed at a CANTON_PARTICIPANT_URL and
+#     CANTON_SCAN_URL the operator supplies via .env (see
+#     `packages/facilitator/README.md`).
+#
+# For an end-to-end local demo with no real Canton participant, use
+# `examples/mock-facilitator.mjs` instead — see `docs/quickstart.md`.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: x402
+      POSTGRES_PASSWORD: x402
+      POSTGRES_DB: x402
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U x402"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  facilitator:
+    build:
+      context: ../..
+      dockerfile: packages/facilitator/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "4022"
+      CANTON_NETWORK: ${CANTON_NETWORK:-canton:devnet}
+      CANTON_PARTICIPANT_URL: ${CANTON_PARTICIPANT_URL}
+      CANTON_FACILITATOR_PARTY: ${CANTON_FACILITATOR_PARTY}
+      CANTON_SYNCHRONIZER_ID: ${CANTON_SYNCHRONIZER_ID}
+      CANTON_SCAN_URL: ${CANTON_SCAN_URL}
+      DATABASE_URL: postgres://x402:x402@postgres:5432/x402
+      JWT_ISSUER: ${JWT_ISSUER:-oidc}
+      JWT_SECRET: ${JWT_SECRET:-}
+      OIDC_TOKEN_ENDPOINT: ${OIDC_TOKEN_ENDPOINT:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      LEDGER_API_AUDIENCE: ${LEDGER_API_AUDIENCE:-}
+      CANTON_USER_ID: ${CANTON_USER_ID:-facilitator-user}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "4022:4022"
+
+volumes:
+  postgres-data:
