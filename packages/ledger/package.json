@@ -1,0 +1,48 @@
+{
+  "name": "@ftptech/x402-canton-ledger",
+  "version": "0.1.1",
+  "description": "Shared Canton ledger primitives — JSON Ledger API v2 client, Ed25519 external-party signing, Scan API client. Used by @ftptech/x402-canton-facilitator and @ftptech/x402-canton-client.",
+  "license": "Apache-2.0",
+  "author": "FTP team",
+  "homepage": "https://github.com/sunstrike228/canton-x402#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sunstrike228/canton-x402.git",
+    "directory": "packages/ledger"
+  },
+  "bugs": {
+    "url": "https://github.com/sunstrike228/canton-x402/issues"
+  },
+  "keywords": [
+    "x402",
+    "canton",
+    "canton-network",
+    "daml",
+    "json-ledger-api",
+    "splice"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "lint": "eslint src --max-warnings 0"
+  },
+  "dependencies": {},
+  "publishConfig": {
+    "access": "public"
+  }
+}
