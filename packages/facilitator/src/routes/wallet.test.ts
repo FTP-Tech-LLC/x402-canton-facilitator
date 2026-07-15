@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import Fastify from "fastify";
 import { registerWalletRoutes, type WalletRelayServices } from "./wallet.js";
+import { UnfundedFeePartyError } from "../canton/preapproval.js";
 import {
   createInMemoryFaucetStore,
   type FaucetClaimStore,
@@ -50,6 +51,29 @@ async function build(s: WalletRelayServices) {
 const pk = { publicKey: { format: "f", keyData: "k", keySpec: "s" }, partyHint: "agent" };
 
 describe("wallet relay routes", () => {
+  it("preapproval/self/prepare with an unfunded merchant → 409 merchant_unfunded, not 502", async () => {
+    const a = await build(
+      svc({
+        selfPreapproval: {
+          prepareSelfPreapproval: vi
+            .fn()
+            .mockRejectedValue(new UnfundedFeePartyError("merchant::1220aabbcc")),
+        } as never,
+      })
+    );
+    const r = await a.inject({
+      method: "POST",
+      url: "/v1/wallet/preapproval/self/prepare",
+      payload: { party: "merchant::1220aabbcc" },
+    });
+    expect(r.statusCode).toBe(409);
+    const body = r.json() as { error: string; party: string; detail: string };
+    expect(body.error).toBe("merchant_unfunded");
+    expect(body.party).toBe("merchant::1220aabbcc");
+    expect(body.detail).toContain("merchant::1220aabbcc");
+    await a.close();
+  });
+
   it("flag OFF → routes are not registered (404)", async () => {
     const a = await build(svc({ enableAgentWallet: false }));
     const r = await a.inject({ method: "POST", url: "/v1/wallet/onboard/prepare", payload: pk });
@@ -267,6 +291,106 @@ describe("wallet relay faucet route (POST /v1/wallet/faucet/claim)", () => {
       method: "POST",
       url: "/v1/wallet/faucet/claim",
       payload: { party: "agent_42::1220cafebabe1234567890abcdef" },
+    });
+    expect(r.statusCode).toBe(200);
+    await a.close();
+  });
+
+  it("global burst cap: throttles a flood (claims/window) across all callers, then 429", async () => {
+    stubScanFetch();
+    const store = createInMemoryFaucetStore();
+    // Cap = 2 claims per (long) window; the 3rd fresh-party claim is throttled.
+    const a = await build(
+      faucetSvc({
+        faucet: faucetConf({
+          store,
+          maxPerIp: 0, // isolate the GLOBAL cap
+          maxGlobalPerMin: 2,
+          burstWindowMs: 60_000,
+        }),
+      })
+    );
+    const claim = (n: number) =>
+      a.inject({
+        method: "POST",
+        url: "/v1/wallet/faucet/claim",
+        payload: { party: `agent_${n}::1220cafe1234` },
+      });
+    expect((await claim(1)).statusCode).toBe(200);
+    expect((await claim(2)).statusCode).toBe(200);
+    const third = await claim(3);
+    expect(third.statusCode).toBe(429);
+    expect(third.json().error).toMatch(/global burst/);
+    await a.close();
+  });
+
+  it("ipExempt: the pay-proxy IP bypasses the per-IP + global-burst caps", async () => {
+    stubScanFetch();
+    // Cap everything to 1, but exempt 127.0.0.1 (the inject client's IP) → the
+    // exempt caller sails past both caps.
+    const a = await build(
+      faucetSvc({
+        faucet: faucetConf({
+          maxPerIp: 1,
+          maxGlobalPerMin: 1,
+          ipExempt: ["127.0.0.1"],
+        }),
+      })
+    );
+    for (let n = 0; n < 3; n++) {
+      const r = await a.inject({
+        method: "POST",
+        url: "/v1/wallet/faucet/claim",
+        payload: { party: `agent_${n}::1220cafe1234` },
+      });
+      expect(r.statusCode, `claim ${n}`).toBe(200);
+    }
+    await a.close();
+  });
+
+  it("internal-secret lock: 403 without (or with a wrong) X-Faucet-Secret", async () => {
+    const store = createInMemoryFaucetStore();
+    const submit = vi
+      .fn()
+      .mockResolvedValue({ updateId: "u-faucet", offset: 1, events: [] });
+    const a = await build(
+      faucetSvc({
+        client: mockClient({ submitAndWaitForTransaction: submit }) as never,
+        faucet: faucetConf({ store, internalSecret: "pay-proxy-shared-secret" }),
+      })
+    );
+    // No header → 403, and nothing touched the store/ledger.
+    const noHdr = await a.inject({
+      method: "POST",
+      url: "/v1/wallet/faucet/claim",
+      payload: { party: "agent::1220cafe1234" },
+    });
+    expect(noHdr.statusCode).toBe(403);
+    // Wrong secret → 403.
+    const wrong = await a.inject({
+      method: "POST",
+      url: "/v1/wallet/faucet/claim",
+      headers: { "x-faucet-secret": "nope" },
+      payload: { party: "agent::1220cafe1234" },
+    });
+    expect(wrong.statusCode).toBe(403);
+    expect(await store.hasClaimed("agent::1220cafe1234")).toBe(false);
+    expect(submit).not.toHaveBeenCalled();
+    await a.close();
+  });
+
+  it("internal-secret lock: 200 with the correct X-Faucet-Secret", async () => {
+    stubScanFetch();
+    const a = await build(
+      faucetSvc({
+        faucet: faucetConf({ internalSecret: "pay-proxy-shared-secret" }),
+      })
+    );
+    const r = await a.inject({
+      method: "POST",
+      url: "/v1/wallet/faucet/claim",
+      headers: { "x-faucet-secret": "pay-proxy-shared-secret" },
+      payload: { party: "agent::1220cafe1234" },
     });
     expect(r.statusCode).toBe(200);
     await a.close();
