@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   PreapprovalService,
+  UnfundedFeePartyError,
   type PreapprovalServiceDeps,
 } from "./preapproval.js";
 
@@ -156,14 +157,40 @@ describe("PreapprovalService.createTransferPreapproval", () => {
     ).toEqual([{ tag: "InputAmulet", value: "00big" }]);
   });
 
-  it("throws when the facilitator has no Amulet holdings for the fee", async () => {
+  it("throws UnfundedFeePartyError naming the FACILITATOR when it has no Amulet for the fee", async () => {
     const { svc } = makeService(ROUNDS, undefined, []);
-    await expect(
-      svc.createTransferPreapproval({
+    const err = await svc
+      .createTransferPreapproval({
         merchant: "merchant::1220m",
         expiresAt: "2026-09-01T00:00:00Z",
       })
-    ).rejects.toThrow(/no Amulet holdings/);
+      .then(
+        () => null,
+        (e: unknown) => e as UnfundedFeePartyError
+      );
+    expect(err).toBeInstanceOf(UnfundedFeePartyError);
+    expect(err!.party).toBe("ftp_facilitator::1220fff");
+    expect(err!.message).toContain("ftp_facilitator::1220fff");
+  });
+
+  it("SELF path: an unfunded MERCHANT names the merchant party, never the facilitator", async () => {
+    // Regression for a live reviewer report: the old hardcoded message blamed
+    // "the facilitator" when the MERCHANT wallet was the empty one, sending the
+    // integrator to debug the wrong side.
+    const { svc } = makeService(ROUNDS, undefined, []);
+    const err = await svc
+      .prepareSelfPreapproval({
+        party: "merchant::1220aabbcc",
+        expiresAt: "2026-09-01T00:00:00Z",
+      })
+      .then(
+        () => null,
+        (e: unknown) => e as UnfundedFeePartyError
+      );
+    expect(err).toBeInstanceOf(UnfundedFeePartyError);
+    expect(err!.party).toBe("merchant::1220aabbcc");
+    expect(err!.message).toContain("merchant::1220aabbcc");
+    expect(err!.message).not.toContain("facilitator");
   });
 
   it("throws when no open mining round is available", async () => {
