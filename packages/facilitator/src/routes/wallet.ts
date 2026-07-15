@@ -19,11 +19,20 @@ import type {
   InteractivePrepareBody,
   InteractiveExecuteBody,
 } from "@ftptech/x402-canton-ledger";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createSlidingWindowLimiter } from "../rate-limit.js";
 import { FaucetService } from "../canton/faucet.js";
+import { UnfundedFeePartyError } from "../canton/preapproval.js";
 import type { FaucetClaimStore } from "../db/faucet-store.js";
 import type { TfStashStore } from "../db/stash-store.js";
+
+/** Constant-time string equality (length-checked first, then timingSafeEqual on
+ *  equal-length buffers). Mirrors the attribution/registry token checks. */
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  return ab.length === bb.length && timingSafeEqual(ab, bb);
+}
 
 export interface WalletRelayServices {
   /** SELF-PROVIDER preapproval (the merchant provisions its OWN
@@ -109,6 +118,22 @@ export interface WalletRelayServices {
          *  the party-once + daily-budget checks in `store.tryClaim`. */
         lifetimeCapCc: string;
         windowMs: number;
+        /** When set, the faucet route requires header `X-Faucet-Secret: <value>`
+         *  (constant-time compare) and 403s otherwise. This locks the raw faucet
+         *  to trusted internal callers (the pay-proxy, which sets the header) so
+         *  the public internet cannot curl it directly — the ONLY way to trigger
+         *  a grant becomes the quest flow. Independent of `agentWalletApiKey`
+         *  (which would gate the public self-custody onboard routes too, so it is
+         *  left unset in prod). Unset here → no faucet-secret gate (dev/back-compat). */
+        internalSecret?: string | undefined;
+        /** Global burst cap: max claims per `burstWindowMs` across all non-exempt
+         *  callers (IP-independent). `0`/undefined disables it. */
+        maxGlobalPerMin?: number | undefined;
+        /** Window (ms) for the global burst cap. Default 60000. */
+        burstWindowMs?: number | undefined;
+        /** IPs exempt from the per-IP + global-burst caps (trusted internal
+         *  callers, e.g. the pay-proxy). per-party-once + budget still apply. */
+        ipExempt?: readonly string[] | undefined;
       }
     | undefined;
   /** transfer-factory ("V3") relay-pay surface. undefined → POST
@@ -208,6 +233,14 @@ export async function registerWalletRoutes(
         });
         return reply.send({ ...p, party, expiresAt });
       } catch (err) {
+        // An unfunded merchant is a caller-fixable state, not a relay fault:
+        // 409 + the party that must be funded, so integrators don't read it as
+        // a facilitator outage (live report: a reviewer did exactly that).
+        if (err instanceof UnfundedFeePartyError) {
+          return reply
+            .code(409)
+            .send({ error: "merchant_unfunded", party: err.party, detail: err.message });
+        }
         return relayError(reply, "preapproval/self/prepare", err);
       }
     }
@@ -885,6 +918,15 @@ export async function registerWalletRoutes(
     maxGlobal: 0,
     windowMs: faucetCfg?.windowMs ?? 86_400_000,
   });
+  // SEPARATE short-window limiter for the GLOBAL burst cap: the daily budget
+  // bounds the 24h total but not a fast flood, so this throttles claims/minute
+  // across ALL non-exempt callers (one shared bucket → IP-independent, so it
+  // holds even when abusers rotate IPs or legit callers share one).
+  const faucetBurstLimiter = createSlidingWindowLimiter({
+    maxPerPayer: 0,
+    maxGlobal: 0,
+    windowMs: faucetCfg?.burstWindowMs ?? 60_000,
+  });
 
   app.post<{ Body: { party?: string } }>(
     "/v1/wallet/faucet/claim",
@@ -892,6 +934,20 @@ export async function registerWalletRoutes(
       if (!authed(req, reply)) return;
       if (!faucetCfg || !faucetSvc) {
         return reply.code(503).send({ error: "faucet disabled" });
+      }
+      // Internal-caller lock: when an internalSecret is configured the raw faucet
+      // is NOT public — the caller must present the matching X-Faucet-Secret. This
+      // makes the quest flow (pay-proxy, which sets the header) the ONLY way to
+      // trigger a grant; a direct public curl is 403. Constant-time compare so a
+      // wrong secret leaks no timing signal. Unset → no gate (dev/back-compat).
+      if (faucetCfg.internalSecret) {
+        const presented = req.headers["x-faucet-secret"];
+        if (
+          typeof presented !== "string" ||
+          !timingSafeEqualStr(presented, faucetCfg.internalSecret)
+        ) {
+          return reply.code(403).send({ error: "faucet is internal-only" });
+        }
       }
       const party = req.body?.party?.trim();
       if (!party) return reply.code(400).send({ error: "party is required" });
@@ -911,8 +967,30 @@ export async function registerWalletRoutes(
             .code(429)
             .send({ error: "faucet already claimed for this party" });
         }
-        // 2. Per-IP cap (in-process). `<=0` disables it.
+        // Trusted internal callers (the pay-proxy, which self-limits: the quest
+        // funds only in STEP 2 after a real payment and is bounded by its own
+        // budget) are EXEMPT from the per-IP + global-burst caps. per-party-once +
+        // the daily budget still apply to them.
+        const exempt = faucetCfg.ipExempt?.includes(req.ip) ?? false;
+        // 2a. GLOBAL burst cap (IP-independent) — throttles a fast flood so nobody
+        //     can hammer the public faucet, even by rotating IPs. Low-rate legit
+        //     callers (a dev running auto_fund once) never hit it.
         if (
+          !exempt &&
+          faucetCfg.maxGlobalPerMin !== undefined &&
+          faucetCfg.maxGlobalPerMin > 0 &&
+          !faucetBurstLimiter.allowKeys(
+            [{ key: "faucet:global", max: faucetCfg.maxGlobalPerMin }],
+            now
+          )
+        ) {
+          return reply
+            .code(429)
+            .send({ error: "faucet rate limit (global burst)" });
+        }
+        // 2b. Per-IP cap (in-process). `<=0` disables it.
+        if (
+          !exempt &&
           faucetCfg.maxPerIp > 0 &&
           !faucetLimiter.allowKeys(
             [{ key: `faucet:ip:${req.ip}`, max: faucetCfg.maxPerIp }],
@@ -1064,6 +1142,7 @@ export async function registerWalletRoutes(
       receiver?: string;
       amount?: string;
       executeBeforeSeconds?: number;
+      memo?: unknown;
     };
   }>("/v1/wallet/pay/prepare", async (req, reply) => {
     if (!authed(req, reply)) return;
@@ -1088,6 +1167,24 @@ export async function registerWalletRoutes(
       return reply
         .code(400)
         .send({ error: "amount must be a positive Daml Decimal string" });
+    }
+    // Optional merchant memo (PaymentRequirements.extra.memo): when present it
+    // MUST be a non-empty string of at most 512 chars. It is stamped into the
+    // transfer's `x402.memo` meta + recorded in the stash so /verify can enforce
+    // it against the merchant's requirement.
+    const rawMemo = req.body?.memo;
+    let memo: string | undefined;
+    if (rawMemo !== undefined) {
+      if (typeof rawMemo !== "string") {
+        return reply.code(400).send({ error: "memo must be a string" });
+      }
+      const trimmed = rawMemo.trim();
+      if (trimmed.length === 0 || trimmed.length > 512) {
+        return reply.code(400).send({
+          error: "memo must be a non-empty string of at most 512 chars",
+        });
+      }
+      memo = trimmed;
     }
     const requested = Number(req.body?.executeBeforeSeconds);
     const ebSeconds =
@@ -1120,7 +1217,11 @@ export async function registerWalletRoutes(
         requestedAt: new Date(now - 1000).toISOString(),
         executeBefore,
         inputHoldingCids: cids,
-        meta: { values: {} as Record<string, string> },
+        meta: {
+          values: {
+            ...(memo !== undefined ? { "x402.memo": memo } : {}),
+          } as Record<string, string>,
+        },
       };
       // Registry resolve with the REAL transfer (inputs included) — the same
       // envelope the faucet + e2e/fund.mjs use.
@@ -1181,6 +1282,7 @@ export async function registerWalletRoutes(
         executeBefore,
         txHash: prepared.preparedTransactionHash,
         preparedTx: prepared.preparedTransaction,
+        ...(memo !== undefined ? { memo } : {}),
       });
       return reply.send({
         submissionRef,
