@@ -382,10 +382,22 @@ export class PreapprovalService {
       if (total >= FEE_INPUT_TARGET_CC) break;
     }
     if (inputs.length === 0) {
-      throw new Error(
-        "facilitator has no Amulet holdings to fund the preapproval fee"
-      );
+      throw new UnfundedFeePartyError(party);
     }
     return inputs;
+  }
+}
+
+/** The fee-funding party holds no Amulet. On the SELF path that party is the
+ *  MERCHANT (it pays its own preapproval fee); on the facilitator-provider path
+ *  it is the facilitator. Named so routes can map it to an actionable 4xx
+ *  instead of a generic 502 — the fix is always "fund `party`, then retry". */
+export class UnfundedFeePartyError extends Error {
+  constructor(readonly party: string) {
+    super(
+      `party ${party} holds no Amulet to fund the preapproval fee — ` +
+        `the fee is paid from this wallet; transfer a few CC to it and retry`
+    );
+    this.name = "UnfundedFeePartyError";
   }
 }
