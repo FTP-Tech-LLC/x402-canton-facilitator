@@ -298,3 +298,40 @@ describe("createAttributionStore factory", () => {
     expect(calls.some((c) => String(c[0]).startsWith("INSERT"))).toBe(true);
   });
 });
+
+describe("AttributionStore.record — the row must be fetchable the moment it exists", () => {
+  it("INSERTs settle_status='served' rather than relying on a follow-up UPDATE", async () => {
+    // The invariant, in one statement. `getPending` only ever selects
+    // settle_status='served', so a row left on the schema default 'attempted'
+    // — an insert that succeeded followed by an UPDATE that did not — is
+    // invisible to the traffic-bytes fetcher for good: the payment settled,
+    // we burned Global Synchronizer traffic for it, and no report can account
+    // for those bytes. There is no second statement to lose any more.
+    const exec = makeExecSeq([]);
+    const store = createPostgresAttributionStore(exec);
+    await store.record({
+      updateId: "1220ab",
+      payerParty: "agent::1220",
+      merchantParty: "merchant::1220",
+      amountAtomic: "100000000",
+      network: "canton:mainnet",
+    });
+    const calls = (exec.query as ReturnType<typeof vi.fn>).mock.calls;
+    const insert = calls[2][0] as string;
+    expect(insert).toContain("INSERT INTO payment_burns");
+    expect(insert).toContain("'served'");
+    // and nothing else runs: no UPDATE to tear away from
+    expect(calls).toHaveLength(3); // 2 DDL + the insert
+  });
+
+  it("has no markServed/getAttempted left to call", () => {
+    // The repair worker that was supposed to rescue an 'attempted' row looked
+    // it up in the CONSUMED-payments store by updateId. Different namespaces —
+    // consumed keys are the payment-identity hash, update ids are the ledger's
+    // `1220…` — so the lookup could only ever return false. Removed rather
+    // than left standing as a safety net that never caught anything.
+    const store = createPostgresAttributionStore(makeExec([]));
+    expect((store as Record<string, unknown>)["markServed"]).toBeUndefined();
+    expect((store as Record<string, unknown>)["getAttempted"]).toBeUndefined();
+  });
+});

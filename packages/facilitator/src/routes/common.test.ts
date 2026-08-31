@@ -118,6 +118,28 @@ describe("runValidation — method-agnostic guards (network + discriminator)", (
     if (!out.ok) expect(out.reason).toBe("unexpected_canton_ledger_error");
   });
 
+  it("answers the legacy carriage with a VERDICT, not an error — the upgrade message must reach the integrator", async () => {
+    // A payload carrying submissionRef is a working client of the older shape,
+    // so this repo's own conformance contract (e2e/conformance.sh) requires
+    //   /verify -> 200 + isValid:false + a discriminated invalidReason
+    //   /settle -> 200 + success:false + a matching errorReason
+    // A 400 would also bury the message: the shipped middlewares turn any
+    // non-2xx into a generic facilitator failure, so the party who needs to
+    // hear "upgrade your client" is the least likely to see it.
+    const body = tfBody();
+    // Match the body's network: the network guard runs first, and this test is
+    // about the carriage, not the network.
+    const deps = {
+      facilitatorParty: FACILITATOR,
+      network: body.paymentRequirements.network,
+    } as unknown as ValidationServices;
+    (body.paymentPayload.payload as { submissionRef?: string }).submissionRef =
+      "8f14e45f-ceea-467f-9c1d-1a2b3c4d5e6f";
+    const out = await runValidation(body, deps, NOW);
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.reason).toBe("invalid_exact_canton_missing_proof");
+  });
+
   it("rejects a discriminator mismatch between payload + requirements (operator misconfig)", async () => {
     // payload.assetTransferMethod must match requirements.extra.assetTransferMethod;
     // a mismatch is merchant-side misconfiguration and is rejected before dispatch.

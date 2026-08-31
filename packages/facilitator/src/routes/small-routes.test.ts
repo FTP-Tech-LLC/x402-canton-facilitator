@@ -102,6 +102,40 @@ describe("GET /health", () => {
   });
 });
 
+describe("GET /supported tells a client what it can actually use", () => {
+  // Both facts below were previously discoverable only by reading our source:
+  // a client had no way to learn that the inline carriage exists here, or which
+  // non-Amulet instruments this deployment settles. Advertising them is what
+  // turns "works if you know" into "works if you look".
+  it("names the carriages, so inline is discoverable rather than folklore", async () => {
+    const app = Fastify();
+    await registerSupportedRoute(app, dummyConfig());
+    const r = await app.inject({ method: "GET", url: "/supported" });
+    const extra = (r.json() as SupportedResponse).kinds[0]!.extra as {
+      carriages?: string[];
+    };
+    expect(extra.carriages).toContain("inline");
+    expect(extra.carriages).not.toContain("stash");
+  });
+
+  it("names the configured registry instruments, and nothing when there are none", async () => {
+    const bare = Fastify();
+    await registerSupportedRoute(bare, dummyConfig());
+    const noneExtra = ((await bare.inject({ method: "GET", url: "/supported" })).json() as SupportedResponse)
+      .kinds[0]!.extra as { instruments?: Array<{ admin: string }> };
+    expect(noneExtra.instruments).toEqual([]);
+
+    const app = Fastify();
+    await registerSupportedRoute(app, {
+      ...dummyConfig(),
+      tokenRegistries: { "usdcx-admin::1220": "https://registry.example" },
+    } as never);
+    const extra = ((await app.inject({ method: "GET", url: "/supported" })).json() as SupportedResponse)
+      .kinds[0]!.extra as { instruments?: Array<{ admin: string }> };
+    expect(extra.instruments).toEqual([{ admin: "usdcx-admin::1220" }]);
+  });
+});
+
 describe("GET /supported", () => {
   it("returns exactly ONE v2 'exact' kind for the configured network", async () => {
     const app = Fastify();

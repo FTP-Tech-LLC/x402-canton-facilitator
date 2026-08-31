@@ -24,12 +24,27 @@ import type { MarkerStore } from "../db/marker-store.js";
 
 const TICK_INTERVAL_MS = 60_000;
 const TRAFFIC_PRICE_USD_PER_MB = 60;
-// No free-tier deduction in total-traffic mode: `total_consumed` counts only
-// PURCHASED traffic (the free base rate is not billed against it — consumed never
-// exceeds total_purchased), and the node's built-in FA emission already claims
-// that free base, which is NOT in this metric. So the whole per-round delta is
-// paid overage and fully markable; subtracting a free tier would discard real
-// paid bytes with no double-count to prevent.
+
+/**
+ * The floor the DAML choice enforces, quoted from the participant's own
+ * rejection rather than inferred:
+ *
+ *   "The requirement 'Weight >= 1.0' was not met."
+ *
+ * A constant, not config: it is the ledger's rule, not our policy. If the DAML
+ * ever changes it, this number is wrong and the symptom is the same HTTP 400 —
+ * which is why the log line above prints the floor it applied.
+ */
+const MIN_LEDGER_WEIGHT = 1.0;
+// `total_consumed` counts only PURCHASED traffic — the free base rate is not
+// billed against it (consumed never exceeds total_purchased). Whether the free
+// base ALSO needs claiming here depends on the node: if the node's own built-in
+// FA emission for the free base is off, claiming it here recovers it; if that
+// emission is on, claiming it here DOUBLE-counts and over-emits markers. Only
+// the node operator can see which, so this is an env knob
+// (`CANTON_X402_MARKER_FREE_BYTES_PER_ROUND`) and NOT a constant — it defaults
+// to 0 (claim nothing extra, the fail-safe direction) and is re-tunable with a
+// restart and no image rebuild, exactly like markerWeightMultiplier.
 
 export interface PaidMarkerWorkerServices {
   markerStore: MarkerStore;
@@ -47,6 +62,11 @@ export interface PaidMarkerWorkerServices {
   /** Hard per-round weight ceiling (USD). Clamps abuse/anomaly spikes so a single
    *  round can never be amplified into an FA overuse-cap breach / revocation. */
   maxWeightPerRound: number;
+  /** Per-round free-base traffic grant (bytes) added to the paid delta before
+   *  pricing (`CANTON_X402_MARKER_FREE_BYTES_PER_ROUND`). 0 = claim nothing
+   *  extra; set it ONLY when the node's own free-base FA emission is off, or
+   *  markers double-count. See the note at the top of this file. */
+  freeBytesPerRound: number;
 }
 
 type Logger = Pick<FastifyBaseLogger, "info" | "warn" | "error">;
@@ -77,6 +97,7 @@ export async function processRound(
     markerWeightMultiplier,
     facilitatorMemberId,
     maxWeightPerRound,
+    freeBytesPerRound,
   } = services;
 
   const prevRow = await store.getPrevRound(targetRound);
@@ -89,15 +110,42 @@ export async function processRound(
     return;
   }
 
-  // Read the validator's cumulative GS traffic. On a Scan failure, skip the round
-  // (the row stays pending → retried next tick); NEVER emit a wrong weight.
+  // The right edge of THIS round's traffic window.
+  //
+  // On a RETRY, reuse the snapshot the first attempt already recorded. A fresh
+  // live read would be a reading of NOW, and a retry happens in a later round —
+  // so the round's window would silently stretch forward over traffic the
+  // rounds in between have already claimed.
+  //
+  // That is not hypothetical, it is the order processAllRounds runs in: the
+  // CURRENT round is processed first, and only then are pending/failed rows up
+  // to three rounds back retried. Measured on the deterministic simulation:
+  // round 100 fails at 1.6 MB, round 101 emits 1.6 -> 2.2 MB (weight 41.4),
+  // then round 100 is retried off a live read and priced 1.0 -> 2.2 MB —
+  // weight 82.8, exactly double its true 41.4, with the extra being precisely
+  // what round 101 had just claimed. Two markers, one lot of bytes. The
+  // per-round clamp cannot see it because each marker is separately under the
+  // cap, and over-claiming is the direction that risks the Featured-App
+  // overuse cap and the right being revoked.
+  //
+  // The failure path stores traffic_consumed precisely so this is possible: the
+  // number was true when it was read, and a round's window does not move.
   let consumed: number;
-  try {
-    const trafficStatus = await scan.getTrafficStatus(synchronizerId, facilitatorMemberId);
-    consumed = trafficStatus.traffic_status.actual.total_consumed;
-  } catch (err) {
-    log.warn({ targetRound, err }, "marker_worker: traffic-status read failed — skipping round");
-    return;
+  const recorded = row.traffic_consumed;
+  if (recorded !== null && recorded !== undefined) {
+    consumed = Number(recorded);
+    log.info(
+      { targetRound, consumed },
+      "marker_worker: retry — pricing from the snapshot this round recorded, not a live read"
+    );
+  } else {
+    try {
+      const trafficStatus = await scan.getTrafficStatus(synchronizerId, facilitatorMemberId);
+      consumed = trafficStatus.traffic_status.actual.total_consumed;
+    } catch (err) {
+      log.warn({ targetRound, err }, "marker_worker: traffic-status read failed — skipping round");
+      return;
+    }
   }
   const consumedBig = BigInt(Math.trunc(consumed));
 
@@ -131,8 +179,12 @@ export async function processRound(
   }
 
   const totalBytesBig = BigInt(Math.trunc(deltaBytes));
-  // Whole delta is paid overage (see constants above) — no free-tier deduction.
-  const rawUsd = (deltaBytes / 1_000_000) * TRAFFIC_PRICE_USD_PER_MB * markerWeightMultiplier;
+  // Weight = paid delta PLUS the configured per-round free-base grant (see the
+  // note at the top of this file). At the default 0 the weight is exactly the
+  // purchased delta. traffic_bytes always stays the REAL purchased delta; only
+  // the priced weight can include the grant.
+  const markableBytes = deltaBytes + freeBytesPerRound;
+  const rawUsd = (markableBytes / 1_000_000) * TRAFFIC_PRICE_USD_PER_MB * markerWeightMultiplier;
   // Clamp to the hard per-round ceiling — an abuse/anomaly spike is capped here,
   // never amplified into an FA overuse-cap breach.
   const totalUsd = Math.min(rawUsd, maxWeightPerRound);
@@ -150,6 +202,45 @@ export async function processRound(
       traffic_usd: "0",
     });
     log.info({ targetRound }, "marker_worker: round skipped (no new traffic this round)");
+    return;
+  }
+
+  // THE LEDGER HAS A FLOOR AND THIS GUARD DID NOT KNOW IT.
+  //
+  // The guard above tests `<= 0`, but the DAML choice asserts `Weight >= 1.0`
+  // and says so in its own words on rejection:
+  //
+  //   DAML_FAILURE ... UNHANDLED_EXCEPTION/DA.Exception.AssertionFailed:
+  //   "The requirement 'Weight >= 1.0' was not met."
+  //
+  // So every round priced in (0, 1) was submitted, refused with HTTP 400,
+  // retried once a minute until the round moved on, and finally recorded
+  // `expired`. Measured on the live table: 5,822 rounds have emitted and the
+  // SMALLEST weight among them is 1.0000620000 — not once below the floor —
+  // while 207 rounds died this way. It bites harder as traffic per round falls,
+  // which is why the rate rose when the average round dropped from ~207 KB to
+  // ~41 KB.
+  //
+  // The bytes are NOT discarded. The checkpoint is deliberately left where the
+  // previous round put it, so this round's traffic rolls into the next one and
+  // is claimed there once the accumulated weight clears the floor. Advancing it
+  // (what the zero-delta skip above correctly does, because there is nothing to
+  // carry) would silently throw away real purchased traffic.
+  //
+  // This cannot double-count: nothing is emitted for a carried round, so no
+  // marker claims those bytes until one marker claims them all, exactly once.
+  if (totalUsd < MIN_LEDGER_WEIGHT) {
+    await store.updateStatus(targetRound, "skipped", {
+      traffic_bytes: totalBytesBig,
+      // NOT consumedBig — carry the previous edge forward.
+      traffic_consumed: BigInt(Number(prevRow.traffic_consumed)),
+      traffic_usd: totalUsd.toFixed(10),
+    });
+    log.info(
+      { targetRound, weight: totalUsd.toFixed(4), floor: MIN_LEDGER_WEIGHT },
+      "marker_worker: below the ledger's Weight >= 1.0 floor — carried into the next round " +
+        "instead of submitting a marker the participant would refuse"
+    );
     return;
   }
 
@@ -241,37 +332,58 @@ export function startPaidMarkerWorker(
   const log = app.log;
   log.info("marker_worker: starting (interval=60s)");
 
-  // Resolve featuredAppRightCid + synchronizerId once at startup.
-  // Both are stable across rounds; no need to re-fetch per tick.
-  Promise.all([
-    services.scan.getFeaturedAppRight(services.markerFtpParty),
-    services.scan.getAmuletRules().then((amulet: { amulet_rules: { domain_id: string } }) => amulet.amulet_rules.domain_id),
-  ])
-    .then(([featuredAppRightCid, synchronizerId]) => {
-      log.info({ featuredAppRightCid, synchronizerId }, "marker_worker: resolved startup deps");
-
-      let running = true;
-      const tick = async (): Promise<void> => {
-        while (running) {
-          const start = Date.now();
-          try {
-            await processAllRounds(services, featuredAppRightCid, synchronizerId, log);
-          } catch (err) {
-            log.error({ err }, "marker_worker: tick failed");
-          }
-          const wait = Math.max(0, TICK_INTERVAL_MS - (Date.now() - start));
-          await new Promise((resolve) => setTimeout(resolve, wait));
+  let running = true;
+  const tick = async (): Promise<void> => {
+    // featuredAppRightCid + synchronizerId are stable across rounds, so they are
+    // resolved once and cached for the process lifetime — but the resolution is
+    // attempted INSIDE the loop, not before it.
+    //
+    // It used to sit outside, and its `.catch` logged "worker disabled" and
+    // returned. Both reads go to Scan, whose 503/429 shedding is common enough
+    // that this repo carries a bounded retry and a multi-SV failover for it. An
+    // outage lasting longer than that budget at the moment the process starts —
+    // and the process starts on every deploy — silently ended marker emission
+    // until a human noticed and restarted. Markers are the validator's app
+    // rewards, so the cost is revenue, and nothing surfaced it: no metric, no
+    // /ready check, one log line at boot.
+    let deps: { featuredAppRightCid: string; synchronizerId: string } | null =
+      null;
+    while (running) {
+      const start = Date.now();
+      try {
+        if (!deps) {
+          const [featuredAppRightCid, synchronizerId] = await Promise.all([
+            services.scan.getFeaturedAppRight(services.markerFtpParty),
+            services.scan
+              .getAmuletRules()
+              .then(
+                (amulet: { amulet_rules: { domain_id: string } }) =>
+                  amulet.amulet_rules.domain_id
+              ),
+          ]);
+          deps = { featuredAppRightCid, synchronizerId };
+          log.info(deps, "marker_worker: resolved startup deps");
         }
-      };
+        await processAllRounds(
+          services,
+          deps.featuredAppRightCid,
+          deps.synchronizerId,
+          log
+        );
+      } catch (err) {
+        log.error({ err }, "marker_worker: tick failed");
+      }
+      const wait = Math.max(0, TICK_INTERVAL_MS - (Date.now() - start));
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+  };
 
-      void tick();
+  void tick();
 
-      // Allow graceful shutdown if the process exits.
-      const stop = (): void => { running = false; };
-      process.once("SIGTERM", stop);
-      process.once("SIGINT", stop);
-    })
-    .catch((err) => {
-      log.error({ err }, "marker_worker: failed to resolve startup deps — worker disabled");
-    });
+  // Allow graceful shutdown if the process exits.
+  const stop = (): void => {
+    running = false;
+  };
+  process.once("SIGTERM", stop);
+  process.once("SIGINT", stop);
 }

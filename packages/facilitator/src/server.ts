@@ -32,6 +32,7 @@ import { getEventTrafficSummaryWithFallback } from "@ftptech/x402-canton-ledger"
 import { startTrafficMonitor } from "./traffic-monitor.js";
 import { startPaidMarkerWorker } from "./workers/paid-marker-worker.js";
 import { cantonErrSerializer } from "./log-serializers.js";
+import { createShutdownHandler } from "./shutdown.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -134,23 +135,19 @@ async function main(): Promise<void> {
   await registerDiscoveryResourcesRoute(app, config);
   await registerRegistryRoutes(app, services);
   await registerWalletRoutes(app, services);
-  // transfer-factory stash hygiene: expired-unsettled rows can never settle
-  // (the ledger rejects past-executeBefore transfers) and settled rows only
-  // need to live for the legit-retry idempotency window. 60s cadence, 10min
-  // grace on unsettled, 24h retention on settled.
-  if (services.tfPay) {
-    const stash = services.tfPay.stash;
-    setInterval(() => {
-      stash
-        .sweep(new Date(), 600_000, 86_400_000)
-        .catch((err) =>
-          app.log.warn(
-            { err: err instanceof Error ? err.message : String(err) },
-            "tf stash sweep failed"
-          )
-        );
-    }, 60_000).unref();
-  }
+  // Inline settle records are a traffic-cost guard, not a ledger record: they
+  // only need to outlive the window in which a client legitimately retries.
+  // 60s cadence, 24h retention.
+  setInterval(() => {
+    services.inlineSettles
+      .sweep(86_400_000)
+      .catch((err) =>
+        app.log.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          "inline settle sweep failed"
+        )
+      );
+  }, 60_000).unref();
   await registerCloseRoute(app, config.enableCloseRoute);
   await registerAttributionRoute(app, services);  // before listen — decision #9
 
@@ -173,6 +170,7 @@ async function main(): Promise<void> {
         facilitatorMemberId:
           config.facilitatorMemberId ?? `PAR::${config.facilitatorParty}`,
         maxWeightPerRound: config.markerMaxWeightPerRound,
+        freeBytesPerRound: config.markerFreeBytesPerRound,
       },
       app
     );
@@ -192,13 +190,19 @@ async function main(): Promise<void> {
     },
   });
 
-  const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
-    app.log.info({ signal }, "shutting down");
-    await app.close();
-    process.exit(0);
-  };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  // Bounded drain — see shutdown.ts. `await app.close()` had no deadline, so a
+  // stuck ledger call meant waiting for the orchestrator's SIGKILL instead: the
+  // same stop, later, with no final log line about what was left in flight.
+  const shutdown = createShutdownHandler({
+    close: () => app.close(),
+    exit: (code) => process.exit(code),
+    log: {
+      info: (obj, msg) => app.log.info(obj, msg),
+      error: (obj, msg) => app.log.error(obj, msg),
+    },
+  });
+  process.on("SIGTERM", (s) => void shutdown(s));
+  process.on("SIGINT", (s) => void shutdown(s));
 }
 
 const MAX_FETCH_ATTEMPTS = 10;
@@ -234,22 +238,6 @@ async function runAttributionTick(
   app: FastifyInstance
 ): Promise<void> {
   {
-    // Repair: promote 'attempted' rows confirmed by the consumed store.
-    try {
-      const attempted = await services.attribution!.getAttempted(100);
-      for (const { updateId } of attempted) {
-        try {
-          if (await services.consumed.has(updateId)) {
-            await services.attribution!.markServed(updateId);
-          }
-        } catch (err) {
-          app.log.warn({ err, updateId }, "attribution_repair_failed");
-        }
-      }
-    } catch (err) {
-      app.log.warn({ err }, "attribution_get_attempted_failed");
-    }
-
     // Retry: fetch traffic bytes for pending served rows (Send).
     //
     // PACING + ERROR CLASSIFICATION (the attribution-undercount fix). The

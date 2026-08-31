@@ -1,47 +1,13 @@
-import { describe, it, expect, vi } from "vitest";
-import Fastify from "fastify";
-import type {
-  FacilitatorRequest,
-  SettleResponse,
-  CantonNetwork,
-} from "@ftptech/x402-canton-core";
-import {
-  registerSettleRoute,
-  selectActiveOpenRound,
-  type SettleRouteServices,
-} from "./settle.js";
-import { CantonError } from "@ftptech/x402-canton-ledger";
-import { createMetrics } from "../metrics.js";
-import {
-  createInMemoryTfStashStore,
-  type TfStashStore,
-  type TfStashRecord,
-} from "../db/stash-store.js";
+import { describe, it, expect } from "vitest";
+import { selectActiveOpenRound, settlePaymentRateKey } from "./settle.js";
 
-const FACILITATOR = "ftp_facilitator::1220fff";
-const PAYER = "agent::1220abc";
-const MERCHANT = "merchant::1220def";
-const DSO = "dso::1220dso";
-const SYNC = "global-domain::1220xyz";
-const TF_AMOUNT_WIRE = "1000000000"; // wire (atomic) form of 0.1 CC under scheme "exact"
-const TF_UPDATE_ID = "1220-tf-settle";
-
-async function callSettle(
-  svc: SettleRouteServices,
-  body: FacilitatorRequest
-): Promise<SettleResponse> {
-  const app = Fastify();
-  await registerSettleRoute(app, svc);
-  const res = await app.inject({
-    method: "POST",
-    url: "/settle",
-    payload: body,
-  });
-  expect(res.statusCode).toBe(200);
-  const json = res.json() as SettleResponse;
-  await app.close();
-  return json;
-}
+// The stash-carriage settle integration suite (operational guards / metrics /
+// observability driven through a seeded tf_stash row) was removed with the
+// legacy carriage. The inline carriage's settle behaviour — idempotency,
+// per-payer rate limiting, the master switch, unknown-outcome handling and
+// traffic accounting — is covered by settle-inline.test.ts; the circuit-breaker
+// unit lives in rate-limit.test.ts. What remains here are the two carriage-
+// agnostic units the settle route exports.
 
 // ---------------------------------------------------------------------------
 // H2 regression: deterministic active open-mining-round selection
@@ -101,684 +67,144 @@ describe("selectActiveOpenRound (unit)", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// transfer-factory ("V3") settle harness — the ONLY remaining settle path.
-// The operational-guard, metrics and observability tests below are
-// method-agnostic (they only care about HTTP status / metric counters / log
-// lines), so they drive the transfer-factory harness: a happy tf settle
-// returns 200 success; the breaker tests override `execute` (the relay leg) to
-// throw the relevant CantonError.
-// ---------------------------------------------------------------------------
+describe("settlePaymentRateKey — one payment, ONE bucket, whichever spelling", () => {
+  const H = "a".repeat(64);
 
-/** In-memory stash exposing a `_seed` to force a specific ref + recordSettled. */
-function makeStash(): TfStashStore & {
-  _seed: (r: string, rec: TfStashRecord) => void;
-} {
-  const base = createInMemoryTfStashStore();
-  const rows = new Map<string, TfStashRecord>();
-  return {
-    ...base,
-    _seed(r, rec) {
-      rows.set(r, rec);
-    },
-    async get(ref) {
-      return rows.get(ref) ?? null;
-    },
-    async recordSettled(ref, updateId) {
-      const row = rows.get(ref);
-      if (!row) return false;
-      if (row.settledUpdateId) return false;
-      row.settledUpdateId = updateId;
-      return true;
-    },
-  };
-}
-
-/** Seed a committed (signed) tf stash row keyed "REF" for the given payer. */
-function seedRow(
-  stash: TfStashStore & { _seed: (r: string, rec: TfStashRecord) => void },
-  payer: string = PAYER
-): void {
-  stash._seed("REF", {
-    ref: "REF",
-    payer,
-    receiver: MERCHANT,
-    amount: "0.1000000000",
-    instrumentAdmin: DSO,
-    instrumentId: "Amulet",
-    executeBefore: new Date(Date.now() + 60_000).toISOString(),
-    txHash: "hash",
-    preparedTx: "prepared",
-    signature: JSON.stringify({
-      hashingSchemeVersion: "HASHING_SCHEME_VERSION_V2",
-      partySignatures: { signatures: [{ party: payer, signatures: [{}] }] },
-    }),
-  });
-}
-
-function makeServices(opts: {
-  network?: CantonNetwork;
-  /** Omit the TransferFactoryService entirely (fail-closed dep test → ledger_error). */
-  omitTf?: boolean;
-  /** execute (the relay leg) throws. */
-  execute?: () => Promise<{
-    updateId: string;
-    transferred: boolean;
-    confirmInconclusive: boolean;
-  }>;
-} = {}): { svc: SettleRouteServices; stash: ReturnType<typeof makeStash> } {
-  const stash = makeStash();
-  const execute =
-    opts.execute ??
-    (async () => ({
-      updateId: TF_UPDATE_ID,
-      transferred: true,
-      confirmInconclusive: false,
-    }));
-  const svc: SettleRouteServices = {
-    facilitatorParty: FACILITATOR,
-    network: opts.network ?? "canton:devnet",
-    tfEnabled: true,
-    tf: { stash, tfEnabled: true },
-    tfStash: stash,
-    ...(opts.omitTf
-      ? {}
-      : {
-          transferFactory: {
-            preapprovalKind: vi.fn(async () => "yes" as const),
-            execute: vi.fn(execute),
-          },
-        }),
-  } as unknown as SettleRouteServices;
-  return { svc, stash };
-}
-
-/** A well-formed transfer-factory /settle body keyed at ref "REF".
- *  The wire payload carries NO `payer` (untrusted claim removed); `submissionRef`
- *  overrides the ref, which is what the settle rate-limit bucket now keys on. */
-function tfBody(
-  over: {
-    payTo?: string;
-    amount?: string;
-    network?: CantonNetwork;
-    submissionRef?: string;
-  } = {}
-): FacilitatorRequest {
-  const network = over.network ?? ("canton:devnet" as const);
-  const reqs = {
-    scheme: "exact" as const,
-    network,
-    amount: over.amount ?? TF_AMOUNT_WIRE,
-    asset: "CC",
-    payTo: over.payTo ?? MERCHANT,
-    maxTimeoutSeconds: 60,
-    extra: {
-      assetTransferMethod: "transfer-factory" as const,
-      feePayer: FACILITATOR,
-      synchronizerId: SYNC,
-      instrumentId: { admin: DSO, id: "Amulet" },
-      executeBeforeSeconds: 120,
-    },
-  };
-  return {
-    x402Version: 2,
-    paymentPayload: {
-      x402Version: 2,
-      scheme: "exact",
-      network,
-      resource: { url: "https://api.example.com/data" },
-      accepted: reqs,
-      payload: {
-        assetTransferMethod: "transfer-factory",
-        submissionRef: over.submissionRef ?? "REF",
-      },
-    },
-    paymentRequirements: reqs,
-  };
-}
-
-/** Build a services + seed the stash for the given payer in one step. */
-function svcFor(
-  opts: Parameters<typeof makeServices>[0] & { payer?: string } = {}
-): SettleRouteServices {
-  const { svc, stash } = makeServices(opts);
-  seedRow(stash, opts.payer ?? PAYER);
-  return svc;
-}
-
-describe("settle route — operational guards (rate limit + circuit breaker)", () => {
-  // Rate-limiting + the breaker are enforced BEFORE settle validation/execution
-  // (the breaker first, then shape, then the per-ref/IP limiter, all ahead of
-  // runValidation). These tests therefore only care about the HTTP status
-  // (200 vs 429 vs 503), so they drive the transfer-factory harness — the only
-  // remaining settle path. A happy transfer-factory settle returns 200; the
-  // breaker tests override execute (the relay leg) to throw the relevant CantonError.
-
-  it("rate-limits a second settle for the same submission ref (429)", async () => {
-    const svc = {
-      ...svcFor({}),
-      settleRateLimit: { maxPerPayer: 1, maxGlobal: 0, windowMs: 60_000 },
-    };
-    const app = Fastify();
-    await registerSettleRoute(app, svc);
-    const body = tfBody();
-    const r1 = await app.inject({ method: "POST", url: "/settle", payload: body });
-    expect(r1.statusCode).toBe(200); // first settle allowed
-    const r2 = await app.inject({ method: "POST", url: "/settle", payload: body });
-    expect(r2.statusCode).toBe(429);
-    expect(r2.json()).toMatchObject({ error: "rate_limited" });
-    await app.close();
+  it("the bare digest and the 1220-framed multihash share a bucket", () => {
+    // The payer-proof verifier accepts both spellings as the same hash, so a
+    // caller could exhaust the per-payment cap under one and get a fresh quota
+    // under the other. The cap bounded half of what its comment claimed.
+    const bare = settlePaymentRateKey({
+      preparedTransaction: "cHJlcA==",
+      preparedTxHash: H,
+    });
+    const framed = settlePaymentRateKey({
+      preparedTransaction: "cHJlcA==",
+      preparedTxHash: `1220${H}`,
+    });
+    expect(bare).not.toBeNull();
+    expect(framed).toBe(bare);
   });
 
-  it("per-ref cap CANNOT be evaded by rotating the submission ref (IP is a 2nd key)", async () => {
-    // The wire `payer` claim is gone, so the settle bucket keys on the stash
-    // ref. Rotating the ref could otherwise mint a fresh per-ref bucket every
-    // request; the client IP is a second per-key dimension, so a same-IP burst
-    // is capped even when every request carries a different submission ref.
-    const { svc: base, stash } = makeServices({});
-    // Seed rows for every payer used below so validation passes and only the
-    // rate limiter can bite.
-    for (const p of ["agent::aaa", "agent::bbb", "agent::ccc"]) {
-      stash._seed(`REF-${p}`, {
-        ref: `REF-${p}`,
-        payer: p,
-        receiver: MERCHANT,
-        amount: "0.1000000000",
-        instrumentAdmin: DSO,
-        instrumentId: "Amulet",
-        executeBefore: new Date(Date.now() + 60_000).toISOString(),
-        txHash: "hash",
-        preparedTx: "prepared",
-        signature: JSON.stringify({
-          hashingSchemeVersion: "HASHING_SCHEME_VERSION_V2",
-          partySignatures: { signatures: [{ party: p, signatures: [{}] }] },
-        }),
-      });
-    }
-    const svc = {
-      ...base,
-      // IP key now has its OWN cap (maxPerIp), separate from the per-ref cap;
-      // set it to 2 so a same-IP burst of distinct refs is capped at the IP key.
-      settleRateLimit: { maxPerPayer: 2, maxPerIp: 2, maxGlobal: 0, windowMs: 60_000 },
-    };
-    const app = Fastify();
-    await registerSettleRoute(app, svc);
-    // Each party maps to its own submission ref — the dimension the settle
-    // limiter now keys on (the wire `payer` is gone).
-    const bodyFor = (party: string) =>
-      tfBody({ submissionRef: `REF-${party}` });
-    const ip = "203.0.113.77";
-    // 2 distinct refs from the same IP → both allowed (IP cap = 2).
-    const r1 = await app.inject({ method: "POST", url: "/settle", payload: bodyFor("agent::aaa"), remoteAddress: ip });
-    expect(r1.statusCode).toBe(200);
-    const r2 = await app.inject({ method: "POST", url: "/settle", payload: bodyFor("agent::bbb"), remoteAddress: ip });
-    expect(r2.statusCode).toBe(200);
-    // 3rd from the SAME IP, with yet another fresh ref → blocked by the IP key.
-    const r3 = await app.inject({ method: "POST", url: "/settle", payload: bodyFor("agent::ccc"), remoteAddress: ip });
-    expect(r3.statusCode).toBe(429);
-    expect(r3.json()).toMatchObject({ error: "rate_limited" });
-    await app.close();
-  });
-
-  it("a different client IP keeps its own settle quota (IP isolation)", async () => {
-    const { svc: base, stash } = makeServices({});
-    for (const p of ["agent::x", "agent::y", "agent::z"]) {
-      stash._seed(`REF-${p}`, {
-        ref: `REF-${p}`,
-        payer: p,
-        receiver: MERCHANT,
-        amount: "0.1000000000",
-        instrumentAdmin: DSO,
-        instrumentId: "Amulet",
-        executeBefore: new Date(Date.now() + 60_000).toISOString(),
-        txHash: "hash",
-        preparedTx: "prepared",
-        signature: JSON.stringify({
-          hashingSchemeVersion: "HASHING_SCHEME_VERSION_V2",
-          partySignatures: { signatures: [{ party: p, signatures: [{}] }] },
-        }),
-      });
-    }
-    const svc = {
-      ...base,
-      settleRateLimit: { maxPerPayer: 1, maxPerIp: 1, maxGlobal: 0, windowMs: 60_000 },
-    };
-    const app = Fastify();
-    await registerSettleRoute(app, svc);
-    // Each party maps to its own submission ref — the dimension the settle
-    // limiter now keys on (the wire `payer` is gone).
-    const bodyFor = (party: string) =>
-      tfBody({ submissionRef: `REF-${party}` });
-    // IP A, ref X → ok; second from IP A (fresh ref Y) → blocked by IP cap.
-    const a1 = await app.inject({ method: "POST", url: "/settle", payload: bodyFor("agent::x"), remoteAddress: "198.51.100.10" });
-    expect(a1.statusCode).toBe(200);
-    const a2 = await app.inject({ method: "POST", url: "/settle", payload: bodyFor("agent::y"), remoteAddress: "198.51.100.10" });
-    expect(a2.statusCode).toBe(429);
-    // IP B is independent → a fresh ref Z from IP B is allowed (its own
-    // per-IP + per-ref buckets, untouched by IP A's traffic).
-    const b1 = await app.inject({ method: "POST", url: "/settle", payload: bodyFor("agent::z"), remoteAddress: "198.51.100.11" });
-    expect(b1.statusCode).toBe(200);
-    await app.close();
-  });
-
-  it("the same submission ref is still capped from one IP (per-ref key intact)", async () => {
-    // Regression guard: the IP key must not weaken the original per-key cap —
-    // same ref, same IP, cap 1 → 2nd is 429.
-    const svc = {
-      ...svcFor({}),
-      settleRateLimit: { maxPerPayer: 1, maxGlobal: 0, windowMs: 60_000 },
-    };
-    const app = Fastify();
-    await registerSettleRoute(app, svc);
-    const body = tfBody(); // submissionRef = "REF" (constant)
-    const r1 = await app.inject({ method: "POST", url: "/settle", payload: body, remoteAddress: "198.51.100.20" });
-    expect(r1.statusCode).toBe(200);
-    const r2 = await app.inject({ method: "POST", url: "/settle", payload: body, remoteAddress: "198.51.100.20" });
-    expect(r2.statusCode).toBe(429);
-    await app.close();
-  });
-
-  it("opens the circuit breaker after a traffic-failure settle and returns 503", async () => {
-    const trafficErr = new CantonError(
-      "execute failed",
-      "HTTP_ERROR",
-      500,
-      "ABORTED: sequencer traffic limit exceeded"
+  it("case is not a second spelling either", () => {
+    expect(
+      settlePaymentRateKey({
+        preparedTransaction: "cHJlcA==",
+        preparedTxHash: H.toUpperCase(),
+      })
+    ).toBe(
+      settlePaymentRateKey({ preparedTransaction: "cHJlcA==", preparedTxHash: H })
     );
-    const svc = {
-      ...svcFor({
-        execute: async () => {
-          throw trafficErr;
-        },
-      }),
-      settleBreaker: { threshold: 1, cooldownMs: 60_000 },
-    };
-    const app = Fastify();
-    await registerSettleRoute(app, svc);
-    const body = tfBody();
-    // 1st: the settle fails for traffic -> failed() (200, success:false) AND trips the breaker.
-    const r1 = await app.inject({ method: "POST", url: "/settle", payload: body });
-    expect(r1.statusCode).toBe(200);
-    expect(r1.json()).toMatchObject({ success: false });
-    // 2nd: breaker OPEN -> refused with 503 before any ledger work.
-    const r2 = await app.inject({ method: "POST", url: "/settle", payload: body });
-    expect(r2.statusCode).toBe(503);
-    expect(r2.json()).toMatchObject({ error: "facilitator_traffic_unavailable" });
-    await app.close();
   });
 
-  it("non-traffic settle failures do NOT trip the breaker", async () => {
-    const otherErr = new CantonError("nope", "HTTP_ERROR", 500, "CONTRACT_NOT_FOUND");
-    const svc = {
-      ...svcFor({
-        execute: async () => {
-          throw otherErr;
-        },
-      }),
-      settleBreaker: { threshold: 1, cooldownMs: 60_000 },
-    };
-    const app = Fastify();
-    await registerSettleRoute(app, svc);
-    const body = tfBody();
-    const r1 = await app.inject({ method: "POST", url: "/settle", payload: body });
-    expect(r1.statusCode).toBe(200);
-    const r2 = await app.inject({ method: "POST", url: "/settle", payload: body });
-    expect(r2.statusCode).toBe(200); // breaker did NOT trip on a non-traffic error
-    await app.close();
+  it("two DIFFERENT payments still get different buckets", () => {
+    // DISCRIMINATOR: canonicalising must not collapse distinct payments into
+    // one bucket, which would let any caller evict everyone else's quota.
+    const other = "b".repeat(64);
+    expect(
+      settlePaymentRateKey({ preparedTransaction: "cHJlcA==", preparedTxHash: H })
+    ).not.toBe(
+      settlePaymentRateKey({
+        preparedTransaction: "cHJlcA==",
+        preparedTxHash: other,
+      })
+    );
   });
 
-  it("is disabled when no guard config is wired (settles flow freely)", async () => {
-    const svc = svcFor({});
-    const app = Fastify();
-    await registerSettleRoute(app, svc);
-    const body = tfBody();
-    for (let i = 0; i < 5; i++) {
-      const r = await app.inject({ method: "POST", url: "/settle", payload: body });
-      expect(r.statusCode).toBe(200);
-    }
-    await app.close();
-  });
-
-  // --- trustProxy policy end-to-end (adversarial-review HIGH fix) ----------
-  // These build Fastify with `trustProxy: ["loopback"]` — the SAFE production
-  // default — and exercise the REAL proxy-addr resolution, modelling the
-  // documented Caddy-on-127.0.0.1 deploy where Caddy APPENDS the real client to
-  // the right of X-Forwarded-For. The pre-fix `trustProxy: true` trusted the
-  // whole chain, making req.ip the leftmost (client-forged) XFF entry and
-  // letting an attacker mint a fresh per-IP bucket per request.
-
-  // Each request uses a FRESH submission ref so the per-ref key never trips —
-  // this isolates the IP key, which is the dimension the HIGH fix is about
-  // (the finding is "rotate the ref AND spoofed IP"; we rotate the ref and
-  // try to also rotate the spoofed IP via XFF).
-  const seedParties = (
-    stash: ReturnType<typeof makeStash>,
-    parties: string[]
-  ): void => {
-    for (const p of parties) {
-      stash._seed(`REF-${p}`, {
-        ref: `REF-${p}`,
-        payer: p,
-        receiver: MERCHANT,
-        amount: "0.1000000000",
-        instrumentAdmin: DSO,
-        instrumentId: "Amulet",
-        executeBefore: new Date(Date.now() + 60_000).toISOString(),
-        txHash: "hash",
-        preparedTx: "prepared",
-        signature: JSON.stringify({
-          hashingSchemeVersion: "HASHING_SCHEME_VERSION_V2",
-          partySignatures: { signatures: [{ party: p, signatures: [{}] }] },
-        }),
-      });
-    }
-  };
-  const bodyForParty = (party: string): FacilitatorRequest =>
-    tfBody({ submissionRef: `REF-${party}` });
-
-  it("loopback-trust: rotating the submission ref AND the FORGED (left) XFF cannot evade the per-IP settle cap", async () => {
-    const { svc: base, stash } = makeServices({});
-    seedParties(stash, ["agent::a", "agent::b", "agent::c"]);
-    const svc = {
-      ...base,
-      // Per-key cap of 1: with a rotating ref, only the IP key can bite.
-      settleRateLimit: { maxPerPayer: 1, maxPerIp: 1, maxGlobal: 0, windowMs: 60_000 },
-    };
-    const app = Fastify({ trustProxy: ["loopback"] });
-    await registerSettleRoute(app, svc);
-    // The trusted loopback proxy (the inject socket = 127.0.0.1) appends the
-    // attacker's REAL address (9.9.9.9) to the right; the attacker forges and
-    // rotates the left-hand entry AND rotates the submission ref per request.
-    const mk = (party: string, forgedLeft: string) => ({
-      method: "POST" as const,
-      url: "/settle",
-      payload: bodyForParty(party),
-      headers: { "x-forwarded-for": `${forgedLeft}, 9.9.9.9` },
+  it("a bare digest that HAPPENS to begin 1220 is not mistaken for framing", () => {
+    // The subtle one, and the reason this delegates to the verifier's own
+    // function instead of stripping "1220" on sight: roughly one honest digest
+    // in 65,536 starts with those four chars. A naive strip would turn it into
+    // 60 chars, which is not a hash at all — and would also let a DIFFERENT
+    // payment (the 68-char framing of it) share its bucket incorrectly.
+    const looksFramed = "1220" + "c".repeat(60); // 64 chars: a BARE digest
+    const framedOfIt = "1220" + looksFramed; // 68 chars: its multihash framing
+    const bare = settlePaymentRateKey({
+      preparedTransaction: "cHJlcA==",
+      preparedTxHash: looksFramed,
     });
-    const r1 = await app.inject(mk("agent::a", "1.1.1.1"));
-    expect(r1.statusCode).toBe(200); // fills the IP bucket keyed on 9.9.9.9
-    const r2 = await app.inject(mk("agent::b", "2.2.2.2")); // fresh ref + fresh forged left
-    expect(r2.statusCode).toBe(429); // same real client (9.9.9.9) → still capped
-    const r3 = await app.inject(mk("agent::c", "3.3.3.3, 4.4.4.4"));
-    expect(r3.statusCode).toBe(429);
-    await app.close();
+    const framed = settlePaymentRateKey({
+      preparedTransaction: "cHJlcA==",
+      preparedTxHash: framedOfIt,
+    });
+    // Same hash under the verifier's rule → same bucket.
+    expect(framed).toBe(bare);
+    // And still distinct from the 60-char string a naive strip would produce.
+    expect(bare).not.toBe(
+      settlePaymentRateKey({
+        preparedTransaction: "cHJlcA==",
+        preparedTxHash: "c".repeat(60),
+      })
+    );
   });
 
-  it("loopback-trust: req.ip resolves to the proxy-appended real client (distinct clients keep own quota)", async () => {
-    const { svc: base, stash } = makeServices({});
-    seedParties(stash, ["agent::a", "agent::b", "agent::c"]);
-    const svc = {
-      ...base,
-      settleRateLimit: { maxPerPayer: 1, maxPerIp: 1, maxGlobal: 0, windowMs: 60_000 },
-    };
-    const app = Fastify({ trustProxy: ["loopback"] });
-    await registerSettleRoute(app, svc);
-    const mk = (party: string, realClient: string) => ({
-      method: "POST" as const,
-      url: "/settle",
-      payload: bodyForParty(party),
-      // Caddy appends the real client on the right; the left entry is whatever
-      // the client sent and must be ignored.
-      headers: { "x-forwarded-for": `forged-junk, ${realClient}` },
+  it("an unparseable hash keeps its own bucket rather than pooling", () => {
+    // DISCRIMINATOR: junk must not fall back to a shared key, or one caller
+    // sending garbage would spend the bucket of every other garbage sender —
+    // and, worse, any collapse-to-constant would be a free eviction primitive.
+    const a = settlePaymentRateKey({
+      preparedTransaction: "cHJlcA==",
+      preparedTxHash: "not-a-hash",
     });
-    const a1 = await app.inject(mk("agent::a", "203.0.113.50"));
-    expect(a1.statusCode).toBe(200);
-    const a2 = await app.inject(mk("agent::b", "203.0.113.50"));
-    expect(a2.statusCode).toBe(429); // same real client over cap (fresh ref didn't help)
-    const b1 = await app.inject(mk("agent::c", "203.0.113.51"));
-    expect(b1.statusCode).toBe(200); // different real client, own quota
-    await app.close();
-  });
-
-  it("trustProxy:true (legacy unsafe mode) DOES let a forged XFF evade — documents why it is not the default", async () => {
-    // The vulnerable behaviour the fix moves AWAY from: with whole-chain trust,
-    // req.ip = the leftmost client-forged entry, so rotating it (plus the party)
-    // mints a fresh IP bucket every time. Asserted here so a future change to
-    // Fastify's resolution that silently alters this is caught.
-    const { svc: base, stash } = makeServices({});
-    seedParties(stash, ["agent::a", "agent::b"]);
-    const svc = {
-      ...base,
-      // IP cap enabled so the test genuinely shows a forged XFF EVADING it.
-      settleRateLimit: { maxPerPayer: 1, maxPerIp: 1, maxGlobal: 0, windowMs: 60_000 },
-    };
-    const app = Fastify({ trustProxy: true });
-    await registerSettleRoute(app, svc);
-    const mk = (party: string, forgedLeft: string) => ({
-      method: "POST" as const,
-      url: "/settle",
-      payload: bodyForParty(party),
-      headers: { "x-forwarded-for": `${forgedLeft}, 9.9.9.9` },
+    const b = settlePaymentRateKey({
+      preparedTransaction: "cHJlcA==",
+      preparedTxHash: "also-not-a-hash",
     });
-    const r1 = await app.inject(mk("agent::a", "1.1.1.1"));
-    expect(r1.statusCode).toBe(200);
-    // Different forged LEFT entry → trustProxy:true keys req.ip on it → the IP
-    // bucket is fresh, and the party is fresh too → NOT capped (the bug).
-    const r2 = await app.inject(mk("agent::b", "2.2.2.2"));
-    expect(r2.statusCode).toBe(200); // NOT capped — the bug, intentionally shown
-    await app.close();
+    expect(a).not.toBeNull();
+    expect(a).not.toBe(b);
   });
 });
 
-// ---------------------------------------------------------------------------
-// WS3 observability: settle_total{result}, breaker_open_total,
-// ratelimit_rejected_total{scope=settle}, settle-latency histogram, the
-// validation-failure log line, and breaker-OPEN raised warn -> error.
-// Reuses the transfer-factory helpers (makeServices / svcFor / tfBody) above.
-// ---------------------------------------------------------------------------
-describe("settle route — WS3 metrics", () => {
-  it("settle_total{result=ok} + a duration-histogram sample on a successful settle", async () => {
-    const metrics = createMetrics({ collectDefault: false });
-    const r = await callSettle({ ...svcFor({}), metrics }, tfBody());
-    expect(r).toMatchObject({ success: true });
-    const settle = await metrics.registry.getSingleMetricAsString(
-      "x402_facilitator_settle_total"
-    );
-    expect(settle).toMatch(/result="ok"\} 1/);
-    const hist = await metrics.registry.getSingleMetricAsString(
-      "x402_facilitator_settle_duration_seconds"
-    );
-    expect(hist).toMatch(/x402_facilitator_settle_duration_seconds_count 1/);
-  });
-
-  it("settle_total{result=ledger_error} when the TF service/stash is not wired", async () => {
-    // A transfer-factory payload whose TransferFactoryService is absent fails
-    // closed with unexpected_canton_ledger_error → ledger_error.
-    const metrics = createMetrics({ collectDefault: false });
-    await callSettle(
-      {
-        ...svcFor({ omitTf: true }),
-        metrics,
-      },
-      tfBody()
-    );
-    const settle = await metrics.registry.getSingleMetricAsString(
-      "x402_facilitator_settle_total"
-    );
-    expect(settle).toMatch(/result="ledger_error"\} 1/);
-  });
-
-  it("settle_total{result=validation_failed} on a malformed body (400)", async () => {
-    const metrics = createMetrics({ collectDefault: false });
-    const app = Fastify();
-    await registerSettleRoute(app, { ...svcFor({}), metrics });
-    const res = await app.inject({
-      method: "POST",
-      url: "/settle",
-      payload: { garbage: true },
+describe("settlePaymentRateKey — one bucket per payment, never a shared constant", () => {
+  it("keys the inline carriage on the transaction hash, NOT the payload text", () => {
+    const HASH = "ab".repeat(32);
+    const k = settlePaymentRateKey({
+      preparedTransaction: "H4sIAAAAAAAA",
+      preparedTxHash: HASH,
     });
-    expect(res.statusCode).toBe(400);
-    await app.close();
-    const settle = await metrics.registry.getSingleMetricAsString(
-      "x402_facilitator_settle_total"
-    );
-    expect(settle).toMatch(/result="validation_failed"\} 1/);
+    expect(k).toMatch(/^tx:[0-9a-f]{32}$/);
+
+    // THE POINT: gzip is not canonical, so the same transaction re-compressed
+    // produces different text. Keying on that text put an honest retry in a
+    // fresh bucket, and the per-payment limit then bounded nothing.
+    expect(
+      settlePaymentRateKey({
+        preparedTransaction: "H4sIAAAAAAAAdifferentBytes",
+        preparedTxHash: HASH,
+      })
+    ).toBe(k);
   });
 
-  it("429 → ratelimit_rejected_total{scope=settle} + settle_total{result=rate_limited}", async () => {
-    const metrics = createMetrics({ collectDefault: false });
-    const svc = {
-      ...svcFor({}),
-      metrics,
-      settleRateLimit: { maxPerPayer: 1, maxGlobal: 0, windowMs: 60_000 },
-    };
-    const app = Fastify();
-    await registerSettleRoute(app, svc);
-    const body = tfBody();
-    const r1 = await app.inject({ method: "POST", url: "/settle", payload: body });
-    expect(r1.statusCode).toBe(200);
-    const r2 = await app.inject({ method: "POST", url: "/settle", payload: body });
-    expect(r2.statusCode).toBe(429);
-    await app.close();
-    const rl = await metrics.registry.getSingleMetricAsString(
-      "x402_facilitator_ratelimit_rejected_total"
-    );
-    expect(rl).toMatch(/scope="settle"\} 1/);
-    const settle = await metrics.registry.getSingleMetricAsString(
-      "x402_facilitator_settle_total"
-    );
-    expect(settle).toMatch(/result="rate_limited"\} 1/);
+  it("falls back to the IP bucket for an inline payload with no hash", () => {
+    // Unkeyable rather than pooled under a constant: that payload is rejected
+    // downstream anyway, and a constant would let it 429 unrelated merchants.
+    expect(settlePaymentRateKey({ preparedTransaction: "AAAA" })).toBeNull();
   });
 
-  it("503 (breaker OPEN) → breaker_open_total + settle_total{result=breaker_open}", async () => {
-    const metrics = createMetrics({ collectDefault: false });
-    const trafficErr = new CantonError(
-      "execute failed",
-      "HTTP_ERROR",
-      500,
-      "ABORTED: sequencer traffic limit exceeded"
+  it("gives DIFFERENT payments different buckets", () => {
+    // The whole point: two merchants settling at once must not share a limit.
+    expect(
+      settlePaymentRateKey({ preparedTransaction: "x", preparedTxHash: "aa" })
+    ).not.toBe(
+      settlePaymentRateKey({ preparedTransaction: "x", preparedTxHash: "bb" })
     );
-    // execute throwing a TRAFFIC error trips the breaker AND records
-    // ledger_error is NOT emitted here — the relay failure maps to
-    // execute_failed (validation_failed bucket); the breaker-OPEN refusal on the
-    // 2nd call is the breaker_open bucket.
-    const svc = {
-      ...svcFor({
-        execute: async () => {
-          throw trafficErr;
-        },
-      }),
-      metrics,
-      settleBreaker: { threshold: 1, cooldownMs: 60_000 },
-    };
-    const app = Fastify();
-    await registerSettleRoute(app, svc);
-    // 1st trips the breaker; the 2nd is refused at the breaker gate (breaker_open)
-    // BEFORE any ledger work.
-    const body = tfBody();
-    const r1 = await app.inject({ method: "POST", url: "/settle", payload: body });
-    expect(r1.statusCode).toBe(200);
-    const r2 = await app.inject({ method: "POST", url: "/settle", payload: body });
-    expect(r2.statusCode).toBe(503);
-    await app.close();
-    const breaker = await metrics.registry.getSingleMetricAsString(
-      "x402_facilitator_breaker_open_total"
-    );
-    expect(breaker).toMatch(/x402_facilitator_breaker_open_total 1/);
-    const settle = await metrics.registry.getSingleMetricAsString(
-      "x402_facilitator_settle_total"
-    );
-    expect(settle).toMatch(/result="breaker_open"\} 1/);
   });
 
-  it("works with metrics UNWIRED (no crash, settles normally)", async () => {
-    // metrics is optional; absence must not break settle.
-    const r = await callSettle(svcFor({}), tfBody());
-    expect(r).toMatchObject({ success: true });
-  });
-});
-
-describe("settle route — WS3 observability logging", () => {
-  it("logs a WARN with {reason, payer, method} on a validation failure (was silent)", async () => {
-    // A wrong-network payment is rejected by runValidation → previously no log.
-    const svc = svcFor({ network: "canton:devnet" });
-    const app = Fastify();
-    await registerSettleRoute(app, svc);
-    const warn = vi.fn();
-    app.addHook("onRequest", async (req) => {
-      req.log.warn = warn as never;
-    });
-    // svc.network is devnet; send a mainnet payment → network mismatch reject.
-    await app.inject({
-      method: "POST",
-      url: "/settle",
-      payload: tfBody({ network: "canton:mainnet" }),
-    });
-    await app.close();
-    const line = warn.mock.calls.find((c) => c[1] === "settle validation failed");
-    expect(line).toBeDefined();
-    expect(line![0]).toMatchObject({
-      reason: "unexpected_canton_ledger_error",
-      // The network guard fires BEFORE any stash load, so there is no proven
-      // payer yet — the outcome echoes an empty payer (the wire carries none).
-      payer: "",
-      method: "transfer-factory",
-    });
+  it("returns null rather than a shared constant when it cannot key", () => {
+    // A constant here would let ten unkeyable requests per minute 429 every
+    // unrelated merchant — the caller handles null by falling back to the IP
+    // bucket instead.
+    for (const bad of [null, undefined, 42, "str", {}, { preparedTransaction: "" }]) {
+      expect(settlePaymentRateKey(bad)).toBeNull();
+    }
   });
 
-  it("breaker-OPEN refusal logs at ERROR (not warn) for paging/grep", async () => {
-    const trafficErr = new CantonError(
-      "execute failed",
-      "HTTP_ERROR",
-      500,
-      "ABORTED: sequencer traffic limit exceeded"
-    );
-    const svc = {
-      ...svcFor({
-        execute: async () => {
-          throw trafficErr;
-        },
-      }),
-      settleBreaker: { threshold: 1, cooldownMs: 60_000 },
-    };
-    const app = Fastify();
-    await registerSettleRoute(app, svc);
-    const error = vi.fn();
-    const warn = vi.fn();
-    app.addHook("onRequest", async (req) => {
-      req.log.error = error as never;
-      req.log.warn = warn as never;
-    });
-    const body = tfBody();
-    await app.inject({ method: "POST", url: "/settle", payload: body }); // trip
-    const r2 = await app.inject({ method: "POST", url: "/settle", payload: body }); // refused
-    expect(r2.statusCode).toBe(503);
-    await app.close();
-    const onError = error.mock.calls.find(
-      (c) => typeof c[0] === "string" && c[0].includes("circuit breaker OPEN")
-    );
-    expect(onError).toBeDefined();
-    const onWarn = warn.mock.calls.find(
-      (c) => typeof c[0] === "string" && c[0].includes("circuit breaker OPEN")
-    );
-    expect(onWarn).toBeUndefined();
-  });
-
-  it("a funded settle logs an INFO 'relayed to the merchant' line (success was silent before)", async () => {
-    // Regression for the observability gap surfaced in live e2e: the success path
-    // emitted NO log, making a healthy facilitator look broken. A funded
-    // transfer-factory settle must log one info line carrying
-    // payer/merchant/amount/updateId.
-    const svc = svcFor({});
-    const app = Fastify();
-    await registerSettleRoute(app, svc);
-    const info = vi.fn();
-    app.addHook("onRequest", async (req) => {
-      req.log.info = info as never;
-    });
-    const r = await app.inject({ method: "POST", url: "/settle", payload: tfBody() });
-    await app.close();
-    expect((r.json() as SettleResponse).success).toBe(true);
-    const line = info.mock.calls.find(
-      (c) =>
-        c[1] ===
-        "/settle: transfer-factory relayed to the merchant (one transaction, sponsored gas, no escrow)"
-    );
-    expect(line).toBeDefined();
-    expect(line![0]).toMatchObject({
-      payer: PAYER,
-      merchant: MERCHANT,
-      updateId: TF_UPDATE_ID,
-    });
+  it("ignores a stray submissionRef and keys on the inline payload", () => {
+    // The legacy stash carriage is gone: a payload's submissionRef means nothing
+    // now. With an inline hash present it keys on that; with none it is unkeyable.
+    expect(
+      settlePaymentRateKey({ submissionRef: "r1", preparedTransaction: "AAAA", preparedTxHash: "aa" })
+    ).toMatch(/^tx:[0-9a-f]{32}$/);
+    expect(settlePaymentRateKey({ submissionRef: "r1" })).toBeNull();
   });
 });

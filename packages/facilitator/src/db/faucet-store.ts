@@ -175,6 +175,10 @@ const FAUCET_INDEX_DDL =
  * error so the route denies (503) rather than risking a double payout. Lazily
  * creates its table + index on first use.
  */
+/** Advisory-lock key shared by every faucet claimant. Arbitrary but fixed; it
+ *  only has to be distinct from other advisory locks this database uses. */
+const FAUCET_LOCK_KEY = 776_402_001;
+
 export function createPostgresFaucetStore(
   executor: PgExecutor
 ): FaucetClaimStore {
@@ -211,14 +215,26 @@ export function createPostgresFaucetStore(
     }) {
       await init();
       const sinceMs = nowMs - windowMs;
-      // ONE statement decides AND records the spend: the row is inserted only if
-      // the party is new AND the daily-window sum + amount fits the budget AND
-      // (cap disabled OR the all-time total + amount fits the cap). Because the
-      // budget/cap sub-SELECTs and the INSERT are a single command, two
-      // concurrent claims cannot both read a stale sum and both insert — the
-      // second sees the first's committed row. rowCount=1 → reserved; 0 → some
-      // guard failed (classified below for the right status code).
-      const ins = await executor.query(
+      // THE CLAIM STATEMENT. Inserts only if the party is new AND the
+      // daily-window sum + amount fits the budget AND (cap disabled OR the
+      // all-time total + amount fits the cap).
+      //
+      // An earlier version of this comment said the single statement made all
+      // three guards atomic — "two concurrent claims cannot both read a stale
+      // sum". That is true of the PARTY guard, which serialises on the primary
+      // key, and false of the two budget guards. Under READ COMMITTED the
+      // sub-SELECTs read the snapshot taken when the statement began, so a
+      // sibling's uncommitted row is invisible to them: two claims for
+      // DIFFERENT parties can both see the same total and both insert, and the
+      // daily budget and the lifetime cap overshoot by however many claims are
+      // in flight.
+      //
+      // The fix is to serialise the claimants, which needs more than one
+      // statement — hence the transaction below. This function is kept as the
+      // single-statement body it always was, and the caller decides whether it
+      // runs under a lock.
+      const claim = (exec: PgExecutor) =>
+        exec.query(
         "INSERT INTO faucet_claims(party, ip, amount_cc, claimed_at) " +
           "SELECT $1, $2, $3::text, to_timestamp($4 / 1000.0) " +
           "WHERE NOT EXISTS (SELECT 1 FROM faucet_claims WHERE party = $1) " +
@@ -229,6 +245,23 @@ export function createPostgresFaucetStore(
           "+ $3::numeric) <= $7::numeric)",
         [party, ip, amountCc, nowMs, sinceMs, dailyBudgetCc, lifetimeCapCc]
       );
+
+      // Serialise every claimant on one advisory lock, so the statement above
+      // begins — and therefore takes its snapshot — only after the previous
+      // claimant has committed. The faucet grants fractions of a CC a few times
+      // a minute at most, so a global lock costs nothing measurable and buys an
+      // exact budget instead of an approximate one.
+      //
+      // Without a transaction (in-memory and test executors) the party guard
+      // still holds exactly-once, and the two budget guards degrade to
+      // best-effort under concurrency. Said out loud rather than left for
+      // someone to discover.
+      const ins = executor.transaction
+        ? await executor.transaction(async (tx) => {
+            await tx.query("SELECT pg_advisory_xact_lock($1)", [FAUCET_LOCK_KEY]);
+            return claim(tx);
+          })
+        : await claim(executor);
       if ((ins.rowCount ?? 0) > 0) return "ok";
       // Refused — classify WHY in one read so the route can pick 429 vs 503.
       // (This read is only on the no-spend path; the INSERT above already

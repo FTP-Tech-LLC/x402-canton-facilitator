@@ -38,26 +38,29 @@ describe("type unions", () => {
     expect(tf.feePayer).toBe("ftp_facilitator::1220");
   });
 
-  it("CantonPaymentPayload (transfer-factory) carries submissionRef + optional preparedTxHash", () => {
+  it("CantonPaymentPayload (transfer-factory) carries the inline signed transfer", () => {
     const tf: CantonPaymentPayload = {
       assetTransferMethod: "transfer-factory",
-      payer: "agent::1220",
-      submissionRef: "sub-ref-abc",
+      preparedTransaction: "H4sIAAAAAAAA",
       preparedTxHash: "aa".repeat(32),
+      signature: "c2ln",
+      hashingSchemeVersion: "HASHING_SCHEME_VERSION_V2",
     };
     expect(tf.assetTransferMethod).toBe("transfer-factory");
-    expect(tf.submissionRef).toBe("sub-ref-abc");
+    expect(tf.preparedTransaction).toBe("H4sIAAAAAAAA");
     expect(tf.preparedTxHash).toBe("aa".repeat(32));
+    expect(tf.signature).toBe("c2ln");
   });
 
-  it("CantonPaymentPayload (transfer-factory) accepts a bare submissionRef", () => {
+  it("CantonPaymentPayload (transfer-factory) leaves the hashing scheme optional", () => {
     const bare: CantonPaymentPayload = {
       assetTransferMethod: "transfer-factory",
-      payer: "agent::1220",
-      submissionRef: "sub-ref-bare",
+      preparedTransaction: "H4sIAAAAAAAA",
+      preparedTxHash: "bb".repeat(32),
+      signature: "c2ln",
     };
     expect(bare.assetTransferMethod).toBe("transfer-factory");
-    expect(bare.submissionRef).toBe("sub-ref-bare");
+    expect(bare.hashingSchemeVersion).toBeUndefined();
   });
 
   it("PaymentRequirements with asset='canton-coin' resolves CC via instrumentId", () => {
@@ -81,7 +84,7 @@ describe("type unions", () => {
 
   it("CantonErrorCode includes the transfer-factory reason codes", () => {
     const codes: CantonErrorCode[] = [
-      "invalid_exact_canton_submission_not_found",
+      "invalid_exact_canton_malformed_payload",
       "invalid_exact_canton_preapproval_missing",
       "invalid_exact_canton_transfer_factory_disabled",
       "invalid_exact_canton_execute_failed",
@@ -119,8 +122,9 @@ describe("type unions", () => {
         },
         payload: {
           assetTransferMethod: "transfer-factory",
-          payer: "agent::1220",
-          submissionRef: "sub-ref-abc",
+          preparedTransaction: "H4sIAAAAAAAA",
+          preparedTxHash: "aa".repeat(32),
+          signature: "c2ln",
         },
       },
       paymentRequirements: {

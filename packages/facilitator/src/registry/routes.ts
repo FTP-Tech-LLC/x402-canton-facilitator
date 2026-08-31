@@ -30,7 +30,9 @@ export interface RegistryRouteServices {
     | "acceptRegistrationProposal"
   >;
   /** Read-only Scan resolve, for merchant preapproval-status detection. */
-  scan: Pick<ScanClient, "resolveTransferKind">;
+  // `getTransferPreapprovalByParty` reads `expiresAt`, which the transfer-kind
+  // resolve does not carry — see the preapproval-status route.
+  scan: Pick<ScanClient, "resolveTransferKind" | "getTransferPreapprovalByParty">;
   /** Probe sender for the resolve (any party works; the check is on receiver). */
   facilitatorParty: string;
   synchronizerId: string;
@@ -216,15 +218,57 @@ export async function registerRegistryRoutes(
         detail: msg.slice(0, 200),
       });
     }
-    const hasPreapproval = transferKind === "direct";
+    // `transferKind` answers "how would a transfer route", and Scan keeps
+    // answering `direct` for an EXPIRED preapproval — so on its own it cannot
+    // tell a working merchant from one whose payments all die at interpretation
+    // with `deadline-exceeded`. Read the contract itself for `expiresAt`.
+    //
+    // Fail-OPEN on a read error, deliberately: this endpoint's historical
+    // contract is "does the merchant have a preapproval", and callers (incl. the
+    // CLI's create path) branch on it. Downgrading to `false` because Scan
+    // hiccuped would tell a healthy merchant to create a second preapproval.
+    // We only ever TIGHTEN `hasPreapproval` on data we actually read.
+    let expiresAt: string | undefined;
+    let expired: boolean | undefined;
+    let expiryNote: string | undefined;
+    if (transferKind === "direct") {
+      try {
+        const pre = await svc.scan.getTransferPreapprovalByParty(req.params.party);
+        if (pre) {
+          expiresAt = pre.expiresAt;
+          expired = Date.parse(pre.expiresAt) <= now;
+        }
+      } catch (err) {
+        expiryNote =
+          "expiresAt could not be read from Scan, so hasPreapproval reflects " +
+          "routing only and may be true for an EXPIRED preapproval: " +
+          (err instanceof Error ? err.message : String(err)).slice(0, 120);
+      }
+    }
+    const hasPreapproval = transferKind === "direct" && expired !== true;
     return {
       merchant: req.params.party,
       instrumentId: { admin, id },
       transferKind,
       hasPreapproval,
+      ...(expiresAt !== undefined ? { expiresAt } : {}),
+      ...(expired !== undefined ? { expired } : {}),
+      ...(expiryNote !== undefined ? { expiryNote } : {}),
+      ...(expired === true
+        ? {
+            guidance:
+              `This merchant's TransferPreapproval EXPIRED at ${expiresAt}. ` +
+              "Payments still route one-step and fail at interpretation with " +
+              "deadline-exceeded. Renew it: archive the expired contract and " +
+              "create a new one from the merchant's own Splice wallet / " +
+              "validator, or run `canton-agent-wallet preapproval --force`.",
+          }
+        : {}),
       ...(hasPreapproval
         ? {}
-        : {
+        : expired === true
+          ? {}
+          : {
             guidance:
               "This merchant has no TransferPreapproval, so x402 Canton Coin " +
               "payments resolve to a two-step Pending transfer and will not " +

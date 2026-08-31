@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { CantonError } from "@ftptech/x402-canton-ledger";
 import {
   FaucetService,
+  FaucetPreSubmitError,
   type FaucetServiceDeps,
   type FaucetTransfer,
 } from "./faucet.js";
@@ -220,5 +221,95 @@ describe("FaucetService.claim — payout queue + contention retry", () => {
     await expect(svc3.claim({ recipient: "agent::1220c" })).resolves.toMatchObject({
       updateId: "u-after",
     });
+  });
+});
+
+describe("FaucetService.claim — 'we never asked the ledger' is a distinct answer", () => {
+  // The route's reservation is a ONE-TIME lifetime grant per party. It can only
+  // roll it back safely when the failure PROVES nothing moved, so the service
+  // has to say which side of the submit it died on. Everything below is the
+  // preparation side: a Scan read, an ACS query on our own party, a registry
+  // HTTP call — none of which can move CC.
+  function svcWith(over: Partial<FaucetServiceDeps>) {
+    return new FaucetService({
+      client: {
+        submitAndWaitForTransaction: vi.fn(async () => ({
+          updateId: "u-fc",
+          offset: 1,
+          events: [],
+        })),
+        queryActiveContracts: vi.fn(async () => AMULETS),
+      } as unknown as FaucetServiceDeps["client"],
+      facilitatorParty: "ftp_facilitator::1220fff",
+      userId: "facilitator-user",
+      synchronizerId: "global-domain::1220sync",
+      amountCc: "0.02",
+      getDso: vi.fn(async () => "dso::1220"),
+      resolveTransferFactory: vi.fn(async () => RESOLVED),
+      ...over,
+    });
+  }
+
+  it("marks a Scan (getDso) failure as pre-submit, keeping the cause", async () => {
+    const boom = new CantonError("scan down", "HTTP_ERROR", 503);
+    const svc = svcWith({ getDso: vi.fn(async () => { throw boom; }) });
+    await expect(svc.claim({ recipient: "agent::1220a" })).rejects.toBeInstanceOf(
+      FaucetPreSubmitError
+    );
+    await svc.claim({ recipient: "agent::1220a" }).catch((e) => {
+      expect((e as FaucetPreSubmitError).cause).toBe(boom);
+    });
+  });
+
+  it("marks a registry-resolve failure as pre-submit", async () => {
+    const svc = svcWith({
+      resolveTransferFactory: vi.fn(async () => {
+        throw new CantonError("registry 500", "HTTP_ERROR", 500);
+      }),
+    });
+    await expect(svc.claim({ recipient: "agent::1220a" })).rejects.toBeInstanceOf(
+      FaucetPreSubmitError
+    );
+  });
+
+  it("marks an unfunded-funder failure as pre-submit", async () => {
+    const svc = svcWith({
+      client: {
+        submitAndWaitForTransaction: vi.fn(),
+        queryActiveContracts: vi.fn(async () => []),
+      } as unknown as FaucetServiceDeps["client"],
+    });
+    await expect(svc.claim({ recipient: "agent::1220a" })).rejects.toBeInstanceOf(
+      FaucetPreSubmitError
+    );
+  });
+
+  it("does NOT mark a SUBMIT failure — that one is genuinely ambiguous", async () => {
+    // The discriminator, and the whole reason the marker is narrow. A submit
+    // that fails may still have committed; if this were wrapped too, the route
+    // would release the reservation and the party could be paid twice.
+    const boom = new CantonError("gateway", "HTTP_ERROR", 502);
+    const svc = svcWith({
+      client: {
+        submitAndWaitForTransaction: vi.fn(async () => { throw boom; }),
+        queryActiveContracts: vi.fn(async () => AMULETS),
+      } as unknown as FaucetServiceDeps["client"],
+    });
+    await expect(svc.claim({ recipient: "agent::1220a" })).rejects.toBe(boom);
+  });
+
+  it("a pre-submit 404 is still input contention — the single re-select survives the marker", async () => {
+    // isInputContention has to unwrap, or wrapping would silently disable the
+    // one retry that exists for a holding consumed mid-flight.
+    let n = 0;
+    const resolve = vi.fn(async () => {
+      if (n++ === 0) throw new CantonError("gone", "HTTP_ERROR", 404);
+      return RESOLVED;
+    });
+    const svc = svcWith({ resolveTransferFactory: resolve });
+    await expect(svc.claim({ recipient: "agent::1220a" })).resolves.toMatchObject({
+      updateId: "u-fc",
+    });
+    expect(resolve).toHaveBeenCalledTimes(2);
   });
 });

@@ -116,18 +116,17 @@ describe("transfer-factory PaymentRequirements matching", () => {
 });
 
 describe("transfer-factory payload arm (compile-shape checks)", () => {
-  it("carries only the small stash reference, never the signed tx", () => {
+  it("carries the payer-signed transfer inline (self-contained, any facilitator relays it)", () => {
     const payload: CantonPaymentPayload = {
       assetTransferMethod: "transfer-factory",
-      payer:
-        "agent::1220ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-      submissionRef: "8f14e45f-ceea-467f-9c1d-1a2b3c4d5e6f",
+      preparedTransaction: "H4sIAAAAAAAA",
       preparedTxHash: "aa".repeat(32),
+      signature: "c2ln",
     };
-    expect(payload.submissionRef.length).toBeLessThan(64);
-    // The payload carries only the small stash reference — never a heavy signed
-    // artifact — so the only method-specific key is the submissionRef.
-    expect("submissionRef" in payload).toBe(true);
+    // The signed transfer travels in the payload itself — there is no
+    // server-side stash reference anymore.
+    expect("preparedTransaction" in payload).toBe(true);
+    expect("submissionRef" in payload).toBe(false);
   });
 
   it("method union covers exactly the one live method", () => {

@@ -14,6 +14,19 @@
  */
 
 import type { FacilitatorRequest } from "@ftptech/x402-canton-core";
+import {
+  DEFAULT_MAX_COMPRESSED_BYTES,
+  MAX_SIGNATURE_B64_CHARS,
+  MAX_PREPARED_TX_HASH_CHARS,
+} from "@ftptech/x402-canton-core";
+
+/** Base64 expansion of the codec's compressed cap, with a little slack. These
+ *  bounds are deliberately the SAME numbers the payload decoder enforces: a
+ *  body boundary that were looser would let oversized input through to the
+ *  decoder, and one that were tighter would reject payments the decoder would
+ *  have accepted. */
+const MAX_INLINE_B64_CHARS = Math.ceil(DEFAULT_MAX_COMPRESSED_BYTES / 3) * 4;
+const MAX_SIGNATURE_CHARS = MAX_SIGNATURE_B64_CHARS;
 
 export type BodyValidationOutcome =
   | { ok: true; body: FacilitatorRequest }
@@ -95,33 +108,69 @@ export function validateFacilitatorRequestShape(
         "assetTransferMethod 'transfer-factory' is not enabled on this facilitator (CANTON_X402_TF_ENABLED is off)",
     };
   }
-  // NO `payer` requirement: the wire payload no longer carries a `payer`
-  // (an untrusted client claim, removed per spec — the facilitator proves the
-  // payer from the relay stash row). A legacy 0.6.x client may still send a
-  // stray `payer` key; it is simply IGNORED here (loose object — no strict
-  // rejection), and the trusted payer is resolved later per-method.
+  // NO `payer` requirement: the wire payload does not carry a `payer` (an
+  // untrusted client claim — the facilitator proves the payer from the signed
+  // transaction). A stray `payer` key from an old client is simply IGNORED here
+  // (loose object — no strict rejection).
 
-  // transfer-factory: the payload carries only the relay-stash reference (the
-  // signed prepared tx lives on the relay — it cannot fit an X-PAYMENT header).
+  // transfer-factory: the INLINE carriage is the only one. The payload carries
+  // the payer-signed transaction itself (`preparedTransaction` + `signature` +
+  // `preparedTxHash`), so any facilitator can relay it. The legacy `submissionRef`
+  // stash carriage was removed — a payload carrying it is rejected, and its
+  // sender must upgrade to a client that emits the inline form.
   if (inner.assetTransferMethod === "transfer-factory") {
+    // NOT rejected here. A payload carrying `submissionRef` parses fine — it is
+    // a working client of the older shape, so the answer is a VERDICT, not a
+    // malformed-request 400. This repo's own conformance contract says so:
+    //   /verify with submissionRef -> 200, isValid:false, discriminated reason
+    //   /settle with the same      -> 200, success:false, matching errorReason
+    // It also reaches the integrator better: a 402 carrying
+    // `invalid_exact_canton_missing_proof` tells them what is wrong, while a
+    // 400 surfaces through the shipped middlewares as a generic facilitator
+    // error. The rejection lives in runValidation (common.ts) instead.
+    // A LEGACY PAYLOAD IS RECOGNISABLY LEGACY — do not judge it by inline's
+    // shape. It carries `submissionRef` and, of course, no `preparedTransaction`;
+    // failing it for the missing inline field would answer 400 for a body that
+    // is not malformed, just old, and the conformance contract wants
+    // 200 + isValid:false + a discriminated reason. runValidation names it
+    // `invalid_exact_canton_missing_proof` (the code the spec already defines for a
+    // payload without the payer-signed submission); let it get there.
+    if (inner.submissionRef !== undefined) {
+      return { ok: true, body: raw as FacilitatorRequest };
+    }
+    // Only cheap shape/bound checks here. Base64 canonicality, gzip framing and
+    // the decompressed cap belong to the payload decoder, which the verify arm
+    // runs — this boundary exists to keep obviously-oversized bodies from
+    // reaching it at all.
     if (
-      typeof inner.submissionRef !== "string" ||
-      inner.submissionRef.length === 0 ||
-      inner.submissionRef.length > 128
+      typeof inner.preparedTransaction !== "string" ||
+      inner.preparedTransaction.length === 0 ||
+      inner.preparedTransaction.length > MAX_INLINE_B64_CHARS
+    ) {
+      return {
+        ok: false,
+        error: `paymentPayload.payload.preparedTransaction must be a non-empty base64 string of at most ${MAX_INLINE_B64_CHARS} chars`,
+      };
+    }
+    if (
+      typeof inner.signature !== "string" ||
+      inner.signature.length === 0 ||
+      inner.signature.length > MAX_SIGNATURE_CHARS
+    ) {
+      return {
+        ok: false,
+        error: `paymentPayload.payload.signature must be a non-empty base64 string of at most ${MAX_SIGNATURE_CHARS} chars`,
+      };
+    }
+    if (
+      typeof inner.preparedTxHash !== "string" ||
+      inner.preparedTxHash.length === 0 ||
+      inner.preparedTxHash.length > MAX_PREPARED_TX_HASH_CHARS
     ) {
       return {
         ok: false,
         error:
-          "paymentPayload.payload.submissionRef required for transfer-factory",
-      };
-    }
-    if (
-      inner.preparedTxHash !== undefined &&
-      typeof inner.preparedTxHash !== "string"
-    ) {
-      return {
-        ok: false,
-        error: "paymentPayload.payload.preparedTxHash must be a string",
+          "paymentPayload.payload.preparedTxHash is required for the inline carriage",
       };
     }
   }

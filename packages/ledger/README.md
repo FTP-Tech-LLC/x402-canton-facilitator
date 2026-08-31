@@ -41,7 +41,7 @@ Facilitator-side domain wrappers (`Cip56InstructionService`,
 `@ftptech/x402-canton-facilitator` because they encode the facilitator's
 role (Scan-read verify, MerchantContract template, preapproval
 provider). The lower-level Canton plumbing in this package is reusable
-by anyone, including the client SDK's `Cip56KeyfileSigner`, which uses
+by anyone, including any client-SDK `CantonSigner`, which uses
 `CantonExternalPartySigner` to submit a `TransferFactory_Transfer` from
 the agent's own participant.
 

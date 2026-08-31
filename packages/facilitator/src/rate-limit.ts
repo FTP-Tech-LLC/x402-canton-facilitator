@@ -65,8 +65,41 @@ export interface SlidingWindowLimiter {
    */
   allowKeys(
     keys: readonly (string | { key: string; max: number })[],
-    now: number
+    now: number,
+    /**
+     * Whether this attempt spends the GLOBAL budget. Default true.
+     *
+     * It exists because the two caps answer different questions. The per-key
+     * caps are admission control — cheap, and rightly charged to anything that
+     * arrives. The global cap is a budget for the scarce thing: submissions
+     * that burn Global Synchronizer traffic. Charging it at admission meant a
+     * stream of well-formed nonsense — bodies that pass shape validation and
+     * are then refused by the real checks, costing us a decode and nothing
+     * else — consumed the same budget as real payments, and could exhaust it
+     * for every honest merchant on the facilitator. Two IPs sending junk were
+     * enough.
+     *
+     * So: pass false at admission, and charge the global budget again with
+     * `allowKeys([], now)` immediately before the submit that actually spends.
+     */
+    chargeGlobal?: boolean
   ): boolean;
+  /**
+   * Is `key` still under `max` — WITHOUT recording an attempt?
+   *
+   * Exists for budgets that are spent on an OUTCOME rather than on arrival:
+   * the caller has to ask "is this key already over" before doing the work,
+   * and then charge only if the work turned out to be waste. `allow` cannot
+   * express that — it tests and records in one step, so using it as the
+   * pre-check would charge the honest case too.
+   *
+   * `max <= 0` means uncapped and always answers true. Concurrent peeks can
+   * both pass and both then charge, overshooting the budget by the number of
+   * in-flight requests; that is deliberate. This is a budget, not an
+   * invariant, and paying for a lock to make it exact would cost more than the
+   * overshoot.
+   */
+  peek(key: string, now: number, max: number): boolean;
   /** Number of live per-key buckets. Introspection hook for tests/metrics. */
   _size(): number;
   /**
@@ -115,7 +148,8 @@ export function createSlidingWindowLimiter(
 
   const allowKeys = (
     keys: readonly (string | { key: string; max: number })[],
-    now: number
+    now: number,
+    chargeGlobal = true
   ): boolean => {
     // Normalize: a bare string is capped at maxPerPayer; an object carries its
     // own cap (e.g. the IP key on /settle uses the higher per-IP cap).
@@ -126,14 +160,15 @@ export function createSlidingWindowLimiter(
 
     // Fully disabled (no per-key cap in play, no global) → no bookkeeping, no
     // unbounded Map growth.
-    if (!anyKeyCapped && maxGlobal <= 0) return true;
+    const globalInPlay = chargeGlobal && maxGlobal > 0;
+    if (!anyKeyCapped && !globalInPlay) return true;
 
     // Amortised eviction of aged-out per-key buckets (bounds Map growth).
     if (anyKeyCapped && now - lastSweepAt >= windowMs) sweep(now);
 
     // Global cap is checked ONCE regardless of how many per-key buckets the
     // attempt touches, so a multi-key call does not double-spend the budget.
-    if (maxGlobal > 0) {
+    if (globalInPlay) {
       prune(globalHits, now);
       if (globalHits.length >= maxGlobal) return false;
     }
@@ -158,7 +193,7 @@ export function createSlidingWindowLimiter(
     }
 
     // Global + every per-key bucket has room — record the hit.
-    if (maxGlobal > 0) globalHits.push(now);
+    if (globalInPlay) globalHits.push(now);
     for (const arr of buckets) arr.push(now);
     // Buckets created above always receive a push, so they are non-empty on
     // return; freshly-created-but-unpushed buckets cannot occur here (we return
@@ -173,6 +208,13 @@ export function createSlidingWindowLimiter(
       return allowKeys([key], now);
     },
     allowKeys,
+    peek(key: string, now: number, max: number): boolean {
+      if (max <= 0) return true;
+      const arr = perKey.get(key);
+      if (!arr) return true;
+      prune(arr, now);
+      return arr.length < max;
+    },
     _size(): number {
       return perKey.size;
     },
@@ -239,16 +281,25 @@ export function createCircuitBreaker(
   const minSamples = cfg?.minSamples ?? 10;
   // TWO independent accountings, deliberately decoupled so success decay cannot
   // blind the rate arm:
-  //   COUNT arm — `decayCount`: a small integer that a failure increments and a
-  //     success DECREMENTS (decay, floored at 0). Back-to-back failures make it
-  //     behave exactly like the old consecutive count; a single success no
-  //     longer fully resets it.
+  //   COUNT arm — `countArm`: failure timestamps that a success forgives one of
+  //     (oldest first) AND that age out of the window. Back-to-back failures
+  //     make it behave exactly like the old consecutive count; a single success
+  //     no longer fully resets it.
+  //
+  //     It is a windowed ARRAY rather than an integer because an integer was
+  //     both of those things and neither: `prune` only ever touched the rate
+  //     arm's arrays, so a failure from an hour ago still counted toward a
+  //     "60-second" window, and — worse — the count stayed at or above the
+  //     threshold after a trip. Once the cooldown elapsed, ONE further failure
+  //     re-opened the breaker immediately, forever. A protection that latches
+  //     open on a single event after its first trip is not a protection; it is
+  //     an outage waiting for its trigger.
   //   RATE arm — true sliding-window timestamps of failures and successes
   //     (NOT mutated by decay), so failures / (failures + successes) reflects
   //     the real recent failure fraction. This is what catches a paced attacker
   //     who pairs one cheap success with every billed-but-zero-funds burn: the
   //     COUNT arm decays toward zero, but the true fraction stays ~50%.
-  let decayCount = 0;
+  const countArm: number[] = []; // sorted-ascending, pruned to windowMs
   const failures: number[] = []; // sorted-ascending, pruned to windowMs
   const successes: number[] = []; // sorted-ascending, pruned to windowMs
   let openUntil = 0;
@@ -268,11 +319,12 @@ export function createCircuitBreaker(
     if (threshold <= 0) return;
     prune(failures, now);
     prune(successes, now);
+    prune(countArm, now);
     failures.push(now);
-    decayCount++;
-    // COUNT arm: the decaying failure count reaches the threshold (back-to-back
-    // failures reproduce the old consecutive behaviour exactly).
-    const countTrip = decayCount >= threshold;
+    countArm.push(now);
+    // COUNT arm: the decaying, windowed failure count reaches the threshold
+    // (back-to-back failures reproduce the old consecutive behaviour exactly).
+    const countTrip = countArm.length >= threshold;
     // RATE arm: a sustained failure fraction over the true window trips even
     // when each burn is paired with a success that decays the count arm.
     const total = failures.length + successes.length;
@@ -281,7 +333,14 @@ export function createCircuitBreaker(
       failures.length >= minSamples &&
       total > 0 &&
       failures.length / total >= failureRate;
-    if (countTrip || rateTrip) openUntil = now + cooldownMs;
+    if (countTrip || rateTrip) {
+      openUntil = now + cooldownMs;
+      // Spend the evidence that tripped it. Otherwise the arm stays at the
+      // threshold through the whole cooldown and the very next failure trips it
+      // again — the breaker would never actually re-close under any load at
+      // all. After a trip it takes a fresh `threshold` failures to re-open.
+      countArm.length = 0;
+    }
   };
 
   return {
@@ -301,7 +360,9 @@ export function createCircuitBreaker(
       // failure, so a real burst still needs as many successes as failures to
       // fully decay. With ≤1 residual failure this lands at 0 — the same as the
       // old reset for the common honest case.
-      if (decayCount > 0) decayCount--;
+      // Forgive the OLDEST outstanding failure. Same decay as before, now on a
+      // value that is also windowed.
+      if (countArm.length > 0) countArm.shift();
       // Feed the rate arm's denominator with a TRUE success sample (only when
       // dated; the legacy no-arg success just decays the count above). Crucially
       // this does NOT remove anything from `failures`, so the measured fraction
@@ -333,4 +394,54 @@ export function isTrafficError(err: unknown): boolean {
   return /traffic|sequencer|ABORTED|OUT_OF_QUOTA|insufficient.*(traffic|balance)/i.test(
     body
   );
+}
+
+/**
+ * The participant is already processing this EXACT submission.
+ *
+ * Canton dedupes by changeId — (user, commandId, actAs) — and a prepared
+ * transaction carries its commandId in the signed bytes, so two concurrent
+ * settles of one payment are the same submission by construction. The second
+ * one gets 409 SUBMISSION_ALREADY_IN_FLIGHT.
+ *
+ * This is the participant's idempotency working, and it is why a duplicate
+ * settle never double-spends. But it is NOT a failure: treating it as one
+ * tells the caller their payment did not go through while it is going through,
+ * and a caller who believes that may pay a second time. Canton labels it
+ * category 2 with `retryInfo`, i.e. retry and you will get the answer.
+ *
+ * Measured, not assumed: this exact 409 was produced on MainNet by firing two
+ * identical /settle calls at once, in a live stress run written for the
+ * purpose. An adversarial review had dismissed the scenario as impossible.
+ */
+/**
+ * Did this failure PROVE that nothing was committed on the ledger?
+ *
+ * Only a participant that answered with a definite client-side rejection did:
+ * it processed the request and refused it, so no contract changed. A timeout,
+ * a dropped connection or a 5xx proves nothing — the submit may well have
+ * committed and only the answer was lost.
+ *
+ * The distinction matters wherever a failure triggers a rollback of our own
+ * bookkeeping. Releasing a one-shot reservation on an ambiguous failure is how
+ * a single payout becomes two: the party claims again, real CC leaves twice,
+ * and the budget never sees the first one. Callers must treat `false` as "I do
+ * not know" and keep the reservation.
+ *
+ * 408 and 429 are excluded from the definite set on purpose — they are the two
+ * 4xx codes that mean "try again", not "refused".
+ */
+export function provesNothingCommitted(err: unknown): boolean {
+  const e = err as { code?: unknown; status?: unknown };
+  if (e?.code !== "HTTP_ERROR") return false; // TIMEOUT / network / unknown
+  const s = typeof e.status === "number" ? e.status : 0;
+  if (s === 408 || s === 429) return false;
+  return s >= 400 && s < 500;
+}
+
+export function isSubmissionAlreadyInFlight(err: unknown): boolean {
+  const body =
+    (err as { responseBody?: string })?.responseBody ??
+    (err instanceof Error ? err.message : String(err ?? ""));
+  return /SUBMISSION_ALREADY_IN_FLIGHT|already in-flight/i.test(body);
 }

@@ -2,9 +2,10 @@ import { describe, it, expect } from "vitest";
 import { validateFacilitatorRequestShape } from "./validate-body.js";
 
 // A well-formed transfer-factory body — the generic VALID fixture most tests
-// build on. transfer-factory is the SOLE settlement method: the payload carries
-// only a bounded submissionRef (NO `payer` — that untrusted claim was removed);
-// extra carries the discriminator + instrument fields.
+// build on. transfer-factory is the SOLE settlement method and the INLINE
+// carriage is the only one: the payload carries the payer-signed transaction
+// (preparedTransaction + preparedTxHash + signature; NO `payer` — that untrusted
+// claim was removed); extra carries the discriminator + instrument fields.
 const VALID = {
   x402Version: 2,
   paymentPayload: {
@@ -15,7 +16,9 @@ const VALID = {
     accepted: {},
     payload: {
       assetTransferMethod: "transfer-factory",
-      submissionRef: "8f14e45f-ceea-467f-9c1d-1a2b3c4d5e6f",
+      preparedTransaction: "H4sIAAAAAAAA",
+      preparedTxHash: "aa".repeat(32),
+      signature: "c2ln",
     },
   },
   paymentRequirements: {
@@ -52,7 +55,9 @@ describe("validateFacilitatorRequestShape", () => {
     });
     const base = {
       assetTransferMethod: "transfer-factory",
-      submissionRef: "8f14e45f-ceea-467f-9c1d-1a2b3c4d5e6f",
+      preparedTransaction: "H4sIAAAAAAAA",
+      preparedTxHash: "aa".repeat(32),
+      signature: "c2ln",
     };
 
     it("accepts a payload with NO `payer` (no longer required)", () => {
@@ -149,7 +154,9 @@ describe("validateFacilitatorRequestShape", () => {
         // payerParty. Neither is required or validated anymore → still valid.
         payload: {
           assetTransferMethod: "transfer-factory",
-          submissionRef: "8f14e45f-ceea-467f-9c1d-1a2b3c4d5e6f",
+          preparedTransaction: "H4sIAAAAAAAA",
+          preparedTxHash: "aa".repeat(32),
+          signature: "c2ln",
           payerParty: "",
         },
       },
@@ -193,10 +200,12 @@ describe("validate-body additional edge cases", () => {
       paymentPayload: {
         ...VALID.paymentPayload,
         // `payer` ABSENT, only a null (retired) payerParty. The validator checks
-        // neither field, so a valid submissionRef alone keeps the body well-formed.
+        // neither field, so a valid inline payload alone keeps the body well-formed.
         payload: {
           assetTransferMethod: "transfer-factory",
-          submissionRef: "8f14e45f-ceea-467f-9c1d-1a2b3c4d5e6f",
+          preparedTransaction: "H4sIAAAAAAAA",
+          preparedTxHash: "aa".repeat(32),
+          signature: "c2ln",
           payerParty: null,
         },
       },
@@ -876,32 +885,44 @@ describe("transfer-factory payload arm", () => {
   });
   const base = {
     assetTransferMethod: "transfer-factory",
-    submissionRef: "8f14e45f-ceea-467f-9c1d-1a2b3c4d5e6f",
+    preparedTransaction: "H4sIAAAAAAAA",
+    preparedTxHash: "aa".repeat(32),
+    signature: "c2ln",
   };
 
-  it("accepts a well-formed tf payload (permissive gate)", () => {
+  it("accepts a well-formed inline tf payload (permissive gate)", () => {
     const r = validateFacilitatorRequestShape(tfBody(base));
     expect(r.ok).toBe(true);
   });
 
-  it("accepts an optional string preparedTxHash; rejects a non-string one", () => {
-    expect(
-      validateFacilitatorRequestShape(tfBody({ ...base, preparedTxHash: "aa" }))
-        .ok
-    ).toBe(true);
-    const bad = validateFacilitatorRequestShape(
+  it("requires a string preparedTxHash; rejects a missing or non-string one", () => {
+    expect(validateFacilitatorRequestShape(tfBody(base)).ok).toBe(true);
+    const nonString = validateFacilitatorRequestShape(
       tfBody({ ...base, preparedTxHash: 42 })
     );
-    expect(bad.ok).toBe(false);
+    expect(nonString.ok).toBe(false);
+    const { preparedTxHash: _drop, ...noHash } = base;
+    const missing = validateFacilitatorRequestShape(tfBody(noHash));
+    expect(missing.ok).toBe(false);
   });
 
-  it("requires a non-empty bounded submissionRef", () => {
-    for (const submissionRef of [undefined, "", "x".repeat(200)]) {
-      const r = validateFacilitatorRequestShape(
-        tfBody({ ...base, submissionRef })
-      );
-      expect(r.ok).toBe(false);
-      if (!r.ok) expect(r.error).toMatch(/submissionRef/);
+  it("does NOT 400 the legacy submissionRef carriage — it is a verdict, not a bad request", () => {
+    // The body parses; the sender is a working client of the older shape. This
+    // repo's own conformance contract (e2e/conformance.sh) requires
+    //   /verify with submissionRef -> 200 + isValid:false + a discriminated reason
+    //   /settle with the same      -> 200 + success:false + a matching errorReason
+    // and a 400 also reaches the integrator worse: the shipped middlewares turn
+    // any non-2xx into a generic facilitator failure, so the one party who needs
+    // to hear "upgrade your client" is the least likely to. The rejection lives
+    // in runValidation now, as the spec's invalid_exact_canton_missing_proof.
+    const r = validateFacilitatorRequestShape(
+      tfBody({
+        assetTransferMethod: "transfer-factory",
+        submissionRef: "8f14e45f-ceea-467f-9c1d-1a2b3c4d5e6f",
+      })
+    );
+    if (!r.ok) {
+      expect(r.error).not.toMatch(/submissionRef/);
     }
   });
 

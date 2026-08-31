@@ -155,3 +155,23 @@ export function ledgerDecimalsMatch(a: string, b: string): boolean {
     return false;
   }
 }
+
+/**
+ * Exact sum of ledger Decimal strings — BigInt on the atomic scale, never a
+ * float. A float sum of a batch of holdings can land an atomic off the
+ * on-ledger total, and verify-before-sign compares the intended amount against
+ * the signed bytes digit-for-digit. Throws on a malformed input (fail-closed).
+ */
+export function sumLedgerDecimals(values: readonly string[]): string {
+  let acc = 0n;
+  for (const v of values) acc += BigInt(decimalToAtomicCC(v));
+  return atomicToDecimalCC(acc.toString());
+}
+
+/** Exact three-way compare of two ledger Decimal strings (short forms such as
+ *  "0.02" are fine). Throws on a malformed input. */
+export function compareLedgerDecimals(a: string, b: string): -1 | 0 | 1 {
+  const x = BigInt(decimalToAtomicCC(a));
+  const y = BigInt(decimalToAtomicCC(b));
+  return x < y ? -1 : x > y ? 1 : 0;
+}

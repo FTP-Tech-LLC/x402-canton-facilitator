@@ -14,10 +14,6 @@ export interface AttributionStore {
     network: string;
   }): Promise<void>;
 
-  markServed(updateId: string): Promise<void>;
-
-  getAttempted(limit: number): Promise<Array<{ updateId: string }>>;
-
   updateTrafficSummary(
     updateId: string,
     result: TrafficSummaryResult
@@ -119,33 +115,36 @@ export function createPostgresAttributionStore(
   };
 
   return {
+    /**
+     * The row lands as 'served' in the SAME statement that creates it.
+     *
+     * It used to insert on the schema default 'attempted' and immediately
+     * UPDATE to 'served' — two statements with a tear between them, and the
+     * tear was not survivable. `getPending` only ever looks at
+     * `settle_status='served'`, so a row stuck on 'attempted' is invisible to
+     * the traffic-bytes fetcher forever: the payment settled on-ledger, we
+     * burned Global Synchronizer traffic for it, and no report can ever
+     * account for those bytes. Silent, and it costs app rewards.
+     *
+     * The repair worker meant to catch that queried the CONSUMED-payments
+     * store by updateId. Those are different namespaces — consumed keys are
+     * the payment-identity hash, update ids are the ledger's `1220…` — so the
+     * lookup could only ever return false and the repair could only ever
+     * no-op. Measured, not inferred: 244,845 rows in production, every one
+     * 'served', and not one 'attempted' row for the worker to have fixed.
+     *
+     * There is nothing 'attempted' about this row anyway. It exists only
+     * because execute already returned a real updateId; the money moved before
+     * we ever reached here.
+     */
     async record(entry) {
       await init();
       await executor.query(
         "INSERT INTO payment_burns" +
-          "(update_id, payer_party, merchant_party, amount_atomic, network)" +
-          " VALUES ($1,$2,$3,$4,$5) ON CONFLICT (update_id) DO NOTHING",
+          "(update_id, payer_party, merchant_party, amount_atomic, network, settle_status)" +
+          " VALUES ($1,$2,$3,$4,$5,'served') ON CONFLICT (update_id) DO NOTHING",
         [entry.updateId, entry.payerParty, entry.merchantParty, entry.amountAtomic, entry.network]
       );
-    },
-
-    async markServed(updateId) {
-      await init();
-      await executor.query(
-        "UPDATE payment_burns SET settle_status='served'" +
-          " WHERE update_id=$1 AND settle_status='attempted'",
-        [updateId]
-      );
-    },
-
-    async getAttempted(limit) {
-      await init();
-      const r = await executor.query(
-        "SELECT update_id FROM payment_burns" +
-          " WHERE settle_status='attempted' ORDER BY settled_at ASC LIMIT $1",
-        [limit]
-      );
-      return (r.rows as Array<{ update_id: string }>).map((row) => ({ updateId: row.update_id }));
     },
 
     async updateTrafficSummary(updateId, result) {

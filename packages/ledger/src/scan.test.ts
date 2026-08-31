@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   ScanClient,
   TtlSingleFlightCache,
+  KeyedTtlSingleFlightCache,
   getEventTrafficSummaryWithFallback,
   isTransientScanError,
   type TrafficSummaryResult,
@@ -555,11 +556,15 @@ describe("ScanClient — domain_id, contract_id, nonce path, headers, traffic fl
       scanUrl: VALIDATOR_BASE,
       fetch: makeFetch(() => {
         callCount++;
-        return { status: 500, body: { error: "internal server error" } };
+        // 400: a request the server understood and rejected. The point here is
+        // "no automatic retry", so the example must be an error nothing retries
+        // — 500 is now transient (an SV's internal error is the case where the
+        // OTHER SV should be asked) and would retry, testing the wrong thing.
+        return { status: 400, body: { error: "bad request" } };
       }),
     });
 
-    await expect(c.getAmuletRules()).rejects.toThrow(/500/);
+    await expect(c.getAmuletRules()).rejects.toThrow(/400/);
     // Only one fetch call — no automatic retry
     expect(callCount).toBe(1);
   });
@@ -1294,6 +1299,52 @@ describe("ScanClient.resolveTransferKind", () => {
     });
     expect(fetchSpy).not.toHaveBeenCalled();
   });
+
+  it("registryBaseUrl: routes a non-Amulet token to the DA Registry Utility per-registrar path", async () => {
+    const UTIL = "https://registry.example";
+    const usdcx = {
+      ...probe,
+      admin: "decentralized-usdc-interchain-rep::1220abc",
+      id: "USDCx",
+      registryBaseUrl: UTIL,
+    };
+    let captured: { url: string; init: RequestInit } | null = null;
+    const c = new ScanClient({
+      scanUrl: SV_BASE,
+      flavor: "sv",
+      fetch: makeFetch((req) => {
+        captured = req;
+        return { body: { transferKind: "direct" } };
+      }),
+    });
+    const kind = await c.resolveTransferKind(usdcx);
+    expect(kind).toBe("direct");
+    expect(captured?.url).toBe(
+      `${UTIL}/api/token-standard/v0/registrars/${encodeURIComponent(
+        "decentralized-usdc-interchain-rep::1220abc"
+      )}/registry/transfer-instruction/v1/transfer-factory`
+    );
+    const body = JSON.parse(captured?.init.body as string);
+    expect(body.choiceArguments.expectedAdmin).toBe(
+      "decentralized-usdc-interchain-rep::1220abc"
+    );
+    expect(body.choiceArguments.transfer.instrumentId.id).toBe("USDCx");
+  });
+
+  it("registryBaseUrl: works on a validator flavor (bypasses the SV-only gate)", async () => {
+    const UTIL = "https://registry.example";
+    const c = new ScanClient({
+      scanUrl: VALIDATOR_BASE,
+      fetch: makeFetch(() => ({ body: { transferKind: "offer" } })),
+    });
+    const kind = await c.resolveTransferKind({
+      ...probe,
+      admin: "reg::1220",
+      id: "USDCx",
+      registryBaseUrl: UTIL,
+    });
+    expect(kind).toBe("offer");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1535,11 +1586,11 @@ describe("ScanClient request — HTTP 429 bounded retry", () => {
       flavor: "sv",
       fetch: vi.fn(async () => {
         calls += 1;
-        return new Response("nope", { status: 500 });
+        return new Response("nope", { status: 400 });
       }) as typeof globalThis.fetch,
     });
     await expect(c.getEventTrafficSummary(UPDATE_ID)).rejects.toMatchObject({
-      status: 500,
+      status: 400,
     });
     expect(calls).toBe(1);
   });
@@ -1718,10 +1769,11 @@ describe("ScanClient — getAmuletRules / mining-rounds TTL cache", () => {
     const fetchFn = vi.fn(async () => {
       n++;
       if (n === 1) {
-        // 500 = a NON-transient error (not retried), so the first call genuinely
-        // fails — proving the failure is not cached. (A 503 would now be retried
-        // transparently into the success below, which is the resilience fix.)
-        return new Response("err", { status: 500 });
+        // 400 = a stable answer, not retried, so the first call genuinely fails
+        // — which is what proves the failure is not cached. Any transient status
+        // (503, and now 500) would be retried transparently into the success
+        // below and the test would pass without testing anything.
+        return new Response("err", { status: 400 });
       }
       return new Response(JSON.stringify(amuletBody("ar-ok")), {
         status: 200,
@@ -1733,7 +1785,7 @@ describe("ScanClient — getAmuletRules / mining-rounds TTL cache", () => {
       fetch: fetchFn,
       cache: { amuletRulesTtlMs: 60_000 },
     });
-    await expect(c.getAmuletRules()).rejects.toThrow(/500/);
+    await expect(c.getAmuletRules()).rejects.toThrow(/400/);
     const ok = await c.getAmuletRules();
     expect(ok.amulet_rules.contract.contract_id).toBe("ar-ok");
     expect(fetchFn).toHaveBeenCalledTimes(2);
@@ -1950,7 +2002,7 @@ describe("ScanClient.getFeaturedAppRight", () => {
 });
 
 describe("ScanClient — transient-5xx retry + multi-SV fallback", () => {
-  it("isTransientScanError: 429/502/503/504 + TIMEOUT/TRANSPORT_ERROR are transient; 500/404/400 and non-CantonError are not", () => {
+  it("isTransientScanError: 429 + 5xx + TIMEOUT/TRANSPORT_ERROR are transient; 4xx and non-CantonError are not", () => {
     const http = (s: number) => new CantonError(`x`, "HTTP_ERROR", s, "");
     expect(isTransientScanError(http(429))).toBe(true);
     expect(isTransientScanError(http(502))).toBe(true);
@@ -1958,7 +2010,14 @@ describe("ScanClient — transient-5xx retry + multi-SV fallback", () => {
     expect(isTransientScanError(http(504))).toBe(true);
     expect(isTransientScanError(new CantonError("t", "TIMEOUT"))).toBe(true);
     expect(isTransientScanError(new CantonError("t", "TRANSPORT_ERROR"))).toBe(true);
-    expect(isTransientScanError(http(500))).toBe(false); // genuine app error, not shed
+    // 500 was deliberately excluded here as "a genuine app error, not shed".
+    // Overturned, because this predicate gates the FAILOVER as well as the
+    // retry: an SV's own internal error is precisely the case where the other
+    // SV should be asked, and excluding it let one SV's bug take the money path
+    // down while healthy SVs sat unused — the outage the fallback list exists
+    // for. The reads are idempotent GETs, so the cost of being wrong the other
+    // way is one bounded retry.
+    expect(isTransientScanError(http(500))).toBe(true);
     expect(isTransientScanError(http(404))).toBe(false); // real "not found"
     expect(isTransientScanError(http(400))).toBe(false);
     expect(isTransientScanError(new Error("plain"))).toBe(false);
@@ -2013,5 +2072,189 @@ describe("ScanClient — transient-5xx retry + multi-SV fallback", () => {
     });
     await expect(c.getAmuletRules()).rejects.toThrow(/404/);
     expect(n).toBe(1); // immediate throw, no retry, no fallback
+  });
+});
+
+describe("getOwnedAmuletAmounts — funding evidence for a party we may not host", () => {
+  const PARTY = "agent::1220aa";
+  const amulet = (cid: string, amount: string, owner = PARTY) => ({
+    contract_id: cid,
+    template_id: "abc:Splice.Amulet:Amulet",
+    create_arguments: { owner, amount: { initialAmount: amount } },
+  });
+
+  function scanWith(pages: unknown[]): ScanClient {
+    let call = 0;
+    return new ScanClient({
+      scanUrl: "https://scan.example",
+      fetch: makeFetch(({ url }) => {
+        if (url.includes("snapshot-timestamp")) {
+          const id = Number(new URL(url).searchParams.get("migration_id"));
+          // Both ids answer; the LATER record_time must win, not the first.
+          const t: Record<number, string> = {
+            0: "2026-01-01T00:00:00Z",
+            1: "2026-08-01T00:00:00Z",
+          };
+          return t[id]
+            ? { body: { record_time: t[id] } }
+            : { status: 404, body: { error: "no such migration" } };
+        }
+        return { body: pages[Math.min(call++, pages.length - 1)] };
+      }),
+    });
+  }
+
+  it("returns cid -> amount for the party's own Amulets", async () => {
+    const m = await scanWith([
+      { created_events: [amulet("c1", "1.0000000000"), amulet("c2", "2.5000000000")] },
+    ]).getOwnedAmuletAmounts(PARTY);
+    expect(m.get("c1")).toBe("1.0000000000");
+    expect(m.get("c2")).toBe("2.5000000000");
+    expect(m.size).toBe(2);
+  });
+
+  it("excludes LockedAmulet — locked coin cannot fund a transfer", async () => {
+    const m = await scanWith([
+      {
+        created_events: [
+          amulet("c1", "1.0000000000"),
+          {
+            contract_id: "locked",
+            template_id: "abc:Splice.Amulet:LockedAmulet",
+            create_arguments: { owner: PARTY, amount: { initialAmount: "99.0" } },
+          },
+        ],
+      },
+    ]).getOwnedAmuletAmounts(PARTY);
+    expect(m.has("locked")).toBe(false);
+    expect(m.size).toBe(1);
+  });
+
+  it("re-checks the owner instead of trusting the query", async () => {
+    // A response that leaked somebody else's holding must not inflate the total.
+    const m = await scanWith([
+      { created_events: [amulet("mine", "1.0"), amulet("theirs", "50.0", "other::1220bb")] },
+    ]).getOwnedAmuletAmounts(PARTY);
+    expect([...m.keys()]).toEqual(["mine"]);
+  });
+
+  it("follows pagination and stops when the token runs out", async () => {
+    const m = await scanWith([
+      { created_events: [amulet("c1", "1.0")], next_page_token: "t1" },
+      { created_events: [amulet("c2", "2.0")] },
+    ]).getOwnedAmuletAmounts(PARTY);
+    expect([...m.keys()].sort()).toEqual(["c1", "c2"]);
+  });
+});
+
+describe("getTransferPreapprovalByParty — per-merchant cache", () => {
+  const record = (expiresAt: string) => ({
+    transfer_preapproval: {
+      contract: {
+        contract_id: "00pre",
+        payload: {
+          dso: "dso::1220",
+          receiver: "merchant::1220m",
+          provider: "prov::1220",
+          expiresAt,
+        },
+      },
+    },
+  });
+  const future = () => new Date(Date.now() + 3_600_000).toISOString();
+  const past = () => new Date(Date.now() - 60_000).toISOString();
+
+  function client(bodies: Array<() => unknown>) {
+    let n = 0;
+    const fetchFn = vi.fn(async () => {
+      const body = bodies[Math.min(n, bodies.length - 1)]!();
+      n++;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    return {
+      c: new ScanClient({
+        scanUrl: "https://scan.example",
+        flavor: "sv",
+        fetch: fetchFn as unknown as typeof globalThis.fetch,
+      }),
+      fetchFn,
+    };
+  }
+
+  it("collapses a burst of reads for ONE merchant into a single round-trip", async () => {
+    // The reason this exists: a merchant taking payments gets this record read
+    // once per verify AND once per settle, against a public SV that rate-limits.
+    const { c, fetchFn } = client([() => record(future())]);
+    for (let i = 0; i < 5; i++) await c.getTransferPreapprovalByParty("merchant::1220m");
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT answer one merchant from another's record", async () => {
+    const { c, fetchFn } = client([() => record(future())]);
+    await c.getTransferPreapprovalByParty("merchant::1220a");
+    await c.getTransferPreapprovalByParty("merchant::1220b");
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-reads rather than serving a cached EXPIRED record", async () => {
+    // A merchant who renews must not keep reading as expired for the rest of
+    // the TTL — the /settle gate refuses payments on exactly this field.
+    const { c, fetchFn } = client([() => record(past()), () => record(future())]);
+    const first = await c.getTransferPreapprovalByParty("merchant::1220m");
+    expect(first?.expiresAt).toBe(await Promise.resolve(first!.expiresAt));
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(Date.parse(first!.expiresAt)).toBeGreaterThan(Date.now());
+  });
+
+  it("a Scan failure is not cached as an answer", async () => {
+    // Not "a 429 throws" — the client retries a 429 internally, so it usually
+    // does not reach here at all. The property under test is the one that
+    // matters once retries ARE exhausted: a rejected load must leave nothing
+    // behind, or one bad minute would answer "this merchant has no
+    // preapproval" for the whole TTL.
+    let down = true;
+    const fetchFn = vi.fn(async () =>
+      down
+        ? new Response("busy", { status: 429 })
+        : new Response(JSON.stringify(record(future())), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+    );
+    const c = new ScanClient({
+      scanUrl: "https://scan.example",
+      flavor: "sv",
+      fetch: fetchFn as unknown as typeof globalThis.fetch,
+    });
+    await expect(c.getTransferPreapprovalByParty("merchant::1220m")).rejects.toThrow();
+    down = false;
+    expect(await c.getTransferPreapprovalByParty("merchant::1220m")).not.toBeNull();
+  });
+});
+
+describe("KeyedTtlSingleFlightCache — the cap", () => {
+  it("does not grow without bound on request-supplied keys", async () => {
+    // The key is a party that arrives in a request body, so an unbounded map is
+    // a memory sink anyone can fill by quoting a fresh party per call.
+    const cache = new KeyedTtlSingleFlightCache<number>(60_000, 4);
+    for (let i = 0; i < 50; i++) await cache.get(`k${i}`, async () => i);
+    expect(cache.size()).toBeLessThanOrEqual(4);
+  });
+
+  it("drops the expired slots before resorting to a full clear", async () => {
+    let t = 1_000;
+    const cache = new KeyedTtlSingleFlightCache<number>(100, 3, () => t);
+    await cache.get("old", async () => 1);
+    t += 500; // "old" is now past its TTL
+    await cache.get("a", async () => 2);
+    await cache.get("b", async () => 3);
+    await cache.get("c", async () => 4); // triggers eviction: "old" goes
+    expect(cache.size()).toBe(3);
+    const fresh = vi.fn(async () => 9);
+    await cache.get("a", fresh);
+    expect(fresh).not.toHaveBeenCalled(); // "a" survived
   });
 });
