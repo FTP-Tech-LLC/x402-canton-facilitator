@@ -47,6 +47,30 @@ export interface FacilitatorConfig {
    *  domain). Empty by default; verify the alternate is reachable +
    *  unauthenticated from the deploy host before setting it. */
   scanFallbackUrls: string[];
+  /** Non-Amulet CIP-56 instrument registries: instrument admin party →
+   *  DA Registry Utility base URL. JSON object in
+   *  `CANTON_X402_TOKEN_REGISTRIES`, e.g.
+   *  `{"decentralized-usdc-interchain-rep::1220...":"https://registry.example"}`.
+   *  An instrument whose `admin` is listed here has its preapproval resolved on
+   *  that utility (per-registrar path) instead of the SV Scan; Amulet is never
+   *  listed and stays on the SV Scan. Empty {} by default. */
+  tokenRegistries: Record<string, string>;
+  /** Instrument identity per registry admin, advertised in `/supported` so a
+   *  merchant can read the full `instrumentId` ({admin,id}) plus a display symbol
+   *  rather than hardcoding it. JSON object in `CANTON_X402_TOKEN_INSTRUMENTS`,
+   *  e.g. `{"decentralized-usdc-interchain-rep::1220...":{"id":"USDCx","symbol":"USDCx"}}`.
+   *  Independent of `tokenRegistries` (which stays {admin:url}); an admin absent
+   *  here is still advertised by admin alone. Empty {} by default. */
+  tokenInstruments: Record<string, { id: string; symbol?: string }>;
+  /** OUT-OF-BAND-trusted registry infrastructure parties per instrument admin, for
+   *  non-Amulet CIP-56 tokens. JSON object in `CANTON_X402_REGISTRY_TRUSTED_PARTIES`,
+   *  e.g. `{"decentralized-usdc-interchain-rep::1220...":["<operator>","<bridge>"]}`.
+   *  A real registry `TransferFactory_Transfer` names the registry operator (and,
+   *  for a bridged token, the bridge operator) as signatories/observers, so the
+   *  facilitator's inline foreign-party backstop must admit them for that admin.
+   *  Sourced out-of-band (operator config / registry `/operator` endpoint), never
+   *  from the payload. Empty {} by default → Amulet-identical. */
+  registryTrustedParties: Record<string, string[]>;
   /** `sv` (public SV Scan, no auth) or `validator` (validator-local
    *  scan-proxy, needs same auth as the participant). DevNet defaults
    *  to `sv` since the SV Scan is unauthenticated and removes one
@@ -57,7 +81,7 @@ export interface FacilitatorConfig {
   scanAuth: boolean;
   /** transfer-factory ("V3", 1-tx meta-transaction) settle-path master switch.
    *  DEFAULT false on every network: a deploy with TF off never prepares,
-   *  stashes, verifies, or settles a transfer-factory payment (routes 503 /
+   *  verifies, or settles a transfer-factory payment (routes 503 /
    *  fail-closed with invalid_exact_canton_transfer_factory_disabled). Set via
    *  CANTON_X402_TF_ENABLED=true. Mirrors the DIRECT gate pattern. */
   tfEnabled: boolean;
@@ -65,13 +89,10 @@ export interface FacilitatorConfig {
    *  primary. Requires `tfEnabled` (advertised ⟹ enabled — /supported can
    *  never advertise an inert path). Set via CANTON_X402_ADVERTISE_TF=true. */
   advertiseTf: boolean;
-  /** Max live (unsettled, unexpired) tf stash rows per payer — bounds the
-   *  relay-side storage a single agent can occupy. */
-  tfStashCapPerPayer: number;
   /** executeBefore horizon (seconds) when the client does not request one. */
   tfDefaultExecuteBeforeSeconds: number;
   /** Hard ceiling on a client-requested executeBefore horizon (seconds) —
-   *  also bounds how long a stashed signed submission can sit unexecuted. */
+   *  also bounds how long a payer-signed submission stays settleable. */
   tfMaxExecuteBeforeSeconds: number;
   /** Operational guards for /settle (v1 settlement pays the GS traffic fee, so
    *  /settle is a cost + griefing surface). Per-payer + global sliding-window
@@ -95,6 +116,93 @@ export interface FacilitatorConfig {
    *  one early failure at 100% fraction cannot trip it. Default 10.
    *  `CANTON_X402_SETTLE_BREAKER_MIN_SAMPLES`. */
   settleBreakerMinSamples: number;
+  /**
+   * Topology reader (packages/topology-reader): where the inline arm gets a
+   * payer's protocol signing key so it can verify the payment's signature.
+   *
+   * The key is only reachable through the participant's admin gRPC API, which
+   * Canton ships unauthenticated and all-or-nothing — the same port carries
+   * ParticipantRepairService. This process serves an unauthenticated /settle to
+   * the internet, so it must NOT hold that access; the reader does, beside the
+   * participant, and answers exactly one question over HTTP.
+   *
+   * Absent → no key source → the verifier refuses every inline payment. That is
+   * the correct fail-closed default and is what a deploy does today.
+   */
+  topologyReaderUrl: string | undefined;
+  topologyReaderToken: string | undefined;
+  /**
+   * Which merchants the INLINE carriage will burn our own traffic for.
+   *
+   * /settle is unauthenticated. The inline carriage lets a stranger post a
+   * well-formed transaction between two parties we have no relationship with
+   * and make us pay to relay it; the feePayer rule only confirms we were named.
+   *
+   *   open                  today's behaviour exactly. THE DEFAULT.
+   *   provider              the merchant's preapproval names US as its app
+   *                         provider — an on-ledger fact that requires the
+   *                         named provider's own authority to create.
+   *   allowlist             the operator declared this merchant.
+   *   provider-or-allowlist either proof; the mode to actually run.
+   *
+   * Do NOT run bare `provider`: a self-provisioned merchant's preapproval names
+   * the MERCHANT as provider, and self-provisioning is this repo's documented
+   * onboarding route, so `provider` alone would refuse most honest traffic.
+   * An unrecognised value THROWS at boot. Falling back to `open` would let a
+   * typo silently disable the gate while the operator reads their own .env and
+   * believes it is on.
+   */
+  inlineMerchantPolicy: "open" | "provider" | "allowlist" | "provider-or-allowlist";
+  /** Merchant parties accepted by the `allowlist` arms above. */
+  inlineMerchantAllowlist: string[];
+  /** Rollout stage for the /settle unknown-outcome guard: off (default,
+   *  identical to the pre-guard build) | observe (record + metric, response
+   *  unchanged) | enforce (503 on an unresolved mark). */
+  settleDispatchMarkMode: "off" | "observe" | "enforce";
+  /** Max relay submit/execute calls per (party, caller IP) per minute. Each is
+   *  a real ledger submission that spends Global Synchronizer traffic. */
+  walletSubmitRateMaxPerKey: number;
+  /** Per-CALLER ceiling on relay submissions per minute. The per-key cap above
+   *  contains a caller-asserted party, so it alone bounds nothing: minting a
+   *  fresh well-formed party per request mints a fresh bucket. Default 4x the
+   *  per-key cap, so an honest host running several agents is unaffected. */
+  walletSubmitRateMaxPerIp: number;
+  /**
+   * Ceiling on external-party ALLOCATIONS per minute across the whole
+   * facilitator, regardless of who asks. 0 disables it.
+   *
+   * The per-IP cap next to this one is admission control, and admission
+   * control cannot bound a GLOBAL resource: `onboard/finalize` writes a
+   * permanent topology transaction to the Global Synchronizer under our
+   * participant, on our traffic, and consumes a user-rights slot
+   * (TOO_MANY_USER_RIGHTS is a limit this participant has already met). The
+   * route is anonymous in production, so "per IP" costs an attacker one more
+   * IP per bucket and costs us a permanent allocation each time.
+   *
+   * Default 60/min — deliberately generous: measured production onboarding is
+   * ~2 per HOUR with a busiest minute of 2, so this is thirty times the
+   * observed peak, and it still turns "unbounded × however many IPs you have"
+   * into a hard ceiling the operator can lower.
+   */
+  walletOnboardRateMaxGlobal: number;
+  /**
+   * How many pay/prepare attempts one payer may WASTE per window before the
+   * route stops doing the expensive part at all, and the window length.
+   *
+   * Only refusals caused by the PAYER'S OWN STATE are charged — today that is
+   * `insufficient holdings`, the answer that costs a DSO lookup and a full ACS
+   * query to reach. A prepare that succeeds costs nothing here, so a busy
+   * honest client never sees this budget at all.
+   *
+   * The point: a failed prepare writes nothing and costs nothing to repeat,
+   * which is backwards — successful work is paid for by the resulting payment
+   * while failed work is pure loss, and an unfunded client in a retry loop
+   * generates only the latter. Charging the loss bounds it.
+   *
+   * `<= 0` on the count disables the budget entirely.
+   */
+  walletPrepareWasteMax: number;
+  walletPrepareWasteWindowMs: number;
   /** Per-client-IP /settle cap. SEPARATE from per-payer because /settle is
    *  called by the MERCHANT, so one IP aggregates every agent paying through it
    *  — capping it at the per-payer value throttles a whole merchant to one
@@ -139,6 +247,25 @@ export interface FacilitatorConfig {
   /** Agent-wallet relay (skill, Phase 1). OFF by default. */
   enableAgentWallet: boolean;
   agentWalletApiKey: string | undefined;
+  /**
+   * Which DAML choices `/v1/wallet/submit/prepare` will build a transaction
+   * for.
+   *
+   * The relay is deliberately open — that is how the published agent wallet
+   * onboards an agent with no credential, and locking it would break every
+   * shipped integrator. But "open onboarding" was never meant to imply "build
+   * me any transaction you like": the route forwarded `commands` verbatim with
+   * no restriction, so anyone could make our participant do unbounded work.
+   *
+   * They could not MOVE anyone's money that way — execute verifies the party's
+   * signature against topology, and the faucet has its own secret — so this is
+   * resource abuse rather than theft. It is still ours to pay for.
+   *
+   * The default is the exact set the shipped client uses, measured from its
+   * only call site rather than guessed. `*` disables the check for an operator
+   * who knowingly wants the old behaviour.
+   */
+  walletSubmitChoiceAllowlist: readonly string[];
   /** Agent CC faucet (out-of-box e2e). OFF by default on EVERY network incl.
    *  mainnet; the caps below are the guardrail when enabled. The faucet sends a
    *  tiny one-time CC seed from the facilitator's OWN party to an agent party
@@ -229,6 +356,13 @@ export interface FacilitatorConfig {
    *  spike so a single round can never be amplified into an overuse-cap breach.
    *  Default 1000; non-numeric/non-positive falls back to the default. */
   markerMaxWeightPerRound: number;
+  /** Per-round free-base traffic grant in bytes added to the paid delta before
+   *  pricing (`CANTON_X402_MARKER_FREE_BYTES_PER_ROUND`). Default 0 — claim only
+   *  the purchased delta. Set it ONLY if the node's own built-in free-base FA
+   *  emission is off; with that emission on, a non-zero value double-counts the
+   *  free base and over-emits markers. Unlike the other marker knobs 0 is a
+   *  MEANINGFUL value, so only negative/non-numeric falls back to the default. */
+  markerFreeBytesPerRound: number;
   /** Attribution retry-worker tick interval in ms
    *  (`CANTON_X402_ATTRIBUTION_RETRY_MS`). Controls how quickly settled rows
    *  get their traffic bytes after Scan indexes the update — and therefore how
@@ -350,6 +484,40 @@ export function parseDiscoveryResources(
   });
 }
 
+/**
+ * A non-negative number from an env var, or the documented default.
+ *
+ * These fields are COST CAPS. A bare `Number()` turns a typo into NaN, and
+ * every `>=` comparison against NaN is false — so a misspelled value does not
+ * fall back, it REMOVES the cap, while the operator reads their own .env and
+ * believes the limit is on. Silent removal of a limit is the one outcome worth
+ * writing a helper to prevent.
+ *
+ * The helper did it anyway, through a door it did not look at. `??` only
+ * substitutes for null/undefined, so a variable that is SET BUT EMPTY passed
+ * straight through — and `Number("")` is 0, which satisfies `n >= 0`. Zero is
+ * not a small cap here, it is the DISABLED sentinel for every consumer:
+ * `<= 0 disables this cap` (rate-limit.ts) for the settle/verify/wallet
+ * limiters, `<= 0 disables the breaker entirely` for the traffic breaker, and
+ * a window of 0 makes the sliding window drop every hit it just recorded.
+ *
+ * `KEY=` with nothing after it is this repo's own house style for a placeholder
+ * in the ops .env.example files, and the compose files pass those keys through bare —
+ * so the shape that removes every cap is the shape an operator is invited to
+ * write. Empty and whitespace now mean exactly what unset means.
+ *
+ * A non-empty value that is merely WRONG still falls back, which is this file's
+ * existing, tested decision and a safe one: the fallback is the documented cap,
+ * not "no cap". Only the empty case had to change.
+ */
+function numericEnv(raw: string | undefined, fallback: number): number {
+  // EMPTY MEANS UNSET. Everything below already handled a typo correctly; this
+  // line is the one that was missing, and it is the dangerous one.
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
 export function loadConfig(): FacilitatorConfig {
   const network = required("CANTON_NETWORK");
   if (
@@ -463,12 +631,91 @@ export function loadConfig(): FacilitatorConfig {
       .filter(Boolean),
     scanFlavor,
     scanAuth: process.env.CANTON_SCAN_AUTH === "true",
+    tokenRegistries: (() => {
+      const raw = process.env.CANTON_X402_TOKEN_REGISTRIES;
+      if (!raw || !raw.trim()) return {};
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const out: Record<string, string> = {};
+          for (const [admin, url] of Object.entries(
+            parsed as Record<string, unknown>
+          )) {
+            if (typeof url === "string" && url.trim()) {
+              out[admin] = url.trim().replace(/\/$/, "");
+            }
+          }
+          return out;
+        }
+      } catch {
+        /* fall through to empty — an unparseable value must not settle CC on a
+           registry the operator did not actually configure */
+      }
+      console.warn(
+        "CANTON_X402_TOKEN_REGISTRIES is set but not a valid JSON object of {admin: url}; ignoring (Amulet-only)"
+      );
+      return {};
+    })(),
+    tokenInstruments: (() => {
+      const raw = process.env.CANTON_X402_TOKEN_INSTRUMENTS;
+      if (!raw || !raw.trim()) return {};
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const out: Record<string, { id: string; symbol?: string }> = {};
+          for (const [admin, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (v && typeof v === "object" && typeof (v as { id?: unknown }).id === "string") {
+              const id = (v as { id: string }).id.trim();
+              const symbolRaw = (v as { symbol?: unknown }).symbol;
+              if (!id) continue;
+              out[admin] = {
+                id,
+                ...(typeof symbolRaw === "string" && symbolRaw.trim()
+                  ? { symbol: symbolRaw.trim() }
+                  : {}),
+              };
+            }
+          }
+          return out;
+        }
+      } catch {
+        /* fall through — an unparseable value just means no id/symbol enrichment */
+      }
+      console.warn(
+        "CANTON_X402_TOKEN_INSTRUMENTS is set but not a valid JSON object of {admin:{id,symbol}}; ignoring"
+      );
+      return {};
+    })(),
+    registryTrustedParties: (() => {
+      const raw = process.env.CANTON_X402_REGISTRY_TRUSTED_PARTIES;
+      if (!raw || !raw.trim()) return {};
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const out: Record<string, string[]> = {};
+          for (const [admin, parties] of Object.entries(
+            parsed as Record<string, unknown>
+          )) {
+            if (Array.isArray(parties)) {
+              const ps = parties.filter(
+                (p): p is string => typeof p === "string" && p.trim().length > 0
+              );
+              if (ps.length > 0) out[admin] = ps;
+            }
+          }
+          return out;
+        }
+      } catch {
+        /* fall through to empty — a malformed trust set must not silently widen
+           the foreign-party backstop */
+      }
+      console.warn(
+        "CANTON_X402_REGISTRY_TRUSTED_PARTIES is set but not a valid JSON object of {admin: string[]}; ignoring"
+      );
+      return {};
+    })(),
     tfEnabled,
     advertiseTf,
-    tfStashCapPerPayer: (() => {
-      const raw = Number(process.env.CANTON_X402_TF_STASH_CAP_PER_PAYER);
-      return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 8;
-    })(),
     tfDefaultExecuteBeforeSeconds: (() => {
       const raw = Number(process.env.CANTON_X402_TF_DEFAULT_EXECUTE_BEFORE_S);
       return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 120;
@@ -477,27 +724,38 @@ export function loadConfig(): FacilitatorConfig {
       const raw = Number(process.env.CANTON_X402_TF_MAX_EXECUTE_BEFORE_S);
       return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 600;
     })(),
-    settleRateMaxPerPayer: Number(
-      process.env.CANTON_X402_SETTLE_RATE_MAX_PER_PAYER ?? 10
+    settleRateMaxPerPayer: numericEnv(
+      process.env.CANTON_X402_SETTLE_RATE_MAX_PER_PAYER,
+      10
     ),
-    settleRateMaxPerIp: (() => {
-      const raw = Number(process.env.CANTON_X402_SETTLE_RATE_MAX_PER_IP);
-      return Number.isFinite(raw) && raw >= 0 ? raw : 100;
-    })(),
-    settleRateMaxGlobal: Number(
-      process.env.CANTON_X402_SETTLE_RATE_MAX_GLOBAL ?? 120
+    // Through `numericEnv`, not a hand-rolled copy. The copy read `Number("")`
+    // as 0, and 0 is the DISABLE value for this cap — so blanking the line in
+    // .env (how an operator comments a knob out, and how it appears in
+    // .env.example) removed the cap instead of restoring the default. An
+    // explicit `0` still disables, which is the documented switch.
+    settleRateMaxPerIp: numericEnv(
+      process.env.CANTON_X402_SETTLE_RATE_MAX_PER_IP,
+      100
     ),
-    settleRateWindowMs: Number(
-      process.env.CANTON_X402_SETTLE_RATE_WINDOW_MS ?? 60000
+    settleRateMaxGlobal: numericEnv(
+      process.env.CANTON_X402_SETTLE_RATE_MAX_GLOBAL,
+      120
     ),
-    settleBreakerThreshold: Number(
-      process.env.CANTON_X402_SETTLE_BREAKER_THRESHOLD ?? 3
+    settleRateWindowMs: numericEnv(
+      process.env.CANTON_X402_SETTLE_RATE_WINDOW_MS,
+      60000
     ),
-    settleBreakerCooldownMs: Number(
-      process.env.CANTON_X402_SETTLE_BREAKER_COOLDOWN_MS ?? 60000
+    settleBreakerThreshold: numericEnv(
+      process.env.CANTON_X402_SETTLE_BREAKER_THRESHOLD,
+      3
     ),
-    settleBreakerWindowMs: Number(
-      process.env.CANTON_X402_SETTLE_BREAKER_WINDOW_MS ?? 60000
+    settleBreakerCooldownMs: numericEnv(
+      process.env.CANTON_X402_SETTLE_BREAKER_COOLDOWN_MS,
+      60000
+    ),
+    settleBreakerWindowMs: numericEnv(
+      process.env.CANTON_X402_SETTLE_BREAKER_WINDOW_MS,
+      60000
     ),
     // Clamp to [0,1]: a fraction outside that range is a misconfig; a value > 1
     // would make the rate arm un-trippable, < 0 would trip on the first failure.
@@ -510,17 +768,101 @@ export function loadConfig(): FacilitatorConfig {
       const raw = Number(process.env.CANTON_X402_SETTLE_BREAKER_MIN_SAMPLES);
       return Number.isFinite(raw) && raw >= 1 ? raw : 10;
     })(),
-    verifyRateMaxPerIp: Number(
-      // 120 (was 60): /verify is also keyed on the MERCHANT IP, so a merchant
-      // fronting many agents shares one /verify bucket. Raised to match the
-      // settle per-IP cap so /verify does not become the new bottleneck once
-      // the settle IP cap is lifted. Each settle is preceded by one verify.
-      process.env.CANTON_X402_VERIFY_RATE_MAX_PER_IP ?? 120
+    topologyReaderUrl: process.env.CANTON_X402_TOPOLOGY_READER_URL,
+    topologyReaderToken: process.env.CANTON_X402_TOPOLOGY_READER_TOKEN,
+    inlineMerchantPolicy: (() => {
+      const raw = process.env.CANTON_X402_INLINE_MERCHANT_POLICY;
+      if (raw === undefined || raw.trim() === "") return "open" as const;
+      const v = raw.trim();
+      // THROW on a value we do not recognise rather than falling back.
+      //
+      // This gate is the only thing standing between an unauthenticated
+      // /settle and a stranger making us burn our own Global Synchronizer
+      // traffic. Every other spelling of "be safe on bad input" would be
+      // wrong here: falling back to the MOST permissive setting means a typo
+      // silently disables the protection while the operator reads their own
+      // .env and believes it is on. A boot that refuses is loud and cheap; a
+      // gate that is quietly off is neither.
+      if (v !== "open" && v !== "provider" && v !== "allowlist" && v !== "provider-or-allowlist") {
+        throw new Error(
+          `CANTON_X402_INLINE_MERCHANT_POLICY must be one of open|provider|allowlist|provider-or-allowlist, got ${JSON.stringify(v)}`
+        );
+      }
+      return v;
+    })(),
+    walletSubmitRateMaxPerKey: numericEnv(
+      process.env.CANTON_X402_WALLET_SUBMIT_RATE_MAX,
+      60
     ),
-    verifyRateWindowMs: Number(
+    walletOnboardRateMaxGlobal: numericEnv(
+      process.env.CANTON_X402_WALLET_ONBOARD_RATE_MAX_GLOBAL,
+      60
+    ),
+    walletSubmitRateMaxPerIp: numericEnv(
+      process.env.CANTON_X402_WALLET_SUBMIT_RATE_MAX_PER_IP,
+      240
+    ),
+    walletPrepareWasteMax: numericEnv(
+      process.env.CANTON_X402_WALLET_PREPARE_WASTE_MAX,
+      10
+    ),
+    walletPrepareWasteWindowMs: numericEnv(
+      process.env.CANTON_X402_WALLET_PREPARE_WASTE_WINDOW_MS,
+      300_000
+    ),
+    // HOW THE UNKNOWN-OUTCOME GUARD ROLLS OUT, and why it is not simply "on".
+    //
+    // The guard changes a MERCHANT-VISIBLE response class: a retry of a
+    // submission we dispatched and never resolved gets 503 instead of a settle
+    // verdict. Measured against the running build, that class does not exist
+    // there at all — so switching it on in a deploy would change what every
+    // integrator sees, in one step, on the strength of unit tests alone.
+    //
+    // Nobody knows how often the unknown outcome actually happens in
+    // production. `observe` is how we find out: the mark is written, the
+    // metric and the log line fire, and the response stays byte-for-byte what
+    // it is today. It does NOT resolve — resolving is a ledger read, and
+    // observe is supposed to cost nothing observable. The counter alone
+    // answers the question the flip depends on: how often, on real traffic.
+    // Then that number decides, and deciding is one environment variable, no
+    // rebuild.
+    //
+    //   off      (default) nothing is written, nothing is read. Identical to
+    //            the build running today.
+    //   observe  mark + metric, response unchanged, no resolve.
+    //   enforce  an unresolved mark answers 503 settle_outcome_unknown.
+    //
+    // A staged-rollout knob: off (default) → observe → enforce.
+    settleDispatchMarkMode: (() => {
+      const raw = process.env.CANTON_X402_SETTLE_DISPATCH_MARK;
+      if (raw === undefined || raw.trim() === "") return "off" as const;
+      const v = raw.trim();
+      if (v !== "off" && v !== "observe" && v !== "enforce") {
+        throw new Error(
+          `CANTON_X402_SETTLE_DISPATCH_MARK must be one of off|observe|enforce, ` +
+            `got ${JSON.stringify(v)}`
+        );
+      }
+      return v;
+    })(),
+    inlineMerchantAllowlist: (
+      process.env.CANTON_X402_INLINE_MERCHANT_ALLOWLIST ?? ""
+    )
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+    // 120 (was 60): /verify is also keyed on the MERCHANT IP, so a merchant
+    // fronting many agents shares one /verify bucket. Raised to match the
+    // settle per-IP cap so /verify does not become the new bottleneck once the
+    // settle IP cap is lifted. Each settle is preceded by one verify.
+    verifyRateMaxPerIp: numericEnv(
+      process.env.CANTON_X402_VERIFY_RATE_MAX_PER_IP,
+      120
+    ),
+    verifyRateWindowMs: numericEnv(
       process.env.CANTON_X402_VERIFY_RATE_WINDOW_MS ??
-        process.env.CANTON_X402_SETTLE_RATE_WINDOW_MS ??
-        60000
+        process.env.CANTON_X402_SETTLE_RATE_WINDOW_MS,
+      60000
     ),
     jwtIssuer,
     jwtSecret: process.env.JWT_SECRET,
@@ -537,12 +879,23 @@ export function loadConfig(): FacilitatorConfig {
     enableAgentWallet:
       process.env.CANTON_X402_ENABLE_AGENT_WALLET === "true",
     agentWalletApiKey: process.env.CANTON_X402_AGENT_WALLET_KEY,
+    walletSubmitChoiceAllowlist: (() => {
+      const raw = process.env.CANTON_X402_WALLET_SUBMIT_CHOICES;
+      if (raw === undefined || raw.trim() === "") {
+        // agent-wallet's prepareSignExecute has exactly one call site, and it
+        // builds exactly these two. Anything else has never been part of the
+        // documented path.
+        return ["TransferFactory_Transfer", "TransferInstruction_Accept"] as const;
+      }
+      return Object.freeze(
+        raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0)
+      );
+    })(),
     faucetEnabled,
     faucetAmountCc,
-    faucetMaxPerIp: (() => {
-      const raw = Number(process.env.CANTON_X402_FAUCET_MAX_PER_IP);
-      return Number.isFinite(raw) && raw >= 0 ? raw : 5;
-    })(),
+    // Same reason as settleRateMaxPerIp above: empty must mean UNSET, because
+    // here 0 means uncapped and this one gates a faucet that sends real CC.
+    faucetMaxPerIp: numericEnv(process.env.CANTON_X402_FAUCET_MAX_PER_IP, 5),
     faucetDailyBudgetCc,
     faucetLifetimeCapCc,
     faucetWindowMs: (() => {
@@ -588,6 +941,12 @@ export function loadConfig(): FacilitatorConfig {
     markerMaxWeightPerRound: (() => {
       const raw = Number(process.env.CANTON_X402_MARKER_MAX_WEIGHT_PER_ROUND);
       return Number.isFinite(raw) && raw > 0 ? raw : 1000;
+    })(),
+    markerFreeBytesPerRound: (() => {
+      // 0 is meaningful here (claim nothing extra) and is also the default, so
+      // the guard is >= 0, not > 0 — a `0` must survive, not fall back.
+      const raw = Number(process.env.CANTON_X402_MARKER_FREE_BYTES_PER_ROUND);
+      return Number.isFinite(raw) && raw >= 0 ? raw : 0;
     })(),
     attributionRetryIntervalMs: (() => {
       const raw = Number(process.env.CANTON_X402_ATTRIBUTION_RETRY_MS);

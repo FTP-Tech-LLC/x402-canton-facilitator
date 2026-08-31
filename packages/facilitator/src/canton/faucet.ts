@@ -82,13 +82,37 @@ const AMULET_TEMPLATE_ID = "#splice-amulet:Splice.Amulet:Amulet";
  *  small fee from inputs and returns change). Matches e2e/fund.mjs. */
 const FEE_MARGIN_CC = 0.01;
 
+/**
+ * A claim that failed STRICTLY BEFORE the ledger submission — during the Scan
+ * read, the ACS query on our own party, or the registry resolve. None of those
+ * can move CC, so this is a proof that nothing was committed.
+ *
+ * It exists because the route's per-party reservation is a ONE-TIME lifetime
+ * grant. Without a way to tell "we never asked the ledger" from "we asked and
+ * lost the answer", the route had to fail closed on both, and an honest agent
+ * lost its only faucet claim — with the daily and lifetime budget debited for
+ * CC that never left — whenever Scan or the registry hiccuped.
+ */
+export class FaucetPreSubmitError extends Error {
+  constructor(override readonly cause: unknown) {
+    super(
+      `faucet claim failed before submission: ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`
+    );
+    this.name = "FaucetPreSubmitError";
+  }
+}
+
 /** Contention class: another submission consumed the funder's selected input
  *  Amulets mid-flight (409 duplicate/contention, 404 CONTRACT_NOT_FOUND). Safe
  *  to re-select inputs and try again; anything else is not. */
 function isInputContention(err: unknown): boolean {
-  return (
-    err instanceof CantonError && (err.status === 409 || err.status === 404)
-  );
+  // Unwrap: input contention is a 409/404 the SUBMIT returns, but the registry
+  // resolve can answer 404 for a holding that was just spent, and that arrives
+  // wrapped. Both deserve the single re-selection retry.
+  const e = err instanceof FaucetPreSubmitError ? err.cause : err;
+  return e instanceof CantonError && (e.status === 409 || e.status === 404);
 }
 
 export class FaucetService {
@@ -128,25 +152,41 @@ export class FaucetService {
   }): Promise<FaucetClaimResult> {
     const { client, facilitatorParty, userId, synchronizerId, amountCc } =
       this.deps;
-    const dso = await this.deps.getDso();
-    const inputHoldingCids = await this.selectInputs(
-      facilitatorParty,
-      Number(amountCc)
-    );
 
-    const now = Date.now();
-    const transfer: FaucetTransfer = {
-      sender: facilitatorParty,
-      receiver: input.recipient,
-      amount: amountCc,
-      instrumentId: { admin: dso, id: "Amulet" },
-      requestedAt: new Date(now - 1000).toISOString(),
-      executeBefore: new Date(now + 3_600_000).toISOString(),
-      inputHoldingCids,
-      meta: { values: {} },
-    };
+    // EVERYTHING up to the submit is preparation: a Scan read, an ACS query on
+    // our own party, and a registry HTTP call. None of them can move CC, so a
+    // failure here PROVES nothing was committed — and the caller needs that
+    // fact, because it is the difference between "your one lifetime faucet
+    // claim is still yours" and "you burned it on our registry timing out".
+    // Without the marker the route saw a bare Error / a 5xx, could not tell it
+    // from a lost submit, and had to fail closed: reservation held, daily and
+    // lifetime budget debited, for a payout that never left the building.
+    let transfer: FaucetTransfer;
+    let dso: string;
+    let f: Awaited<ReturnType<FaucetServiceDeps["resolveTransferFactory"]>>;
+    try {
+      dso = await this.deps.getDso();
+      const inputHoldingCids = await this.selectInputs(
+        facilitatorParty,
+        Number(amountCc)
+      );
 
-    const f = await this.deps.resolveTransferFactory({ transfer, dso });
+      const now = Date.now();
+      transfer = {
+        sender: facilitatorParty,
+        receiver: input.recipient,
+        amount: amountCc,
+        instrumentId: { admin: dso, id: "Amulet" },
+        requestedAt: new Date(now - 1000).toISOString(),
+        executeBefore: new Date(now + 3_600_000).toISOString(),
+        inputHoldingCids,
+        meta: { values: {} },
+      };
+
+      f = await this.deps.resolveTransferFactory({ transfer, dso });
+    } catch (err) {
+      throw new FaucetPreSubmitError(err);
+    }
 
     const result = await client.submitAndWaitForTransaction({
       commandId: `faucet-${randomUUID()}`,

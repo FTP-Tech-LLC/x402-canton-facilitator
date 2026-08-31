@@ -437,6 +437,10 @@ export class CantonClient {
    * outstanding from prior transfers.
    */
   async getTransactionById(args: {
+    /** Ask for the full ledger-effects tree (exercises included) instead of the
+     *  narrow projection. Needed by the registry funds-moved proof; see the
+     *  measurement in the request body below. */
+    fullEffects?: boolean;
     updateId: string;
     requestingParties: string[];
   }): Promise<{
@@ -468,16 +472,71 @@ export class CantonClient {
           ArchivedEvent?: { contractId: string; templateId: string };
         }>;
       };
-    }>("/v2/updates/transaction-by-id", {
-      updateId: args.updateId,
-      requestingParties: args.requestingParties,
-      transactionShape: "TRANSACTION_SHAPE_LEDGER_EFFECTS",
-    });
-    const tx = response.transaction ?? {};
+    }>(
+      args.fullEffects ? "/v2/updates/update-by-id" : "/v2/updates/transaction-by-id",
+      args.fullEffects
+        ? {
+            // THE SAME PARTY ON THE SAME TRANSACTION SEES DIFFERENT EVENTS
+            // DEPENDING ON WHICH REQUEST SHAPE ASKS. Measured on a live MainNet
+            // USDCx settle, payer as the requesting party:
+            //   transaction-by-id + requestingParties -> 2 events, both
+            //     Created/Archived of the payer's own Holding, NO exercises
+            //   update-by-id + updateFormat.filtersByParty(wildcard) -> the
+            //     full ledger-effects tree, including TransferFactory_Transfer
+            //     WITH its exerciseResult
+            // The registry funds-moved proof lives in that exerciseResult, so
+            // it needs this shape. Amulet keeps the original request byte for
+            // byte: its positive signal is an archived Amulet, which the
+            // narrow shape already carries, and widening the event set there
+            // could only add events its heuristics might trip over — not a
+            // trade worth making on the path six merchants are paid through.
+            updateId: args.updateId,
+            updateFormat: {
+              includeTransactions: {
+                eventFormat: {
+                  filtersByParty: Object.fromEntries(
+                    args.requestingParties.map((p) => [
+                      p,
+                      {
+                        cumulative: [
+                          {
+                            identifierFilter: {
+                              WildcardFilter: {
+                                value: { includeCreatedEventBlob: false },
+                              },
+                            },
+                          },
+                        ],
+                      },
+                    ])
+                  ),
+                  verbose: false,
+                },
+                transactionShape: "TRANSACTION_SHAPE_LEDGER_EFFECTS",
+              },
+            },
+          }
+        : {
+            updateId: args.updateId,
+            requestingParties: args.requestingParties,
+            transactionShape: "TRANSACTION_SHAPE_LEDGER_EFFECTS",
+          }
+    );
+    // The two endpoints wrap the transaction differently. MEASURED, not assumed:
+    //   transaction-by-id -> { transaction: { events } }
+    //   update-by-id      -> { update: { Transaction: { value: { events } } } }
+    const wrapped = (
+      response as unknown as {
+        update?: { Transaction?: { value?: { updateId?: string; offset?: number; events?: unknown[] } } };
+      }
+    ).update?.Transaction?.value;
+    const tx = (args.fullEffects ? wrapped : response.transaction) ?? {};
     return {
       updateId: tx.updateId ?? args.updateId,
       offset: tx.offset ?? 0,
-      events: tx.events ?? [],
+      events: (tx.events ?? []) as Awaited<
+        ReturnType<CantonClient["getTransactionById"]>
+      >["events"],
     };
   }
 
@@ -634,6 +693,109 @@ export class CantonClient {
     return this.request<T>("POST", path, body);
   }
 
+  /**
+   * Read an external party's Ed25519 SIGNING public keys from the synchronizer
+   * topology, as JWKS. Returns the raw 32-byte keys.
+   *
+   * WHY THIS EXISTS: a party id carries a FINGERPRINT — a multihash over the
+   * serialized SigningPublicKey protobuf — which is one-way, so the key it
+   * names cannot be recovered from it. Verifying a payer's signature therefore
+   * needs a topology read, and this is the only one the JSON Ledger API offers.
+   *
+   * OUR PARTICIPANT NEED NOT HOST THE PARTY. The endpoint resolves against the
+   * broadcast synchronizer topology store, so any party on a synchronizer we
+   * are connected to is readable; authorization is Public, not admin. That is
+   * what makes cross-participant relaying possible at all.
+   *
+   * VERSION GATE, RE-MEASURED 2026-08-08 against the actual artifacts, and the
+   * earlier claim here was wrong. The Splice-distributed participant does NOT
+   * serve this route: neither canton-participant:0.6.13 (Canton 3.5.9) nor
+   * :0.6.14 (Canton 3.5.10) contains any JoseService class in the shipped
+   * canton-open-source jar, and the JSON Ledger API spec inside both images
+   * lists 52 routes with no `jose` path. A live probe of the 0.6.13 participant
+   * returns 404, identical to a nonsense path. Upstream Canton at tag v3.5.10
+   * does define the route, so it exists somewhere — but not in what Splice
+   * ships, which is what we run.
+   *
+   * So a 404 here is the NORMAL state today, not a stale-participant symptom.
+   * Callers MUST treat it as "cannot verify", never as "no keys, so accept" —
+   * which is what the verifier does, so the inline arm simply does not settle.
+   *
+   * The real source for an external party's signing key is the participant's
+   * ADMIN gRPC topology read (ListNamespaceDelegation / the deprecated
+   * ListPartyToKeyMapping, both present in the 0.6.13 protobuf we already run),
+   * which reads the broadcast synchronizer store and so answers for parties we
+   * do not host. Moving Rule 3 onto it needs no upgrade at all.
+   *
+   * NOTE ON `kid`, if this route is ever reachable: it is an RFC 7638 JWK
+   * THUMBPRINT, not a Canton Fingerprint, and must never be used as
+   * `Signature.signedBy` (see the comment in facilitator routes/settle.ts).
+   *
+   * Only keys usable for protocol signing come back, which is exactly the usage
+   * an external party's signing key carries.
+   */
+  async getPartySigningKeys(
+    synchronizerId: string,
+    party: string
+  ): Promise<Buffer[]> {
+    return (await this.getPartySigningKeyEntries(synchronizerId, party)).map(
+      (e) => e.key
+    );
+  }
+
+  /**
+   * The same topology read, keeping each key's published IDENTIFIER alongside
+   * its bytes.
+   *
+   * WHY THE IDENTIFIER MATTERS: a relayed external signature must name the key
+   * that produced it (`Signature.signedBy`). A party with ONE key can be named
+   * by its own namespace, because the namespace IS that key's fingerprint — but
+   * a party that has rotated or published a second key cannot. Verifying
+   * against "any published key" while naming a fixed one is a mismatch the
+   * participant rejects at execute, so the identifier has to survive the
+   * lookup rather than be re-derived by guesswork.
+   *
+   * `kid` is passed through EXACTLY as published; it is deliberately not
+   * synthesised. Canton's fingerprint preimage has two plausible key-byte
+   * spellings (DER SPKI and the raw point — see the agent-wallet onboarding
+   * check, which computes both and accepts either), so a locally derived
+   * fingerprint would be a coin flip, and the wrong side of it is a failed
+   * settle. Absent `kid` means the caller must fall back to what it can prove.
+   */
+  async getPartySigningKeyEntries(
+    synchronizerId: string,
+    party: string
+  ): Promise<Array<{ key: Buffer; keyId?: string }>> {
+    const res = await this.get<{
+      keys?: Array<{ kty?: string; crv?: string; x?: string; kid?: string }>;
+    }>(
+      `/v2/jose/jwks/synchronizer/${encodeURIComponent(
+        synchronizerId
+      )}/party/${encodeURIComponent(party)}`
+    );
+    const out: Array<{ key: Buffer; keyId?: string }> = [];
+    for (const k of res.keys ?? []) {
+      // Pin the curve: an OKP entry for a different curve would decode to the
+      // wrong length or the wrong algorithm, and silently skipping the check
+      // would let a non-Ed25519 key reach an Ed25519 verify.
+      if (k.kty !== "OKP" || k.crv !== "Ed25519" || typeof k.x !== "string") {
+        continue;
+      }
+      // `x` is base64url, unpadded, RFC 8032 — the raw point, which is what
+      // node's Ed25519 verify wants.
+      const raw = Buffer.from(k.x, "base64url");
+      if (raw.length === 32) {
+        out.push({
+          key: raw,
+          ...(typeof k.kid === "string" && k.kid.length > 0
+            ? { keyId: k.kid }
+            : {}),
+        });
+      }
+    }
+    return out;
+  }
+
   private async get<T>(path: string): Promise<T> {
     return this.request<T>("GET", path);
   }
@@ -667,6 +829,40 @@ export class CantonClient {
   }
 
   /**
+   * ONE PASS over the completion stream for a submissionId. No waiting, no
+   * retry — the caller decides how patient to be.
+   *
+   * Exists so "what did this submission do" has ONE reading of the completion
+   * record. `pollCompletionUpdateId` below is that reading plus patience, and
+   * the after-the-fact resolver in the facilitator is the same reading with
+   * none. Two copies of this three-way discrimination (settled / rejected /
+   * not there yet) is exactly the divergence that keeps producing money bugs
+   * in this repo.
+   */
+  async findCompletion(
+    userId: string,
+    party: string,
+    submissionId: string,
+    beginExclusive: number
+  ): Promise<
+    | { kind: "settled"; updateId: string }
+    | { kind: "rejected"; message: string }
+    | { kind: "absent" }
+  > {
+    for (const v of await this.readCompletions(userId, party, beginExclusive)) {
+      if (v.submissionId !== submissionId) continue;
+      if (!v.status || v.status.code === 0) {
+        return { kind: "settled", updateId: v.updateId ?? "" };
+      }
+      return {
+        kind: "rejected",
+        message: v.status.message || `status ${v.status.code}`,
+      };
+    }
+    return { kind: "absent" };
+  }
+
+  /**
    * Poll the completion stream for the updateId of an interactive submission.
    * /execute is async (returns {}); the updateId lands on the completion keyed
    * by submissionId. Throws SUBMISSION_FAILED if that completion carries a
@@ -679,11 +875,16 @@ export class CantonClient {
     beginExclusive: number
   ): Promise<string> {
     for (let attempt = 0; attempt < 20; attempt++) {
-      for (const v of await this.readCompletions(userId, party, beginExclusive)) {
-        if (v.submissionId !== submissionId) continue;
-        if (!v.status || v.status.code === 0) return v.updateId ?? "";
+      const found = await this.findCompletion(
+        userId,
+        party,
+        submissionId,
+        beginExclusive
+      );
+      if (found.kind === "settled") return found.updateId;
+      if (found.kind === "rejected") {
         throw new CantonError(
-          `interactive submission rejected: ${v.status.message || `status ${v.status.code}`}`,
+          `interactive submission rejected: ${found.message}`,
           "SUBMISSION_FAILED"
         );
       }

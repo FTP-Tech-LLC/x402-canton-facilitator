@@ -13,8 +13,11 @@ import { CantonClient, type TokenProvider, ScanClient } from "@ftptech/x402-cant
 import { MerchantContractService } from "./canton/merchant-contract.js";
 import { mintUnsafeHmacJwt, createOidcTokenProvider } from "./auth/token.js";
 import { createConsumedStore, type ConsumedPaymentStore } from "./db/consumed-store.js";
+import {
+  createInlineSettleStore,
+  type InlineSettleStore,
+} from "./db/inline-settle-store.js";
 import { createFaucetStore, type FaucetClaimStore } from "./db/faucet-store.js";
-import { createTfStashStore, type TfStashStore } from "./db/stash-store.js";
 import { TransferFactoryService } from "./canton/transfer-factory.js";
 import { PreapprovalService } from "./canton/preapproval.js";
 import type { SlidingWindowConfig, CircuitBreakerConfig } from "./rate-limit.js";
@@ -37,6 +40,8 @@ import {
   type ReadinessProbe,
   type ReadinessCheckResult,
 } from "./readiness.js";
+import { createPayerProofVerifier } from "./canton/payer-proof.js";
+import { createTopologyReaderLookup } from "./canton/topology-reader-client.js";
 
 export interface Services {
   client: CantonClient;
@@ -48,6 +53,9 @@ export interface Services {
   /** Alternate SV Scan bases for the relay's raw-fetch resolves to fail over to
    *  (mirrors ScanClient.fallbackUrls; see FacilitatorConfig.scanFallbackUrls). */
   scanFallbackUrls: string[];
+  /** Non-Amulet CIP-56 instrument registries: admin party → DA Registry Utility
+   *  base URL (see FacilitatorConfig.tokenRegistries). */
+  tokenRegistries: Record<string, string>;
   /** CAIP-2-style network id echoed back in /supported and SettleResponse. */
   network: CantonNetwork;
   /** Ledger user id the facilitator submits commands as. */
@@ -56,6 +64,9 @@ export interface Services {
   operatorToken: string | undefined;
   /** Single-use payment store (replay protection, audit M2). */
   consumed: ConsumedPaymentStore;
+  /** Inline-carriage settle idempotency. Always constructed; degrades to an
+   *  in-memory map when no database is configured. */
+  inlineSettles: InlineSettleStore;
   /** Facilitator-as-provider preapproval (instant CC settle, Phase 2). */
   preapproval: PreapprovalService;
   /** Same PreapprovalService instance-shape, consumed by registerWalletRoutes
@@ -66,6 +77,12 @@ export interface Services {
   enablePreapprovalProvider: boolean;
   enableAgentWallet: boolean;
   agentWalletApiKey: string | undefined;
+  /** DAML choices the wallet relay's submit/prepare will build. */
+  walletSubmitChoices: readonly string[];
+  submitRateMaxPerKey: number;
+  /** Facilitator-wide ceiling on external-party allocations per minute. */
+  onboardRateMaxGlobal: number;
+  submitRateMaxPerIp: number;
   /** Agent CC faucet config + store. undefined when CANTON_X402_FAUCET_ENABLED
    *  is off → the faucet route 503s. Consumed by registerWalletRoutes. */
   faucet:
@@ -85,29 +102,55 @@ export interface Services {
   /** transfer-factory ("V3") master switch (config.tfEnabled). Threaded to the
    *  body validator + the /verify + /settle tf branches (fail-closed when off). */
   tfEnabled: boolean;
-  /** transfer-factory relay-pay surface (stash + knobs). undefined when
-   *  tfEnabled is off → the pay/prepare + pay/commit routes 503 and the
-   *  /verify + /settle tf branches fail closed. Consumed by
-   *  registerWalletRoutes and (P3.2) the verify/settle tf arms. */
+  /** transfer-factory relay-pay surface (inline-prepare knobs). undefined when
+   *  tfEnabled is off → the pay/prepare route 503s. Consumed by
+   *  registerWalletRoutes. */
   tfPay:
     | {
-        stash: TfStashStore;
-        capPerPayer: number;
+        /** Wasted-prepare budget per payer (config.walletPrepareWaste*). */
+        wasteMax: number;
+        wasteWindowMs: number;
         defaultExecuteBeforeSeconds: number;
         maxExecuteBeforeSeconds: number;
       }
     | undefined;
-  /** transfer-factory verify dep (stash reader + gate) for runValidation's tf
-   *  arm. undefined when tfEnabled off. */
-  tf:
-    | { stash: Pick<TfStashStore, "get">; tfEnabled: boolean }
-    | undefined;
+  /** Inline-carriage payer proof (scheme Rule 3). Always present; it answers
+   *  false until a participant topology read supplies the payer's signing key,
+   *  so an inline payload is rejected by a real check rather than by a missing
+   *  one. */
+  inline: {
+    /** Ceiling (seconds) on the transfer's executeBefore — the relay path's
+     *  clamp, handed to the carriage that skips prepare. */
+    maxExecuteBeforeSeconds?: number;
+    verifySignature: ReturnType<typeof createPayerProofVerifier>;
+    fetchPreapproval: (party: string) => Promise<{
+      receiver: string;
+      dso: string;
+      expiresAt: string;
+      provider?: string;
+      validFrom?: string;
+    } | null>;
+    merchantPolicy?:
+      | "open"
+      | "provider"
+      | "allowlist"
+      | "provider-or-allowlist";
+    merchantAllowlist?: readonly string[];
+    fetchOwnedHoldingAmounts?: (
+      party: string
+    ) => Promise<Map<string, string> | undefined>;
+    /** Non-Amulet CIP-56 registries (admin → utility base URL); routes inline
+     *  Rule 7 to a utility for a listed instrument admin. */
+    tokenRegistries?: Record<string, string>;
+    /** OUT-OF-BAND-trusted registry infra parties (admin → party[]) admitted by
+     *  the inline foreign-party backstop for registry tokens. */
+    registryTrustedParties?: Record<string, string[]>;
+  };
   /** transfer-factory settle primitive (preapproval resolve + ExecuteSubmission
    *  + funds-moved confirm). undefined when tfEnabled off. */
   transferFactory: TransferFactoryService | undefined;
-  /** transfer-factory idempotency recorder (settledUpdateId). undefined when
-   *  tfEnabled off. */
-  tfStash: Pick<TfStashStore, "recordSettled"> | undefined;
+  /** Rollout stage for the /settle unknown-outcome guard (config). */
+  settleDispatchMark: "off" | "observe" | "enforce";
   /** /settle operational guards (sliding-window rate limit + traffic breaker). */
   settleRateLimit?: SlidingWindowConfig;
   settleBreaker?: CircuitBreakerConfig;
@@ -213,6 +256,49 @@ export function buildServices(config: FacilitatorConfig): Services {
 
   const metrics = createMetrics();
 
+  // ONE payer-proof verifier, shared by both carriages. The inline arm and the
+  // legacy pay/commit must judge a signature by exactly the same rule; two
+  // instances built from the same arguments would be the same today and drift
+  // the first time one is changed.
+  const payerProof = createPayerProofVerifier({
+        // Rule 3's second half. The key comes from the TOPOLOGY READER, a
+        // node-local service that holds the participant's admin access so this
+        // process does not have to.
+        //
+        // It is NOT the JSON Ledger API's /v2/jose/jwks route: that route does
+        // not exist in what Splice ships (measured against the 0.6.13 and
+        // 0.6.14 participant images and their bundled Canton jars), so wiring
+        // it here only ever produced a 404 and a refusal.
+        //
+        // Unconfigured → no lookup → the verifier refuses every inline payment.
+        // Fail-closed, and the state a deploy is in until the reader is up.
+        ...(config.topologyReaderUrl && config.topologyReaderToken
+          ? {
+              fetchPayerSigningKey: createTopologyReaderLookup({
+                baseUrl: config.topologyReaderUrl,
+                token: config.topologyReaderToken,
+              }),
+            }
+          : {}),
+        // A reader outage refuses every inline payment as
+        // `signature_invalid`, which on the wire is indistinguishable from
+        // someone forging signatures at us. Counted, not logged: during an
+        // outage this fires once per payment, and a per-request log line would
+        // bury the incident in its own noise. `unavailable` is our reader
+        // failing; `no_key` is topology answering that the payer publishes
+        // none — same refusal to the client, opposite thing to go fix.
+        // Read the reason the error carries. This used to be a regex over the
+        // message — a second copy of a rule that lives in
+        // topology-reader-client.ts, which would have gone silently wrong the
+        // first time anyone reworded a sentence.
+        onLookupError: (_party, err) =>
+          metrics.recordInlineKeyLookup(
+            (err as { reason?: unknown } | null)?.reason === "no_key"
+              ? "no_key"
+              : "unavailable"
+          ),
+      });
+
   // Readiness probe (GET /ready): can this facilitator settle right now? The
   // three checks mirror the settle prerequisites — a mintable ledger token, a
   // reachable participant, and reachable Scan DSO-state. Each is wrapped so a
@@ -245,13 +331,16 @@ export function buildServices(config: FacilitatorConfig): Services {
     },
   });
 
-  // transfer-factory ("V3") stash — built ONCE and shared by the relay pay
-  // routes, the /verify arm, and the /settle idempotency record. undefined when
-  // the TF path is disabled (default).
-  const tfStashStore: TfStashStore | undefined = config.tfEnabled
-    ? createTfStashStore({
-        dbUrl: config.dbUrl,
-        ...(dbExecutor ? { executor: dbExecutor } : {}),
+  // Hoisted so the inline Rule 7 (registry-utility arm) can reuse the SAME
+  // registry-aware preapproval probe as the settle gate, with no second copy of
+  // the routing logic to drift.
+  const transferFactory = config.tfEnabled
+    ? new TransferFactoryService({
+        client,
+        scan,
+        facilitatorParty: config.facilitatorParty,
+        userId,
+        tokenRegistries: config.tokenRegistries,
       })
     : undefined;
 
@@ -268,6 +357,10 @@ export function buildServices(config: FacilitatorConfig): Services {
     userId,
     operatorToken: config.operatorToken,
     consumed: createConsumedStore({ dbUrl: config.dbUrl, executor: dbExecutor }),
+    inlineSettles: createInlineSettleStore({
+      ...(config.dbUrl !== undefined ? { dbUrl: config.dbUrl } : {}),
+      ...(dbExecutor ? { executor: dbExecutor } : {}),
+    }),
     preapproval: new PreapprovalService({
       client,
       scan,
@@ -287,7 +380,12 @@ export function buildServices(config: FacilitatorConfig): Services {
     enablePreapprovalProvider: config.enablePreapprovalProvider,
     scanUrl: config.scanUrl,
     scanFallbackUrls: config.scanFallbackUrls,
+    tokenRegistries: config.tokenRegistries,
     enableAgentWallet: config.enableAgentWallet,
+    walletSubmitChoices: config.walletSubmitChoiceAllowlist,
+    submitRateMaxPerKey: config.walletSubmitRateMaxPerKey,
+    onboardRateMaxGlobal: config.walletOnboardRateMaxGlobal,
+    submitRateMaxPerIp: config.walletSubmitRateMaxPerIp,
     agentWalletApiKey: config.agentWalletApiKey,
     faucet: config.faucetEnabled
       ? {
@@ -309,28 +407,110 @@ export function buildServices(config: FacilitatorConfig): Services {
         }
       : undefined,
     tfEnabled: config.tfEnabled,
-    // ONE stash instance shared by the relay pay routes (tfPay), the /verify
-    // arm (tf.stash) and the /settle idempotency record (tfStash).
-    tfPay: tfStashStore
+    // Inline-prepare knobs for the pay/prepare relay route. undefined when the
+    // TF path is disabled (default) → pay/prepare 503s.
+    tfPay: config.tfEnabled
       ? {
-          stash: tfStashStore,
-          capPerPayer: config.tfStashCapPerPayer,
+          wasteMax: config.walletPrepareWasteMax,
+          wasteWindowMs: config.walletPrepareWasteWindowMs,
           defaultExecuteBeforeSeconds: config.tfDefaultExecuteBeforeSeconds,
           maxExecuteBeforeSeconds: config.tfMaxExecuteBeforeSeconds,
         }
       : undefined,
-    tf: tfStashStore
-      ? { stash: tfStashStore, tfEnabled: true }
-      : undefined,
-    transferFactory: config.tfEnabled
-      ? new TransferFactoryService({
-          client,
-          scan,
-          facilitatorParty: config.facilitatorParty,
-          userId,
-        })
-      : undefined,
-    tfStash: tfStashStore,
+    // Inline carriage, scheme Rule 3. The verifier is ALWAYS wired, so the
+    // rejection an inline payload gets today comes from the real proof check
+    // (hash binding passes, the signature half has no key source) rather than
+    // from an absent dependency. Completing Rule 3 is one argument here —
+    // `fetchPayerSigningKey` — once a participant topology read exists.
+    inline: {
+      // The relay path has always clamped this at prepare time; the inline
+      // carriage bypasses prepare by construction, so it needs the same
+      // ceiling handed to it explicitly or the payer sets its own.
+      maxExecuteBeforeSeconds: config.tfMaxExecuteBeforeSeconds,
+      verifySignature: payerProof,
+      // Rule 7 reads the merchant's live TransferPreapproval from Scan. That
+      // read is TTL-cached per merchant and single-flighted, so a burst of
+      // payments to one merchant collapses to a single lookup — and an expired
+      // record is never served from the cache, since this is the field the
+      // /settle gate refuses payments on.
+      // The WHOLE record — the arm binds receiver and issuer, not just expiry.
+      fetchPreapproval: async (party: string) => {
+        const r = await scan.getTransferPreapprovalByParty(party);
+        return r
+          ? {
+              receiver: r.receiver,
+              dso: r.dso,
+              expiresAt: r.expiresAt,
+              // LOAD-BEARING for the served-merchant policy: drop this and any
+              // non-open policy sees an undefined provider and refuses every
+              // merchant, taking the inline money path down.
+              provider: r.provider,
+              ...(r.validFrom !== undefined ? { validFrom: r.validFrom } : {}),
+            }
+          : null;
+      },
+      merchantPolicy: config.inlineMerchantPolicy,
+      merchantAllowlist: config.inlineMerchantAllowlist,
+      // Registry-utility (non-Amulet) Rule 7 on the inline arm: reuse the settle
+      // gate's registry-aware probe so a USDCx/cBTC merchant's preapproval is
+      // detected the same way on /verify and /settle.
+      tokenRegistries: config.tokenRegistries,
+      // OUT-OF-BAND-trusted registry infra parties per admin, so the foreign-party
+      // backstop admits the operator/bridge a real registry transfer names. Empty
+      // {} → Amulet-identical.
+      registryTrustedParties: config.registryTrustedParties,
+      // Rule 13's sum, answered from the PARTICIPANT'S LIVE ACS — the same
+      // query pay/prepare uses to SELECT the inputs, so the two see one truth.
+      //
+      // It is deliberately NOT Scan's public snapshot, which this repo's own
+      // comment (routes/wallet.ts) describes as lagging by hours. Checking live
+      // contract ids against a stale view refuses any payer spending change
+      // from its previous payment or a fresh faucet claim: the common case, not
+      // an edge one, and an over-strict money path is an outage.
+      //
+      // WHO THIS CAN ANSWER FOR: only parties this participant hosts, because
+      // reading a party's active contracts requires rights on that party. For
+      // everyone else the query fails and we return undefined, which the arm
+      // treats as "no authoritative view" and SKIPS the sum — exactly what the
+      // scheme makes conditional on hosting the payer. So the sum becomes real
+      // for our own agent wallets and stays honestly unanswered for the rest,
+      // rather than being answered wrongly for everyone.
+      fetchOwnedHoldingAmounts: async (party: string) => {
+        const events = await client.queryActiveContracts({
+          filtersByParty: {
+            [party]: {
+              cumulative: [
+                {
+                  identifierFilter: {
+                    // Template-scoped, NOT a wildcard. A party with a large ACS
+                    // trips Canton's element cap on a wildcard query and the
+                    // read 502s; scoping keeps the result O(amulets).
+                    TemplateFilter: {
+                      value: {
+                        templateId: "#splice-amulet:Splice.Amulet:Amulet",
+                        includeCreatedEventBlob: false,
+                      },
+                    },
+                  },
+                },
+              ],
+            },
+          },
+        });
+        const owned = new Map<string, string>();
+        for (const e of events) {
+          const amt = (
+            e.createArgument as { amount?: { initialAmount?: string } }
+          )?.amount?.initialAmount;
+          if (typeof amt === "string" && amt.length > 0) {
+            owned.set(e.contractId, amt);
+          }
+        }
+        return owned;
+      },
+    },
+    transferFactory,
+    settleDispatchMark: config.settleDispatchMarkMode,
     settleRateLimit: {
       maxPerPayer: config.settleRateMaxPerPayer,
       maxPerIp: config.settleRateMaxPerIp,

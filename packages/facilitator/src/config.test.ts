@@ -19,6 +19,8 @@ const REQUIRED = [
 ] as const;
 
 const OPTIONAL = [
+  "CANTON_X402_INLINE_MERCHANT_ALLOWLIST",
+  "CANTON_X402_INLINE_MERCHANT_POLICY",
   "PORT",
   "JWT_ISSUER",
   "JWT_SECRET",
@@ -657,6 +659,77 @@ describe("loadConfig", () => {
   });
 });
 
+
+describe("inline merchant policy — the switch that gates whose traffic we burn", () => {
+  let saved: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    saved = {
+      p: process.env.CANTON_X402_INLINE_MERCHANT_POLICY,
+      a: process.env.CANTON_X402_INLINE_MERCHANT_ALLOWLIST,
+    };
+    delete process.env.CANTON_X402_INLINE_MERCHANT_POLICY;
+    delete process.env.CANTON_X402_INLINE_MERCHANT_ALLOWLIST;
+  });
+  afterEach(() => {
+    if (saved.p === undefined) delete process.env.CANTON_X402_INLINE_MERCHANT_POLICY;
+    else process.env.CANTON_X402_INLINE_MERCHANT_POLICY = saved.p;
+    if (saved.a === undefined) delete process.env.CANTON_X402_INLINE_MERCHANT_ALLOWLIST;
+    else process.env.CANTON_X402_INLINE_MERCHANT_ALLOWLIST = saved.a;
+  });
+
+  function cfg(): ReturnType<typeof loadConfig> {
+    process.env.CANTON_NETWORK = "canton:devnet";
+    process.env.CANTON_PARTICIPANT_URL = "http://localhost:3975";
+    process.env.CANTON_FACILITATOR_PARTY = "ftp_facilitator::1220";
+    process.env.CANTON_SYNCHRONIZER_ID = "global-domain::1220";
+    process.env.CANTON_SCAN_URL = "http://localhost:3903";
+    process.env.DATABASE_URL = "postgres://x:x@localhost/x";
+    return loadConfig();
+  }
+
+  it("defaults to open, so an existing deploy changes nothing", () => {
+    expect(cfg().inlineMerchantPolicy).toBe("open");
+    expect(cfg().inlineMerchantAllowlist).toEqual([]);
+  });
+
+  it("accepts each real mode", () => {
+    for (const v of ["provider", "allowlist", "provider-or-allowlist"]) {
+      process.env.CANTON_X402_INLINE_MERCHANT_POLICY = v;
+      expect(cfg().inlineMerchantPolicy).toBe(v);
+    }
+  });
+
+  it("REFUSES TO BOOT on a typo, rather than silently running wide open", () => {
+    // This test used to assert the opposite, reasoning that failing closed
+    // would take the money path down over a typo. That framing had only two
+    // options in it — silently permissive, or silently refusing everything —
+    // and both are silent. There is a third: do not start.
+    //
+    // It matters which way this falls because the value is a SECURITY gate. A
+    // misspelling that resolves to `open` disables the only control over whose
+    // payments make us burn our own Global Synchronizer traffic, while the
+    // operator reads their .env and believes the gate is on. A boot that
+    // refuses is loud, immediate, happens at deploy time rather than under
+    // load, and names the mistake.
+    process.env.CANTON_X402_INLINE_MERCHANT_POLICY = "providr";
+    expect(() => cfg()).toThrow(/CANTON_X402_INLINE_MERCHANT_POLICY must be one of/);
+  });
+
+  it("treats unset and empty as open, so existing deploys are untouched", () => {
+    // The strictness above must not turn an ordinary `FOO=` in a compose file
+    // into an outage.
+    process.env.CANTON_X402_INLINE_MERCHANT_POLICY = "";
+    expect(cfg().inlineMerchantPolicy).toBe("open");
+    process.env.CANTON_X402_INLINE_MERCHANT_POLICY = "  ";
+    expect(cfg().inlineMerchantPolicy).toBe("open");
+  });
+
+  it("parses the allowlist, trimming and dropping blanks", () => {
+    process.env.CANTON_X402_INLINE_MERCHANT_POLICY = "allowlist";
+    process.env.CANTON_X402_INLINE_MERCHANT_ALLOWLIST = " a::1 , ,b::2 ";
+    expect(cfg().inlineMerchantAllowlist).toEqual(["a::1", "b::2"]);
+  });
+});
 describe("parseTrustProxy (security: forgeable req.ip mitigation)", () => {
   it("unset / empty → loopback-only (the SAFE default, not whole-chain trust)", () => {
     expect(parseTrustProxy(undefined)).toEqual(["loopback"]);
@@ -696,5 +769,204 @@ describe("parseTrustProxy (security: forgeable req.ip mitigation)", () => {
       "10.0.0.1",
       "10.0.0.2",
     ]);
+  });
+});
+
+describe("cost caps fall back on a typo instead of vanishing", () => {
+  const KEYS = [
+    ["CANTON_X402_SETTLE_RATE_MAX_GLOBAL", "settleRateMaxGlobal"],
+    ["CANTON_X402_SETTLE_RATE_MAX_PER_PAYER", "settleRateMaxPerPayer"],
+    ["CANTON_X402_VERIFY_RATE_MAX_PER_IP", "verifyRateMaxPerIp"],
+    ["CANTON_X402_SETTLE_BREAKER_THRESHOLD", "settleBreakerThreshold"],
+  ] as const;
+
+  function base() {
+    process.env.CANTON_NETWORK = "canton:devnet";
+    process.env.CANTON_PARTICIPANT_URL = "http://localhost:3975";
+    process.env.CANTON_FACILITATOR_PARTY = "ftp_facilitator::1220";
+    process.env.CANTON_SYNCHRONIZER_ID = "global-domain::1220";
+    process.env.CANTON_SCAN_URL = "http://localhost:3903";
+  }
+
+  it("a misspelled value keeps the documented default, never NaN", () => {
+    // NaN is the dangerous outcome, not zero: every `>= max` comparison against
+    // NaN is false, so the cap does not become strict — it disappears, while
+    // the operator's .env still reads like the limit is on.
+    for (const [env, field] of KEYS) {
+      const saved = process.env[env];
+      base();
+      const good = (loadConfig() as unknown as Record<string, number>)[field]!;
+      process.env[env] = "12O"; // letter O
+      const got = (loadConfig() as unknown as Record<string, number>)[field]!;
+      expect(Number.isFinite(got), `${field} must stay finite`).toBe(true);
+      expect(got).toBe(good);
+      if (saved === undefined) delete process.env[env];
+      else process.env[env] = saved;
+    }
+  });
+
+  it("a SET-BUT-EMPTY value means unset, not zero", () => {
+    // The dangerous shape, and the one this repo invites: `KEY=` with nothing
+    // after it is the house style for a placeholder in the ops .env.example
+    // files, and the compose files pass those keys through bare. `??` does not
+    // substitute for "", `Number("")` is 0, and 0 is the DISABLED sentinel for
+    // every consumer here — so the placeholder removed the cap while the
+    // operator's own .env read like the limit was on.
+    for (const [env, field] of KEYS) {
+      const saved = process.env[env];
+      base();
+      const documented = (loadConfig() as unknown as Record<string, number>)[field]!;
+      for (const empty of ["", "   ", "\t"]) {
+        process.env[env] = empty;
+        const got = (loadConfig() as unknown as Record<string, number>)[field]!;
+        expect(got, `${field} with ${JSON.stringify(empty)}`).toBe(documented);
+        expect(got, `${field} must not silently disable`).not.toBe(0);
+      }
+      if (saved === undefined) delete process.env[env];
+      else process.env[env] = saved;
+    }
+  });
+
+  it("a real value is still honoured", () => {
+    const saved = process.env.CANTON_X402_SETTLE_RATE_MAX_GLOBAL;
+    base();
+    process.env.CANTON_X402_SETTLE_RATE_MAX_GLOBAL = "7";
+    expect(loadConfig().settleRateMaxGlobal).toBe(7);
+    // Zero means "disabled" in this codebase and must survive the guard.
+    process.env.CANTON_X402_SETTLE_RATE_MAX_GLOBAL = "0";
+    expect(loadConfig().settleRateMaxGlobal).toBe(0);
+    if (saved === undefined) delete process.env.CANTON_X402_SETTLE_RATE_MAX_GLOBAL;
+    else process.env.CANTON_X402_SETTLE_RATE_MAX_GLOBAL = saved;
+  });
+});
+
+describe("wasted-prepare budget config", () => {
+  let saved: Record<string, string | undefined> = {};
+  const KEYS = [
+    "CANTON_X402_WALLET_PREPARE_WASTE_MAX",
+    "CANTON_X402_WALLET_PREPARE_WASTE_WINDOW_MS",
+  ];
+  beforeEach(() => {
+    saved = {};
+    for (const k of KEYS) { saved[k] = process.env[k]; delete process.env[k]; }
+  });
+  afterEach(() => {
+    for (const k of KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  function cfg(): ReturnType<typeof loadConfig> {
+    process.env.CANTON_NETWORK = "canton:devnet";
+    process.env.CANTON_PARTICIPANT_URL = "http://localhost:3975";
+    process.env.CANTON_FACILITATOR_PARTY = "ftp_facilitator::1220";
+    process.env.CANTON_SYNCHRONIZER_ID = "global-domain::1220";
+    process.env.CANTON_SCAN_URL = "http://localhost:3903";
+    process.env.DATABASE_URL = "postgres://x:x@localhost/x";
+    return loadConfig();
+  }
+
+  it("defaults to 10 wasted prepares per 5 minutes", () => {
+    const c = cfg();
+    expect(c.walletPrepareWasteMax).toBe(10);
+    expect(c.walletPrepareWasteWindowMs).toBe(300_000);
+  });
+
+  it("is operator-tunable, and 0 disables it", () => {
+    process.env.CANTON_X402_WALLET_PREPARE_WASTE_MAX = "3";
+    process.env.CANTON_X402_WALLET_PREPARE_WASTE_WINDOW_MS = "60000";
+    expect(cfg().walletPrepareWasteMax).toBe(3);
+    expect(cfg().walletPrepareWasteWindowMs).toBe(60_000);
+    process.env.CANTON_X402_WALLET_PREPARE_WASTE_MAX = "0";
+    expect(cfg().walletPrepareWasteMax).toBe(0);
+  });
+});
+
+/**
+ * AN EMPTY ENV VALUE IS "UNSET", NOT "ZERO" — AND HERE ZERO MEANS UNCAPPED.
+ *
+ * `numericEnv` says so in its own comment ("EMPTY MEANS UNSET"), and it was
+ * written after exactly this bug. Two readers in the same file never got
+ * routed through it and kept their hand-rolled `Number(raw) >= 0` shape:
+ * `Number("")` is 0, `0 >= 0` is true, so the reader returns 0 — and 0 is the
+ * documented DISABLE value for both caps (`rate-limit.ts`: `if (max <= 0)
+ * continue; // this key is not capped`).
+ *
+ * So blanking a line in .env — `CANTON_X402_SETTLE_RATE_MAX_PER_IP=`, which is
+ * how an operator comments a knob out, and which appears verbatim in
+ * .env.example — silently removes the cap instead of restoring the default.
+ * Two readers of the same idea, disagreeing about the one input an operator is
+ * most likely to produce.
+ */
+describe("blanking a capped env line restores the default, never uncaps", () => {
+  const KEYS = [
+    "CANTON_X402_SETTLE_RATE_MAX_PER_IP",
+    "CANTON_X402_FAUCET_MAX_PER_IP",
+  ] as const;
+  let saved: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    saved = {};
+    for (const k of KEYS) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+  });
+  afterEach(() => {
+    for (const k of KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  function cfg(): ReturnType<typeof loadConfig> {
+    process.env.CANTON_NETWORK = "canton:devnet";
+    process.env.CANTON_PARTICIPANT_URL = "http://localhost:3975";
+    process.env.CANTON_FACILITATOR_PARTY = "ftp_facilitator::1220";
+    process.env.CANTON_SYNCHRONIZER_ID = "global-domain::1220";
+    process.env.CANTON_SCAN_URL = "http://localhost:3903";
+    process.env.DATABASE_URL = "postgres://x:x@localhost/x";
+    return loadConfig();
+  }
+
+  it("empty and whitespace fall back to the default cap, not to 0", () => {
+    for (const blank of ["", "   "]) {
+      process.env.CANTON_X402_SETTLE_RATE_MAX_PER_IP = blank;
+      process.env.CANTON_X402_FAUCET_MAX_PER_IP = blank;
+      const c = cfg();
+      expect(c.settleRateMaxPerIp).toBe(100);
+      expect(c.faucetMaxPerIp).toBe(5);
+    }
+  });
+
+  it("absent still gives the default", () => {
+    const c = cfg();
+    expect(c.settleRateMaxPerIp).toBe(100);
+    expect(c.faucetMaxPerIp).toBe(5);
+  });
+
+  // ── discriminator: an EXPLICIT 0 must keep meaning "uncapped" ─────────────
+  it("an explicit 0 still disables the cap — that is the documented switch", () => {
+    // .env.example says "0 disables", and a relay operator fronting many agents
+    // relies on it. A guard that refused 0 would break a supported deployment.
+    process.env.CANTON_X402_SETTLE_RATE_MAX_PER_IP = "0";
+    process.env.CANTON_X402_FAUCET_MAX_PER_IP = "0";
+    const c = cfg();
+    expect(c.settleRateMaxPerIp).toBe(0);
+    expect(c.faucetMaxPerIp).toBe(0);
+  });
+
+  it("a real value is still honoured, and a typo falls back rather than uncapping", () => {
+    process.env.CANTON_X402_SETTLE_RATE_MAX_PER_IP = "7";
+    process.env.CANTON_X402_FAUCET_MAX_PER_IP = "3";
+    let c = cfg();
+    expect(c.settleRateMaxPerIp).toBe(7);
+    expect(c.faucetMaxPerIp).toBe(3);
+
+    process.env.CANTON_X402_SETTLE_RATE_MAX_PER_IP = "abc";
+    process.env.CANTON_X402_FAUCET_MAX_PER_IP = "-1";
+    c = cfg();
+    expect(c.settleRateMaxPerIp).toBe(100);
+    expect(c.faucetMaxPerIp).toBe(5);
   });
 });

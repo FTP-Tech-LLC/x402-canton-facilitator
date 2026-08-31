@@ -203,3 +203,167 @@ describe("PreapprovalService.createTransferPreapproval", () => {
     ).rejects.toThrow(/open mining round/);
   });
 });
+
+/**
+ * Past a 200 from interactiveSubmissionExecute the submission is ACCEPTED and
+ * will be sequenced; the completion read only classifies it. This is the third
+ * copy of that rule in the codebase (transfer-factory.ts execute and the relay
+ * submit/execute route are the other two) and the last one to get the guard —
+ * without it a merchant whose preapproval committed was told it failed, and ran
+ * the flow again for a second creation fee.
+ */
+describe("executeSelfPreapproval: an unreadable completion is not a failed submission", () => {
+  const run = async (poll: () => Promise<string>) => {
+    const client = {
+      getLedgerEnd: vi.fn(async () => ({ offset: 1 })),
+      interactiveSubmissionExecute: vi.fn(async () => ({ updateId: undefined })),
+      pollCompletionUpdateId: vi.fn(poll),
+    } as unknown as PreapprovalServiceDeps["client"];
+    const svc = new PreapprovalService({
+      client,
+      scan: {} as never,
+      facilitatorParty: "ftp_facilitator::1220fff",
+      userId: "facilitator-user",
+    });
+    return svc
+      .executeSelfPreapproval({
+        party: "merchant::1220m",
+        preparedTransaction: "pt",
+        hashingSchemeVersion: "HASHING_SCHEME_VERSION_V2",
+        partySignatures: { signatures: [] },
+      })
+      .then(
+        () => undefined,
+        (e: unknown) => e
+      );
+  };
+
+  it("wraps an unreadable completion as an unknown outcome", async () => {
+    const err = await run(async () => {
+      throw Object.assign(new Error("no completion for submissionId within timeout"), {
+        code: "INVALID_RESPONSE",
+      });
+    });
+    expect((err as Error).name).toBe("SubmissionOutcomeUnknownError");
+  });
+
+  it("lets a definitive participant refusal through unchanged", async () => {
+    // The discriminator: SUBMISSION_FAILED means the completion ARRIVED and the
+    // participant refused. Wrapping that too would hide a real, safe failure
+    // behind a warning about a preapproval that never existed.
+    const err = await run(async () => {
+      throw Object.assign(new Error("interactive submission rejected: bad"), {
+        code: "SUBMISSION_FAILED",
+      });
+    });
+    expect((err as Error).name).not.toBe("SubmissionOutcomeUnknownError");
+    expect((err as { code?: string }).code).toBe("SUBMISSION_FAILED");
+  });
+})
+
+describe("createTransferPreapproval — stale disclosed round", () => {
+  const STALE = "00omr-stale";
+  const LIVE = "00omr-live";
+  const roundsWith = (cid: string) => ({
+    open_mining_rounds: [
+      {
+        contract: {
+          contract_id: cid,
+          template_id: "#splice:OpenMiningRound",
+          created_event_blob: "blob-omr",
+          payload: { round: { number: "100" } },
+        },
+      },
+    ],
+    issuing_mining_rounds: [],
+  });
+
+  /** A Scan whose cached read is stale until `Fresh` invalidates it. */
+  function staleThenFresh(submit: ReturnType<typeof vi.fn>) {
+    const cached = vi.fn(async () => roundsWith(STALE));
+    const fresh = vi.fn(async () => roundsWith(LIVE));
+    const scan = {
+      getAmuletRules: vi.fn(async () => AMULET),
+      getAmuletRulesFresh: vi.fn(async () => AMULET),
+      getOpenAndIssuingMiningRounds: cached,
+      getOpenAndIssuingMiningRoundsFresh: fresh,
+    } as unknown as PreapprovalServiceDeps["scan"];
+    const client = {
+      submitAndWaitForTransaction: submit,
+      queryActiveContracts: vi.fn(async () => AMULETS),
+    } as unknown as PreapprovalServiceDeps["client"];
+    return {
+      svc: new PreapprovalService({
+        client,
+        scan,
+        facilitatorParty: "ftp_facilitator::1220fff",
+        userId: "facilitator-user",
+      }),
+      cached,
+      fresh,
+    };
+  }
+  const disclosedIds = (call: unknown) =>
+    (call as { disclosedContracts: Array<{ contractId: string }> }).disclosedContracts.map(
+      (d) => d.contractId
+    );
+
+  it("retries with the LIVE round after the ledger refuses the cached one", async () => {
+    // Within one cache TTL of a round rotation, the cached cid names a contract
+    // the ledger has already archived. Before the retry, every preapproval
+    // create in that window simply failed.
+    const submit = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("LOCAL_VERDICT_INACTIVE_CONTRACTS"))
+      .mockResolvedValueOnce({ updateId: "u-retry", offset: 2, events: [] });
+    const { svc, fresh } = staleThenFresh(submit);
+    const r = await svc.createTransferPreapproval({
+      merchant: "merchant::1220m",
+      expiresAt: "2026-09-01T00:00:00Z",
+    });
+    expect(r.updateId).toBe("u-retry");
+    expect(fresh).toHaveBeenCalledTimes(1);
+    expect(disclosedIds(submit.mock.calls[0]![0])).toContain(STALE);
+    expect(disclosedIds(submit.mock.calls[1]![0])).toContain(LIVE);
+  });
+
+  it("does NOT retry an ambiguous failure — a timeout may have created it", async () => {
+    // The retry is safe only because a contention rejection is a DEFINITE
+    // verdict that created nothing. Re-submitting after "maybe it worked"
+    // would risk a second preapproval.
+    const submit = vi.fn().mockRejectedValue(new Error("socket hang up"));
+    const { svc, fresh } = staleThenFresh(submit);
+    await expect(
+      svc.createTransferPreapproval({
+        merchant: "merchant::1220m",
+        expiresAt: "2026-09-01T00:00:00Z",
+      })
+    ).rejects.toThrow(/socket hang up/);
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(fresh).not.toHaveBeenCalled();
+  });
+
+  it("retries at most once — a second refusal is the caller's answer", async () => {
+    const submit = vi.fn().mockRejectedValue(new Error("have been archived"));
+    const { svc, fresh } = staleThenFresh(submit);
+    await expect(
+      svc.createTransferPreapproval({
+        merchant: "merchant::1220m",
+        expiresAt: "2026-09-01T00:00:00Z",
+      })
+    ).rejects.toThrow(/have been archived/);
+    expect(submit).toHaveBeenCalledTimes(2);
+    expect(fresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("the happy path never touches the cache-bypassing read", async () => {
+    const submit = vi.fn(async () => ({ updateId: "u-ok", offset: 1, events: [] }));
+    const { svc, cached, fresh } = staleThenFresh(submit);
+    await svc.createTransferPreapproval({
+      merchant: "merchant::1220m",
+      expiresAt: "2026-09-01T00:00:00Z",
+    });
+    expect(cached).toHaveBeenCalledTimes(1);
+    expect(fresh).not.toHaveBeenCalled();
+  });
+});

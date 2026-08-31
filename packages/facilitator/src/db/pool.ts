@@ -35,6 +35,20 @@ export interface PgExecutor {
     sql: string,
     params?: unknown[]
   ): Promise<{ rows: unknown[]; rowCount: number | null }>;
+  /**
+   * Run several statements on ONE connection inside a transaction.
+   *
+   * Needed wherever a guard cannot be expressed as a single statement. Under
+   * READ COMMITTED a statement's snapshot is fixed when the statement begins,
+   * so a sub-SELECT inside an INSERT cannot see a sibling's uncommitted row —
+   * which means "one big INSERT ... WHERE (SELECT SUM(...)) <= budget" reads a
+   * stale total under concurrency and both claims can pass. Only a row lock, or
+   * serialising the claimants, actually decides.
+   *
+   * OPTIONAL because the in-memory and test executors have no connection to
+   * hold. Callers must say what they do without it rather than assume it.
+   */
+  transaction?<T>(fn: (tx: PgExecutor) => Promise<T>): Promise<T>;
 }
 
 export interface FacilitatorPoolOptions {
@@ -104,7 +118,26 @@ export function createFacilitatorPool(
 /** Adapt a `pg.Pool` to the {@link PgExecutor} surface the stores consume. */
 export function poolExecutor(pool: Pool): PgExecutor {
   return {
-    query: (sql, params) =>
-      pool.query(sql, params as unknown[] | undefined),
+    query: (sql, params) => pool.query(sql, params as unknown[] | undefined),
+    async transaction<T>(fn: (tx: PgExecutor) => Promise<T>): Promise<T> {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        // Every statement inside gets its own snapshot taken when it starts, so
+        // a statement issued AFTER a lock was acquired sees everything the
+        // previous holder committed. That is the property the callers need.
+        const tx: PgExecutor = {
+          query: (sql, params) => client.query(sql, params as unknown[] | undefined),
+        };
+        const out = await fn(tx);
+        await client.query("COMMIT");
+        return out;
+      } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw err;
+      } finally {
+        client.release();
+      }
+    },
   };
 }

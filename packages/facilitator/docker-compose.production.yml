@@ -78,6 +78,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # EVERY var config.ts reads, not a hand-picked few. The block below names
+    # ~12 of the ~65 it actually reads; without this the rest are silently
+    # dropped, including CANTON_X402_TF_ENABLED — whose default false makes
+    # the ONLY settlement method refuse every payment, with a reason naming
+    # the very variable the operator already set in the .env the README told
+    # them to write. deploy/README.md calls this path equivalent to systemd
+    # "against the same env vars"; this line is what makes that true.
+    env_file:
+      - .env
     environment:
       PORT: "4022"
       # Required — no defaults; missing values fail at startup.

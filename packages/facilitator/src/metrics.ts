@@ -47,7 +47,14 @@ export type SettleResult =
   | "counter_not_ready"
   | "already_settled"
   | "rate_limited"
-  | "breaker_open";
+  | "breaker_open"
+  // The submit may or may not have committed. Its own label because an
+  // operator must never see this folded into ordinary ledger errors.
+  | "outcome_unknown"
+  /** The same state, met while the guard is in `observe`: counted so the
+   *  rollout decision is made on a number rather than a guess, while the
+   *  response stays what it is today. */
+  | "outcome_unknown_observed";
 
 /** The two rate-limited endpoints, labelled on `ratelimit_rejected_total{scope=...}`. */
 export type RateLimitScope = "verify" | "settle";
@@ -72,6 +79,16 @@ export type SendOutcome =
   | "retry_aborted_nonce"
   | "committed_zero_funds_burn";
 
+/**
+ * Outcome of the payer signing-key read that gates every inline payment.
+ *
+ * The distinction is the whole point: `unavailable` is OUR topology reader
+ * failing to answer, `no_key` is topology answering that this payer publishes
+ * nothing usable. Both refuse the payment — correctly — but only one of them
+ * is our outage, and on the wire they are the same refusal.
+ */
+export type InlineKeyLookupOutcome = "ok" | "unavailable" | "no_key";
+
 export interface FacilitatorMetrics {
   /** The registry to serialize on GET /metrics. */
   registry: Registry;
@@ -91,6 +108,8 @@ export interface FacilitatorMetrics {
    *  is saving money; committed_zero_funds_burn rising = the gas-burn DoS is
    *  active (money lost). See {@link SendOutcome}. */
   sendOutcomeTotal: CounterT<"outcome">;
+  /** See {@link FacilitatorMetrics.recordInlineKeyLookup}. */
+  inlineKeyLookupTotal: CounterT<"outcome">;
   /** Convenience: record one settle outcome (increments settle_total{result}). */
   recordSettle(result: SettleResult): void;
   /** Convenience: record a 429 rejection for `scope`. */
@@ -98,6 +117,16 @@ export interface FacilitatorMetrics {
   /** Convenience: record one v1 Send GS-traffic outcome (avoided OR incurred
    *  burn — see {@link SendOutcome}). */
   recordSendOutcome(outcome: SendOutcome): void;
+  /** inline_key_lookup_total{outcome} — the payer signing-key read behind
+   *  EVERY inline payment.
+   *
+   *  Exists because a failed lookup and a forged signature are the same thing
+   *  on the wire: both refuse with `invalid_exact_canton_signature_invalid`.
+   *  Without this counter, the topology reader going down looks exactly like
+   *  an attack, and the operator debugs the wrong system. `unavailable`
+   *  climbing means OUR dependency is down; `no_key` climbing means payers are
+   *  arriving without a published protocol signing key. */
+  recordInlineKeyLookup(outcome: InlineKeyLookupOutcome): void;
 }
 
 /**
@@ -145,6 +174,13 @@ export function createMetrics(opts?: {
     registers: [registry],
   });
 
+  const inlineKeyLookupTotal = new Counter({
+    name: "x402_facilitator_inline_key_lookup_total",
+    help: "payer signing-key lookups against the topology reader, by outcome: ok, unavailable (our reader could not answer), no_key (the party publishes none)",
+    labelNames: ["outcome"] as const,
+    registers: [registry],
+  });
+
   const sendOutcomeTotal = new Counter({
     name: "x402_facilitator_send_outcome_total",
     help: "v1 Send GS-traffic outcomes by outcome: nonce cost-gate burns avoided (skipped_nonce_consumed/retry_aborted_nonce) and committed-but-zero-funds burns incurred (committed_zero_funds_burn)",
@@ -159,6 +195,7 @@ export function createMetrics(opts?: {
     rateLimitRejectedTotal,
     settleDuration,
     sendOutcomeTotal,
+    inlineKeyLookupTotal,
     recordSettle(result: SettleResult): void {
       settleTotal.inc({ result });
     },
@@ -167,6 +204,9 @@ export function createMetrics(opts?: {
     },
     recordSendOutcome(outcome: SendOutcome): void {
       sendOutcomeTotal.inc({ outcome });
+    },
+    recordInlineKeyLookup(outcome: InlineKeyLookupOutcome): void {
+      inlineKeyLookupTotal.inc({ outcome });
     },
   };
 }

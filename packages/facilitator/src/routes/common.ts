@@ -11,13 +11,13 @@ import type {
   CantonErrorCode,
   CantonNetwork,
 } from "@ftptech/x402-canton-core";
-import {
-  wireAmountToLedgerDecimal,
-  ledgerDecimalEquals,
-} from "@ftptech/x402-canton-core";
 import type { ConsumedPaymentStore } from "../db/consumed-store.js";
-import type { TfStashStore, TfStashRecord } from "../db/stash-store.js";
 import type { FastifyRequest } from "fastify";
+import {
+  isInlineCarriage,
+  validateInlineTransferPath,
+  type InlineValidationDeps,
+} from "./inline-transfer.js";
 
 /**
  * Resolve the client IP used as the rate-limit key for the PUBLIC endpoints
@@ -42,22 +42,41 @@ export function clientIp(req: FastifyRequest): string {
 }
 
 export interface ValidationServices {
-  /** Single-use payment store for replay protection (audit M2). When set,
-   *  /settle records each settled txid (rejecting a second settle) and
-   *  /verify rejects an already-settled payment. Optional so route tests
-   *  may omit it. */
+  /** Single-use payment store, read by the attribution repair worker.
+   *
+   *  It does NOT provide settle replay protection today, whatever an earlier
+   *  version of this comment claimed: nothing in the source ever calls
+   *  `markSettled`, so the table is never written and the worker's `has()`
+   *  probe can never be true. Idempotency lives entirely in the inline settle
+   *  store (db/inline-settle-store.ts). Left wired because the worker reads it,
+   *  and documented honestly so nobody counts it as a guard it is not. */
   consumed?: ConsumedPaymentStore;
-  /** transfer-factory ("V3") verify deps. OPTIONAL — a deploy with TF off omits
-   *  them; a transfer-factory payload then fails closed
-   *  (invalid_exact_canton_transfer_factory_disabled). `stash.get` reads the
-   *  relay-recorded transfer fields the /verify arm compares against
-   *  PaymentRequirements (NO facilitator-side protobuf decode — the relay built
-   *  the tx itself, so its recorded fields are the trust anchor). */
-  tf?:
-    | {
-        stash: Pick<TfStashStore, "get">;
-        tfEnabled: boolean;
-      }
+  /** transfer-factory ("V3") MASTER SWITCH (config.tfEnabled). Explicit `false`
+   *  refuses the inline carriage before it does any work; `undefined` stays
+   *  permissive so a caller that never wires it keeps its behaviour.
+   *
+   *  Gating inline on anything else would be gating it on the wrong thing: with
+   *  the switch off, an unauthenticated /verify still ran the whole inline
+   *  validation — one Scan read on a caller-chosen merchant party and one
+   *  participant ACS query on the decoded payer, under the facilitator's own
+   *  credentials, on a deploy the operator believes is inert — and answered
+   *  isValid:true. (/settle has its own inline gate, so no money ever moved.) */
+  tfEnabled?: boolean | undefined;
+  /** Inline-carriage deps. Absent means the inline arm cannot verify a
+   *  signature, and it then REFUSES every inline payload — the missing
+   *  capability is a rejection, not a skipped check. */
+  inline?:
+    | Pick<
+        InlineValidationDeps,
+        | "verifySignature"
+        | "fetchPreapproval"
+        | "fetchOwnedHoldingAmounts"
+        | "maxExecuteBeforeSeconds"
+        | "merchantPolicy"
+        | "merchantAllowlist"
+        | "tokenRegistries"
+        | "registryTrustedParties"
+      >
     | undefined;
   facilitatorParty: string;
   /** CAIP-2 network identifier this facilitator is configured for.
@@ -74,16 +93,26 @@ export interface ValidationServices {
 export type ValidationOutcome =
   | {
       ok: true;
-      method: "transfer-factory";
+      /** INLINE carriage — the only one. Settle relays bytes the PAYLOAD
+       *  carried, not a row the facilitator stored, so there is nothing to mark
+       *  settled and the ledger's own rejection of a respend is the replay
+       *  guard. */
+      method: "transfer-factory-inline";
       payer: string;
-      /** The MERCHANT (paymentRequirements.payTo) — provably == the relay-
-       *  recorded transfer receiver (validateTransferFactoryPath pins
-       *  stash.receiver == payTo). */
       merchant: string;
-      /** The verified relay stash row — /settle reads its prepared tx +
-       *  signature bundle to relay, and its executeBefore/amount for the settle
-       *  gate. */
-      stash: TfStashRecord;
+      /** Instrument admin of the transfer (pinned by verification). Threads the
+       *  registry-utility funds-moved rule into settle's execute. */
+      instrumentAdmin: string;
+      /** Base64 prepared transaction, exactly as decoded — relayed verbatim. */
+      preparedTransaction: string;
+      signatureB64: string;
+      hashingSchemeVersion: "HASHING_SCHEME_VERSION_V1" | "HASHING_SCHEME_VERSION_V2";
+      /** The RECOMPUTED transaction hash, proven against the bytes during
+       *  verification. /settle keys its idempotency record on this — never on
+       *  the client's claimed hash, which is accepted in two spellings and so
+       *  could be re-spelled into a second bucket for the same payment. */
+      preparedTxHashHex?: string;
+      publishedProtocolKeys?: number;
     }
   | { ok: false; reason: CantonErrorCode; payer: string };
 
@@ -100,10 +129,10 @@ export async function runValidation(
   const { paymentPayload, paymentRequirements } = body;
   const payload = paymentPayload.payload;
   const extra = paymentRequirements.extra;
-  // No trusted payer exists before the stash row is loaded: the wire payload
-  // carries no `payer` claim anymore, so these method-agnostic early-guard
+  // No trusted payer exists before the inline payload is decoded: the wire
+  // payload carries no `payer` claim, so these method-agnostic early-guard
   // outcomes (network / discriminator / exhaustiveness) echo an empty payer.
-  // The PROVEN payer is only known per-method, from the relay stash row.
+  // The PROVEN payer is only known after the inline transfer is verified.
   const payer = "";
 
   // Network guard: reject payments claiming a different network.
@@ -129,6 +158,33 @@ export async function runValidation(
 
   let outcome: ValidationOutcome | null = null;
   if (payload.assetTransferMethod === "transfer-factory") {
+    // THE LEGACY CARRIAGE IS A VERDICT, NOT A BAD REQUEST.
+    //
+    // A payload carrying `submissionRef` comes from a client that worked
+    // yesterday; the body is well-formed and we simply no longer settle that
+    // shape. Answering 400 would be saying "you sent nonsense", and the shipped
+    // middlewares turn a non-2xx into a generic facilitator failure — so the one
+    // party who needs to hear "upgrade your client" is the one least likely to.
+    // A discriminated reason travels the channel integrators already read.
+    if ((payload as { submissionRef?: unknown }).submissionRef !== undefined) {
+      // The spec already names this. Rule 2 of specs/scheme_exact_canton.md:
+      // "The payload MUST carry preparedTransaction, preparedTxHash and
+      // signature. If absent, reject with invalid_exact_canton_missing_proof."
+      // A submissionRef payload lacks exactly those three, so it IS that case —
+      // and packages/core/src/inline-payload.ts already answers other payloads
+      // missing the signed submission with the same code.
+      //
+      // A second code for one condition would be the divergence this codebase
+      // keeps paying for: integrators read the spec's error table, and a reason
+      // that appears only in our source is one they cannot look up. The "upgrade
+      // your client" detail belongs in the docs and the spec text, not in a
+      // parallel enum entry.
+      return {
+        ok: false,
+        reason: "invalid_exact_canton_missing_proof",
+        payer,
+      };
+    }
     outcome = await validateTransferFactoryPath(body, svc, nowMs);
   }
 
@@ -140,7 +196,7 @@ export async function runValidation(
   // runtime the body validator already rejected unknown
   // assetTransferMethod values with 400, so this branch is only
   // reachable if validate-body.ts gets a new variant added without
-  // updating runValidation. No stash row was resolved, so the discriminated
+  // updating runValidation. No payer was proven, so the discriminated
   // error echoes an empty payer.
   return {
     ok: false,
@@ -150,20 +206,18 @@ export async function runValidation(
 }
 
 /**
- * transfer-factory ("V3") verify arm. The client's payload carries only a
- * relay-stash `submissionRef` (the signed prepared tx is 100s of KB and lives on
- * the relay). We load the stash row the RELAY built and recorded at prepare time
- * and compare its recorded transfer fields against the server's
- * PaymentRequirements. No protobuf decode: the relay built the tx, so its
- * recorded fields are the trust anchor; the PAYER's own protection is the
- * client-side verify-before-sign over the returned preparedTransaction.
+ * transfer-factory ("V3") verify arm. The client's payload carries the
+ * payer-signed prepared transaction INLINE, so any facilitator can relay it —
+ * there is no relay-side stash reference (the legacy `submissionRef` carriage
+ * was removed). This routes straight to the inline validator, which decodes and
+ * structurally verifies the signed bytes against the server's PaymentRequirements.
  *
  * Rejections (all fail-closed):
- *   - TF disabled / deps unwired → transfer_factory_disabled.
- *   - ref unknown / uncommitted (unsigned) / expired
- *     (executeBefore ≤ now) / preparedTxHash mismatch → submission_not_found.
- *   - amount / receiver / instrument mismatch vs requirements → the matching
- *     discriminated reason.
+ *   - TF disabled (master switch off) → transfer_factory_disabled.
+ *   - a payload that is not the inline carriage (body validation already rejects
+ *     it) → malformed_payload.
+ *   - inline structural / signature / amount / receiver / instrument mismatch →
+ *     the matching discriminated reason from validateInlineTransferPath.
  */
 async function validateTransferFactoryPath(
   body: FacilitatorRequest,
@@ -171,113 +225,82 @@ async function validateTransferFactoryPath(
   nowMs: number
 ): Promise<ValidationOutcome> {
   const { paymentPayload, paymentRequirements } = body;
-  const payload = paymentPayload.payload as {
-    submissionRef?: string;
-    preparedTxHash?: string;
-  };
 
-  if (!svc.tf || !svc.tf.tfEnabled) {
-    // No stash row is loaded yet, so there is no proven payer to echo.
+  // MASTER SWITCH FIRST, then carriage. See ValidationServices.tfEnabled.
+  if (svc.tfEnabled === false) {
     return {
       ok: false,
       reason: "invalid_exact_canton_transfer_factory_disabled",
       payer: "",
     };
   }
-  const submissionRef = payload.submissionRef ?? "";
-  const row = submissionRef ? await svc.tf.stash.get(submissionRef) : null;
-  // Unknown, uncommitted (unsigned), expired, or hash-mismatch all read as
-  // submission_not_found (no ref/state enumeration oracle). No payer-match
-  // conjunct: the ref is an unguessable stash reference, `signature` must be
-  // present, and `preparedTxHash` binds the exact bytes — matching a
-  // client-claimed payer added no authentication (and there is no wire payer
-  // to match anymore).
-  if (
-    !row ||
-    row.signature === undefined ||
-    new Date(row.executeBefore).getTime() <= nowMs ||
-    (payload.preparedTxHash !== undefined &&
-      payload.preparedTxHash !== row.txHash)
-  ) {
-    // No row (or an unusable one) → no proven payer to echo.
-    return {
-      ok: false,
-      reason: "invalid_exact_canton_submission_not_found",
-      payer: "",
-    };
-  }
 
-  // Receiver must be the merchant (paymentRequirements.payTo).
-  if (row.receiver !== paymentRequirements.payTo) {
-    return {
-      ok: false,
-      reason: "invalid_exact_canton_merchant_mismatch",
-      payer: row.payer,
-    };
-  }
-  // Amount: the recorded row.amount is a ledger Daml Decimal; the wire
-  // requirement is atomic under scheme "exact". Normalize both to the ledger
-  // Decimal and compare by atomic units (folds "0.1" ≡ "0.1000000000"). A
-  // malformed amount on either side fails closed.
-  let amountEq = false;
-  try {
-    amountEq = ledgerDecimalEquals(
-      row.amount,
-      wireAmountToLedgerDecimal(
-        paymentRequirements.scheme,
-        paymentRequirements.amount
-      )
-    );
-  } catch {
-    amountEq = false;
-  }
-  if (!amountEq) {
-    return {
-      ok: false,
-      reason: "invalid_exact_canton_amount_mismatch",
-      payer: row.payer,
-    };
-  }
-  // Instrument: if the requirement pins an instrumentId, the recorded row must
-  // match its admin (+id). (assetMatches at the middleware already pinned the
-  // symbol; this pins the on-ledger admin/id the transfer was built for.)
-  const reqInstr = (
-    paymentRequirements.extra as {
-      instrumentId?: { admin?: string; id?: string };
+  // Inline is the ONLY carriage. Body validation already guaranteed the payload
+  // is the inline form; a non-inline payload falls through to malformed_payload.
+  if (isInlineCarriage(paymentPayload.payload)) {
+    const r = await validateInlineTransferPath(body, {
+      facilitatorParty: svc.facilitatorParty,
+      // The SAME clock the caller passed. Reading the wall clock here instead
+      // is the defect that made a 2026 fixture look expired — one field over,
+      // same shape, and nothing tested the seam.
+      nowMs,
+      ...(svc.inline?.verifySignature
+        ? { verifySignature: svc.inline.verifySignature }
+        : {}),
+      ...(svc.inline?.fetchPreapproval
+        ? { fetchPreapproval: svc.inline.fetchPreapproval }
+        : {}),
+      ...(svc.inline?.fetchOwnedHoldingAmounts
+        ? { fetchOwnedHoldingAmounts: svc.inline.fetchOwnedHoldingAmounts }
+        : {}),
+      ...(svc.inline?.merchantPolicy
+        ? { merchantPolicy: svc.inline.merchantPolicy }
+        : {}),
+      ...(svc.inline?.maxExecuteBeforeSeconds !== undefined
+        ? { maxExecuteBeforeSeconds: svc.inline.maxExecuteBeforeSeconds }
+        : {}),
+      ...(svc.inline?.merchantAllowlist
+        ? { merchantAllowlist: svc.inline.merchantAllowlist }
+        : {}),
+      ...(svc.inline?.tokenRegistries
+        ? { tokenRegistries: svc.inline.tokenRegistries }
+        : {}),
+      ...(svc.inline?.registryTrustedParties
+        ? { registryTrustedParties: svc.inline.registryTrustedParties }
+        : {}),
+    });
+    if (!r.ok) {
+      return {
+        ok: false,
+        reason: r.reason ?? "invalid_exact_canton_malformed_payload",
+        payer: r.payer,
+      };
     }
-  ).instrumentId;
-  if (
-    reqInstr &&
-    (reqInstr.admin !== row.instrumentAdmin || reqInstr.id !== row.instrumentId)
-  ) {
     return {
-      ok: false,
-      reason: "invalid_exact_canton_asset_mismatch",
-      payer: row.payer,
+      ok: true,
+      method: "transfer-factory-inline",
+      payer: r.payer,
+      // Provably the merchant: the structural match pinned the transfer's
+      // receiver to paymentRequirements.payTo before this point.
+      merchant: paymentRequirements.payTo,
+      instrumentAdmin: paymentRequirements.extra?.instrumentId?.admin ?? "",
+      preparedTransaction: (r.preparedTransactionBytes ?? Buffer.alloc(0)).toString("base64"),
+      signatureB64: r.signatureB64 ?? "",
+      hashingSchemeVersion: r.hashingSchemeVersion ?? "HASHING_SCHEME_VERSION_V2",
+      ...(r.publishedProtocolKeys !== undefined
+        ? { publishedProtocolKeys: r.publishedProtocolKeys }
+        : {}),
+      ...(r.preparedTxHashHex !== undefined
+        ? { preparedTxHashHex: r.preparedTxHashHex }
+        : {}),
     };
   }
 
-  // Merchant memo binding: when the merchant REQUIRES a memo (extra.memo is a
-  // non-empty string) the relay-recorded transfer MUST carry exactly that value
-  // as `x402.memo` (row.memo, stamped at pay/prepare). Fail-CLOSED — a stash row
-  // WITHOUT a memo while the merchant requires one is a mismatch (an old / non-
-  // compliant client that dropped it). When the merchant sets no memo there is no
-  // check (a payer-supplied memo the merchant did not require is fine). Cast
-  // mirrors the reqInstr read just above.
-  const wantMemo = (paymentRequirements.extra as { memo?: string }).memo;
-  if (typeof wantMemo === "string" && wantMemo.length > 0 && row.memo !== wantMemo) {
-    return {
-      ok: false,
-      reason: "invalid_exact_canton_memo_mismatch",
-      payer: row.payer,
-    };
-  }
-
+  // Not the inline carriage — body validation should have rejected it already,
+  // so reaching here means a malformed payload.
   return {
-    ok: true,
-    method: "transfer-factory",
-    payer: row.payer,
-    merchant: paymentRequirements.payTo,
-    stash: row,
+    ok: false,
+    reason: "invalid_exact_canton_malformed_payload",
+    payer: "",
   };
 }

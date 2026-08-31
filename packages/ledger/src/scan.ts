@@ -65,6 +65,14 @@ export interface ScanCacheOptions {
    */
   amuletRulesTtlMs?: number;
   /**
+   * TTL for the per-merchant `getTransferPreapprovalByParty` read (default
+   * 15 s, `0` disables). Short on purpose: unlike the DSO-state reads, this
+   * record carries an `expiresAt` that callers refuse payments on, so it is
+   * cached only long enough to collapse a burst of payments to one merchant
+   * into a single Scan round-trip.
+   */
+  preapprovalTtlMs?: number;
+  /**
    * Open+issuing mining rounds TTL in ms. Rounds rotate on the order of
    * tens of minutes; a short TTL keeps the disclosed round fresh while still
    * coalescing the bursts of settles within a round. Default 30 s. `0`
@@ -153,6 +161,21 @@ export interface TrafficSummaryResult {
   totalTrafficCost: number | null;
 }
 
+/** A merchant's on-ledger `Splice.AmuletRules:TransferPreapproval`, as Scan
+ *  reports it. Daml field names (NOT snake_case) — they come straight from the
+ *  contract payload. `expiresAt` is the whole point: it is the only signal that
+ *  separates a preapproval that still settles from one that fails at
+ *  interpretation, and it is absent from the transfer-kind resolve. */
+export interface TransferPreapprovalRecord {
+  contractId: string;
+  dso: string;
+  receiver: string;
+  provider: string;
+  expiresAt: string;
+  validFrom?: string;
+  lastRenewedAt?: string;
+}
+
 /** Daml `InstrumentId` as it appears inside a Scan v2 update's exercised
  *  `TransferFactory_Transfer` choice argument. */
 export interface ScanInstrumentId {
@@ -209,6 +232,9 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 
 const DEFAULT_AMULET_RULES_TTL_MS = 5 * 60_000; // 5 minutes
 const DEFAULT_MINING_ROUNDS_TTL_MS = 30_000; // 30 seconds
+const DEFAULT_PREAPPROVAL_TTL_MS = 15_000; // 15 seconds
+/** Distinct merchants held at once; see KeyedTtlSingleFlightCache on why. */
+const PREAPPROVAL_CACHE_MAX_KEYS = 512;
 
 /**
  * A single-slot TTL cache with single-flight refresh.
@@ -274,10 +300,65 @@ export class TtlSingleFlightCache<T> {
 }
 
 /**
+ * The same cache, keyed — one slot per key, with a hard cap on how many keys it
+ * will hold.
+ *
+ * The cap is not tidiness. The key here is a merchant party that arrives in a
+ * request body, so an unbounded map is a memory sink anyone can fill by
+ * quoting a fresh party per call. When the cap is reached the expired slots go
+ * first, and if every slot is still live the whole map is dropped: a cache is
+ * an optimisation, and forgetting is always correct.
+ */
+export class KeyedTtlSingleFlightCache<T> {
+  private readonly slots = new Map<string, TtlSingleFlightCache<T>>();
+  private readonly stamps = new Map<string, number>();
+
+  constructor(
+    private readonly ttlMs: number,
+    private readonly maxKeys: number,
+    private readonly now: () => number = Date.now
+  ) {}
+
+  async get(key: string, loader: () => Promise<T>): Promise<T> {
+    let slot = this.slots.get(key);
+    if (!slot) {
+      this.evictIfFull();
+      slot = new TtlSingleFlightCache<T>(this.ttlMs, this.now);
+      this.slots.set(key, slot);
+    }
+    this.stamps.set(key, this.now());
+    return slot.get(loader);
+  }
+
+  /** Drop one key's slot (next get() for it refetches). */
+  invalidate(key: string): void {
+    this.slots.delete(key);
+    this.stamps.delete(key);
+  }
+
+  /** Live key count. For tests and ops. */
+  size(): number {
+    return this.slots.size;
+  }
+
+  private evictIfFull(): void {
+    if (this.slots.size < this.maxKeys) return;
+    const cutoff = this.now() - this.ttlMs;
+    for (const [k, stamp] of this.stamps) {
+      if (stamp <= cutoff) this.invalidate(k);
+    }
+    if (this.slots.size >= this.maxKeys) {
+      this.slots.clear();
+      this.stamps.clear();
+    }
+  }
+}
+
+/**
  * Is this Scan error TRANSIENT — worth a backoff-retry / failover rather than a
  * hard failure? Covers the per-IP 429 burst budget, server-side overload/5xx
  * (502/503/504 — the SV Scan's `local_*` shedding that surfaced as relay 502s),
- * and our own timeout/transport faults. A 4xx other than 429 (e.g. 404 from
+ * and our own timeout/transport faults (500 included: see below). A 4xx other than 429 (e.g. 404 from
  * getUpdateById in the first-payment dead-zone, or a 400) is a real, stable
  * answer and is NOT transient. Exported for unit testing.
  */
@@ -286,6 +367,14 @@ export function isTransientScanError(err: unknown): boolean {
   if (err.code === "TIMEOUT" || err.code === "TRANSPORT_ERROR") return true;
   return (
     err.status === 429 ||
+    // 500 belongs here with the rest. The list was written from what the SV
+    // Scan was observed shedding (502/503/504) and a bare 500 was simply never
+    // seen, not reasoned about — but every read through this client is an
+    // idempotent registry/DSO-state GET, so an internal server error is worth
+    // the same one bounded retry and the same failover to another SV. Treating
+    // it as a stable answer is the expensive reading: it turns one bad response
+    // into a hard failure on a money path.
+    err.status === 500 ||
     err.status === 502 ||
     err.status === 503 ||
     err.status === 504
@@ -308,6 +397,9 @@ export class ScanClient {
    *  per design). */
   private readonly amuletRulesCache: TtlSingleFlightCache<AmuletRulesResponse>;
   private readonly miningRoundsCache: TtlSingleFlightCache<MiningRoundsResponse>;
+  /** Per-merchant preapproval reads. Keyed: the DSO-state caches answer one
+   *  global question, this one answers a different question per party. */
+  private readonly preapprovalCache: KeyedTtlSingleFlightCache<TransferPreapprovalRecord | null>;
 
   constructor(opts: ScanClientOptions) {
     this.fetchFn = opts.fetch ?? globalThis.fetch;
@@ -329,6 +421,10 @@ export class ScanClient {
     );
     this.miningRoundsCache = new TtlSingleFlightCache<MiningRoundsResponse>(
       roundsTtl
+    );
+    this.preapprovalCache = new KeyedTtlSingleFlightCache(
+      opts.cache?.preapprovalTtlMs ?? DEFAULT_PREAPPROVAL_TTL_MS,
+      PREAPPROVAL_CACHE_MAX_KEYS
     );
   }
 
@@ -532,9 +628,19 @@ export class ScanClient {
    *   - `offer`  → no preapproval → two-step Pending; x402 cannot settle in
    *     one round-trip.
    *   - `self`   → sender == receiver.
-   * SV flavor ONLY (the registry root path; the validator scan-proxy equivalent
-   * is unconfirmed) — throws `UNSUPPORTED` otherwise so callers degrade to
-   * "unknown".
+   * Amulet (SV Scan) is the default: the registry root path
+   * `/registry/transfer-instruction/v1/transfer-factory` on the SV Scan, SV
+   * flavor ONLY — throws `UNSUPPORTED` on a validator flavor so callers degrade
+   * to "unknown".
+   *
+   * For a non-Amulet CIP-56 token whose registry is a DA Registry Utility, pass
+   * `registryBaseUrl`: the probe is then POSTed to that base under the
+   * per-registrar path
+   * `/api/token-standard/v0/registrars/<admin>/registry/transfer-instruction/v1/transfer-factory`,
+   * flavor-independent (the SV `isSv` gate does not apply — the utility is a
+   * separate registry, not the SV Scan). USDCx and other Registry-Utility
+   * tokens return `direct` here exactly when the receiver has created a
+   * `Utility.Registry.App.V0.Model.TransferPreapproval`.
    */
   async resolveTransferKind(args: {
     sender: string;
@@ -544,13 +650,10 @@ export class ScanClient {
     id: string;
     requestedAt: string;
     executeBefore: string;
+    /** DA Registry Utility base URL for a non-Amulet token. Omit for Amulet
+     *  (routes to the SV Scan registry root). */
+    registryBaseUrl?: string;
   }): Promise<string> {
-    if (!this.isSv) {
-      throw new CantonError(
-        "resolveTransferKind is only supported for the sv Scan flavor",
-        "UNSUPPORTED"
-      );
-    }
     const reqBody = {
       choiceArguments: {
         expectedAdmin: args.admin,
@@ -568,6 +671,24 @@ export class ScanClient {
       },
       excludeDebugFields: true,
     };
+    if (args.registryBaseUrl) {
+      const path = `/api/token-standard/v0/registrars/${encodeURIComponent(
+        args.admin
+      )}/registry/transfer-instruction/v1/transfer-factory`;
+      const res = await this.requestBases<{ transferKind?: string }>(
+        "POST",
+        path,
+        reqBody,
+        [args.registryBaseUrl]
+      );
+      return res.transferKind ?? "";
+    }
+    if (!this.isSv) {
+      throw new CantonError(
+        "resolveTransferKind is only supported for the sv Scan flavor (or pass registryBaseUrl for a Registry-Utility token)",
+        "UNSUPPORTED"
+      );
+    }
     const res = await this.request<{ transferKind?: string }>(
       "POST",
       "/registry/transfer-instruction/v1/transfer-factory",
@@ -617,6 +738,197 @@ export class ScanClient {
     return data.featured_app_right.contract_id;
   }
 
+  /**
+   * Read a merchant's `TransferPreapproval` contract, or `null` when the party
+   * has none. GET /api/scan/v0/transfer-preapprovals/by-party/{party}.
+   *
+   * This is the ONLY way we can see a merchant's preapproval: the contract is
+   * hosted on the MERCHANT's validator, not ours, so the participant ACS is not
+   * readable to us — Scan is a network-wide public read and is.
+   *
+   * Needed because `resolveTransferKind` answers "how would a transfer route",
+   * which stays `direct` for an EXPIRED preapproval. Routing on that alone
+   * sends every payment down the one-step path where it dies at interpretation
+   * (`deadline-exceeded` on `TransferPreapproval.expiresAt`) instead of
+   * degrading to the two-step Pending path that would still work. `expiresAt`
+   * is what distinguishes the two, and only this endpoint carries it.
+   */
+  async getTransferPreapprovalByParty(
+    party: string
+  ): Promise<TransferPreapprovalRecord | null> {
+    const rec = await this.preapprovalCache.get(party, () =>
+      this.getTransferPreapprovalByPartyUncached(party)
+    );
+    // Never SERVE a cached record that has already expired. Expiry is the one
+    // field callers act on destructively — the /settle gate refuses a payment
+    // on it — so a merchant who renewed a second ago must not keep reading as
+    // expired for the rest of the TTL. Re-read once instead. A merchant who is
+    // genuinely expired pays one extra Scan read per call, which is the right
+    // side to be wrong on: they are already failing, and concurrent callers
+    // still collapse onto one in-flight read.
+    if (rec && Date.parse(rec.expiresAt) <= Date.now()) {
+      this.preapprovalCache.invalidate(party);
+      return this.preapprovalCache.get(party, () =>
+        this.getTransferPreapprovalByPartyUncached(party)
+      );
+    }
+    return rec;
+  }
+
+  private async getTransferPreapprovalByPartyUncached(
+    party: string
+  ): Promise<TransferPreapprovalRecord | null> {
+    const data = await this.get<{
+      transfer_preapproval?: {
+        contract?: {
+          contract_id?: string;
+          payload?: {
+            dso?: string;
+            receiver?: string;
+            provider?: string;
+            validFrom?: string;
+            lastRenewedAt?: string;
+            expiresAt?: string;
+          };
+        };
+      } | null;
+    }>(`${this.prefix}/transfer-preapprovals/by-party/${encodeURIComponent(party)}`);
+    const contract = data.transfer_preapproval?.contract;
+    const payload = contract?.payload;
+    // Treat a payload without `expiresAt` as "cannot determine" rather than
+    // "live forever": callers must fail closed, never assume validity.
+    if (!contract?.contract_id || !payload?.expiresAt) return null;
+    return {
+      contractId: contract.contract_id,
+      dso: payload.dso ?? "",
+      receiver: payload.receiver ?? "",
+      provider: payload.provider ?? "",
+      expiresAt: payload.expiresAt,
+      ...(payload.validFrom !== undefined ? { validFrom: payload.validFrom } : {}),
+      ...(payload.lastRenewedAt !== undefined
+        ? { lastRenewedAt: payload.lastRenewedAt }
+        : {}),
+    };
+  }
+
+  /**
+   * Every Amulet a party owns, as contract-id -> ledger-Decimal amount, read
+   * from the PUBLIC SV Scan ACS snapshot.
+   *
+   * WHY SCAN AND NOT THE PARTICIPANT: the amount is needed to decide whether a
+   * payer's declared input holdings actually cover a payment, and we do not
+   * necessarily host the payer — a facilitator that could only check payers it
+   * hosts would defeat the point of relaying for anyone. Scan's snapshot is
+   * public and party-scoped, so it answers for any party on the network.
+   *
+   * LockedAmulet is EXCLUDED: locked coin is not spendable as a transfer input,
+   * and counting it would let a transfer look funded by coin it cannot touch.
+   * The owner is re-checked per event rather than trusted from the query, so a
+   * response that returned somebody else's holdings cannot inflate the total.
+   *
+   * A holding MISSING from this map is not a zero — it is unknown-or-spent, and
+   * the caller must treat it as a refusal rather than as no contribution.
+   */
+  async getOwnedAmuletAmounts(party: string): Promise<Map<string, string>> {
+    const { migrationId, recordTime } = await this.latestAcsSnapshot();
+    const out = new Map<string, string>();
+    let after: unknown;
+    // Bounded: a party with more pages than this is far outside anything the
+    // payment path should be reasoning about, and an unbounded loop here would
+    // hand a slow Scan an open-ended request budget.
+    for (let page = 0; page < 20; page++) {
+      const body: Record<string, unknown> = {
+        migration_id: migrationId,
+        record_time: recordTime,
+        owner_party_ids: [party],
+        page_size: 500,
+      };
+      if (after !== undefined) body["after"] = after;
+      const res = await this.request<{
+        created_events?: Array<{
+          contract_id?: string;
+          template_id?: string;
+          create_arguments?: {
+            owner?: string;
+            amount?: { initialAmount?: string };
+          };
+        }>;
+        next_page_token?: unknown;
+      }>("POST", "/api/scan/v0/holdings/state", body);
+
+      for (const e of res.created_events ?? []) {
+        const cid = e.contract_id;
+        const amount = e.create_arguments?.amount?.initialAmount;
+        if (
+          typeof cid !== "string" ||
+          typeof amount !== "string" ||
+          !e.template_id?.endsWith(":Splice.Amulet:Amulet") ||
+          e.create_arguments?.owner !== party
+        ) {
+          continue;
+        }
+        out.set(cid, amount);
+      }
+      if (res.next_page_token === undefined || res.next_page_token === null) break;
+      after = res.next_page_token;
+    }
+    return out;
+  }
+
+  /**
+   * The live migration id and its snapshot record_time.
+   *
+   * Probes migration ids and keeps the one with the LATEST record_time rather
+   * than the first that answers: after a migration both ids can still respond,
+   * and taking the first would read a frozen pre-migration snapshot — stale
+   * holdings, which here means a wrong funding verdict.
+   */
+  private acsSnapshotCache?: {
+    at: number;
+    migrationId: number;
+    recordTime: string;
+  };
+
+  private async latestAcsSnapshot(): Promise<{
+    migrationId: number;
+    recordTime: string;
+  }> {
+    // Cached: discovery costs one request per probed id, and without this every
+    // payment would spend nine of them before asking the question it came for.
+    // The live migration changes on the order of months, so a few minutes of
+    // staleness in the SNAPSHOT POINTER is harmless — the holdings themselves
+    // are read fresh against it on every call.
+    const TTL_MS = 5 * 60_000;
+    const now = Date.now();
+    if (this.acsSnapshotCache && now - this.acsSnapshotCache.at < TTL_MS) {
+      return {
+        migrationId: this.acsSnapshotCache.migrationId,
+        recordTime: this.acsSnapshotCache.recordTime,
+      };
+    }
+    const before = new Date().toISOString();
+    let best: { migrationId: number; recordTime: string } | null = null;
+    for (let id = 0; id <= 8; id++) {
+      try {
+        const r = await this.get<{ record_time?: string }>(
+          `/api/scan/v0/state/acs/snapshot-timestamp?before=${encodeURIComponent(
+            before
+          )}&migration_id=${id}`
+        );
+        if (typeof r.record_time !== "string") continue;
+        if (!best || r.record_time > best.recordTime) {
+          best = { migrationId: id, recordTime: r.record_time };
+        }
+      } catch {
+        // A migration id that does not exist answers 404. Not an error — just
+        // not this one.
+      }
+    }
+    if (!best) throw new Error("scan: no ACS snapshot available");
+    this.acsSnapshotCache = { at: now, ...best };
+    return best;
+  }
+
   private get<T>(path: string): Promise<T> {
     return this.request<T>("GET", path);
   }
@@ -633,10 +945,28 @@ export class ScanClient {
    * batch tripped the budget, the 429s were swallowed upstream, and rows hit
    * their attempt cap as permanently 'failed' while the data was available.)
    */
-  private async request<T>(
+  private request<T>(
     method: "GET" | "POST",
     path: string,
     body?: unknown
+  ): Promise<T> {
+    return this.requestBases<T>(method, path, body, [
+      this.scanUrl,
+      ...this.fallbackUrls,
+    ]);
+  }
+
+  /**
+   * Same transient-retry-then-failover loop as {@link request}, but against an
+   * explicit list of base URLs. Lets a caller target a registry that is NOT the
+   * SV Scan — e.g. a DA Registry Utility base for a non-Amulet CIP-56 token —
+   * while reusing the identical idempotent-read retry semantics.
+   */
+  private async requestBases<T>(
+    method: "GET" | "POST",
+    path: string,
+    body: unknown,
+    bases: string[]
   ): Promise<T> {
     const MAX_TRANSIENT_RETRIES = 3;
     // Try the primary base, then each fallback in order. A TRANSIENT failure
@@ -647,7 +977,6 @@ export class ScanClient {
     // getUpdateById 404 is meaningful — the first-payment counter dead-zone
     // relies on it). Every Scan call here is an idempotent READ, so both the
     // retry and the failover are safe.
-    const bases = [this.scanUrl, ...this.fallbackUrls];
     let lastErr: unknown;
     for (const base of bases) {
       for (let attempt = 0; ; attempt++) {
@@ -699,7 +1028,13 @@ export class ScanClient {
       if (method === "POST") {
         headers["Content-Type"] = "application/json";
       }
-      if (this.token) {
+      // Attach the participant's Scan bearer ONLY to an SV base (scanUrl or a
+      // configured fallback). A non-Amulet token's registry base (passed via
+      // requestBases for resolveTransferKind) is a DIFFERENT origin — sending
+      // the Scan credential there would leak it cross-origin.
+      const isSvBase =
+        base === this.scanUrl || this.fallbackUrls.includes(base);
+      if (this.token && isSvBase) {
         const tok =
           typeof this.token === "string" ? this.token : await this.token();
         headers.Authorization = `Bearer ${tok}`;

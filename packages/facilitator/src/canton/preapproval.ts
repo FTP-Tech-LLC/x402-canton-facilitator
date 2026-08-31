@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { SubmissionOutcomeUnknownError } from "./transfer-factory.js";
 import type {
   CantonClient,
   DisclosedContract,
   ScanClient,
 } from "@ftptech/x402-canton-ledger";
 import { selectActiveOpenRound } from "../routes/settle.js";
+import { isInputContentionError } from "./ledger-errors.js";
 
 const PREAPPROVAL_CHOICE = "AmuletRules_CreateTransferPreapproval";
 
@@ -18,7 +20,13 @@ export interface PreapprovalServiceDeps {
     | "getLedgerEnd"
     | "pollCompletionUpdateId"
   >;
-  scan: Pick<ScanClient, "getAmuletRules" | "getOpenAndIssuingMiningRounds">;
+  scan: Pick<
+    ScanClient,
+    | "getAmuletRules"
+    | "getOpenAndIssuingMiningRounds"
+    | "getAmuletRulesFresh"
+    | "getOpenAndIssuingMiningRoundsFresh"
+  >;
   facilitatorParty: string;
   userId: string;
 }
@@ -66,15 +74,48 @@ export interface CreatePreapprovalResult {
 export class PreapprovalService {
   constructor(private readonly deps: PreapprovalServiceDeps) {}
 
+  /**
+   * The DSO state this choice DISCLOSES to the ledger: AmuletRules and the
+   * mining rounds. Both are read through a TTL cache, so within one TTL of a
+   * round rotation the cached cid names a contract the ledger has already
+   * archived and the submit is refused. `fresh` is the documented escape:
+   * invalidate, refetch, repopulate.
+   */
+  private async dsoState(fresh: boolean) {
+    const { scan } = this.deps;
+    return Promise.all([
+      fresh ? scan.getAmuletRulesFresh() : scan.getAmuletRules(),
+      fresh
+        ? scan.getOpenAndIssuingMiningRoundsFresh()
+        : scan.getOpenAndIssuingMiningRounds(),
+    ]);
+  }
+
   async createTransferPreapproval(
     input: CreatePreapprovalInput
   ): Promise<CreatePreapprovalResult> {
-    const { facilitatorParty, userId, scan, client } = this.deps;
+    try {
+      return await this.attemptCreate(input, false);
+    } catch (err) {
+      // Retry ONLY on the refusal we can prove created nothing: the ledger
+      // rejecting the submission because a disclosed contract is already
+      // archived — which here means our cached round or AmuletRules cid, not
+      // anything about the merchant. A rejection is a definite verdict, so the
+      // retry cannot double-create. Anything ambiguous (a timeout, a transport
+      // error) is rethrown untouched: re-submitting a preapproval that may
+      // already exist is not something to guess at.
+      if (!isInputContentionError(err)) throw err;
+      return await this.attemptCreate(input, true);
+    }
+  }
 
-    const [amulet, rounds] = await Promise.all([
-      scan.getAmuletRules(),
-      scan.getOpenAndIssuingMiningRounds(),
-    ]);
+  private async attemptCreate(
+    input: CreatePreapprovalInput,
+    fresh: boolean
+  ): Promise<CreatePreapprovalResult> {
+    const { facilitatorParty, userId, client } = this.deps;
+
+    const [amulet, rounds] = await this.dsoState(fresh);
 
     const openRound = selectActiveOpenRound(
       rounds.open_mining_rounds,
@@ -197,11 +238,12 @@ export class PreapprovalService {
     txHash: string;
     synchronizerId: string;
   }> {
-    const { scan, client, userId } = this.deps;
-    const [amulet, rounds] = await Promise.all([
-      scan.getAmuletRules(),
-      scan.getOpenAndIssuingMiningRounds(),
-    ]);
+    const { client, userId } = this.deps;
+    // No retry arm here on purpose: this method only PREPARES: the merchant
+    // signs and executes it themselves, so a stale disclosed round surfaces at
+    // their execute, not ours, and re-reading after the fact would not help
+    // them. They re-run the prepare, which by then reads a refreshed cache.
+    const [amulet, rounds] = await this.dsoState(false);
     const openRound = selectActiveOpenRound(
       rounds.open_mining_rounds,
       Date.now()
@@ -323,14 +365,35 @@ export class PreapprovalService {
       // Required by /v2/interactive-submission/execute; no dedup for a one-shot.
       deduplicationPeriod: { Empty: {} },
     });
+    // THE EXECUTE POST HAS RETURNED 200 — the submission is accepted and will
+    // be sequenced. What follows only READS that outcome.
+    //
+    // Third copy of the same rule (see canton/transfer-factory.ts execute() and
+    // the relay /v1/wallet/submit/execute route). pollCompletionUpdateId gives
+    // up with INVALID_RESPONSE on ANY failure of the completion read, and that
+    // escaped here as a plain throw, which the route turns into a 502: a
+    // definite "your preapproval failed" for a TransferPreapproval that then
+    // commits. The merchant runs the flow again and pays a second creation fee
+    // for a preapproval they already have.
+    //
+    // SUBMISSION_FAILED keeps its meaning in all three copies: the completion
+    // ARRIVED with a non-zero status, so the participant refused it and nothing
+    // moved.
     let updateId = r.updateId;
     if (!updateId) {
-      updateId = await client.pollCompletionUpdateId(
-        userId,
-        input.party,
-        submissionId,
-        offset0
-      );
+      try {
+        updateId = await client.pollCompletionUpdateId(
+          userId,
+          input.party,
+          submissionId,
+          offset0
+        );
+      } catch (err) {
+        if ((err as { code?: unknown } | null)?.code === "SUBMISSION_FAILED") {
+          throw err;
+        }
+        throw new SubmissionOutcomeUnknownError(err);
+      }
     }
     return { updateId };
   }

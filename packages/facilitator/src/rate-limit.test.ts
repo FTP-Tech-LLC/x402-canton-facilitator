@@ -3,6 +3,7 @@ import {
   createSlidingWindowLimiter,
   createCircuitBreaker,
   isTrafficError,
+  isSubmissionAlreadyInFlight,
 } from "./rate-limit.js";
 
 describe("createSlidingWindowLimiter", () => {
@@ -356,3 +357,159 @@ describe("isTrafficError", () => {
     expect(isTrafficError(null)).toBe(false);
   });
 });
+
+describe("isSubmissionAlreadyInFlight", () => {
+  /** The verbatim participant response, captured from a live MainNet run that
+   *  fired two identical /settle calls at the same instant. Written from the
+   *  observed body rather than from the shape one would expect. */
+  const REAL_409 = {
+    responseBody: JSON.stringify({
+      code: "SUBMISSION_ALREADY_IN_FLIGHT",
+      cause: "The submission is already in-flight",
+      context: {
+        participant: "participant",
+        changeId: "ChangeId(A3hmvC3DzW3IfAG94G5l1nxvRkL5mWF3@clients,tfpay-31d85774,Set(agent::1220315489))",
+        existingSubmissionId: "Some(x402-inline-tx:394eac047e8fb959f992971a226a7bf2)",
+        category: "2",
+      },
+      errorCategory: 2,
+      retryInfo: "1 second",
+    }),
+  };
+
+  it("recognises the real participant 409", () => {
+    expect(isSubmissionAlreadyInFlight(REAL_409)).toBe(true);
+  });
+
+  it("does not mistake it for a traffic problem", () => {
+    // The two are handled completely differently: a traffic error feeds the
+    // breaker and means "we are out of budget"; this one means "your payment
+    // is fine, it is happening right now". Confusing them would trip the
+    // breaker on ordinary concurrency.
+    expect(isTrafficError(REAL_409)).toBe(false);
+  });
+
+  it("does not fire on unrelated failures", () => {
+    for (const other of [
+      { responseBody: '{"code":"CONTRACT_NOT_FOUND"}' },
+      { responseBody: '{"code":"PACKAGE_NAMES_NOT_FOUND"}' },
+      new Error("connection refused"),
+      undefined,
+      null,
+      "",
+    ]) {
+      expect(isSubmissionAlreadyInFlight(other)).toBe(false);
+    }
+  });
+
+  it("still fires when only the human-readable cause survives", () => {
+    // Some layers drop the structured body and keep the message.
+    expect(isSubmissionAlreadyInFlight(new Error("HTTP 409: already in-flight"))).toBe(true);
+  });
+});
+
+describe("breaker: the count arm is windowed and is spent when it trips", () => {
+  const cfg = { threshold: 3, cooldownMs: 1_000, windowMs: 10_000, failureRate: 0, minSamples: 999 };
+
+  it("does NOT re-open on a single failure after the cooldown", () => {
+    // THE ONE THAT MATTERS. With a monotone counter the arm stayed at or above
+    // the threshold for ever after the first trip, so once the cooldown
+    // elapsed the very next failure re-opened it — and the next, and the next.
+    // A breaker that latches open on one event is an outage with extra steps.
+    const b = createCircuitBreaker(cfg);
+    let t = 1_000_000;
+    for (let i = 0; i < 3; i++) b.recordTrafficFailure(t + i);
+    expect(b.isOpen(t + 10)).toBe(true);
+
+    t += 2_000; // cooldown elapsed
+    expect(b.isOpen(t)).toBe(false);
+    b.recordTrafficFailure(t);
+    expect(b.isOpen(t + 1)).toBe(false); // one failure must not be enough
+    b.recordTrafficFailure(t + 1);
+    expect(b.isOpen(t + 2)).toBe(false); // nor two
+    b.recordTrafficFailure(t + 2);
+    expect(b.isOpen(t + 3)).toBe(true); // a fresh threshold does re-open it
+  });
+
+  it("ages failures out of the window instead of counting them for ever", () => {
+    const b = createCircuitBreaker(cfg);
+    const t = 2_000_000;
+    b.recordTrafficFailure(t);
+    b.recordTrafficFailure(t + 1);
+    // Two failures, then a long quiet period: they must not still be counted.
+    const later = t + 60_000;
+    b.recordTrafficFailure(later);
+    expect(b.isOpen(later + 1)).toBe(false);
+  });
+
+  it("still trips on genuinely consecutive failures, and a success still forgives one", () => {
+    const b = createCircuitBreaker(cfg);
+    const t = 3_000_000;
+    b.recordTrafficFailure(t);
+    b.recordTrafficFailure(t + 1);
+    b.recordSuccess(t + 2); // forgives one
+    b.recordTrafficFailure(t + 3);
+    expect(b.isOpen(t + 4)).toBe(false); // back to two outstanding
+    b.recordTrafficFailure(t + 4);
+    expect(b.isOpen(t + 5)).toBe(true);
+  });
+});
+
+describe("the global budget can be charged separately from admission", () => {
+  const cfg = { maxPerPayer: 0, maxGlobal: 2, windowMs: 60_000, maxPerIp: 100 };
+
+  it("admission with chargeGlobal=false does not consume the budget", () => {
+    // THE POINT. Junk that passes shape validation and is then refused must
+    // not spend the budget that real submissions need. Before this, two IPs
+    // sending well-formed nonsense could exhaust the global cap and deny
+    // settlement to every merchant on the facilitator.
+    const l = createSlidingWindowLimiter(cfg);
+    const t = 1_000;
+    for (let i = 0; i < 50; i++) {
+      expect(l.allowKeys([{ key: "ip:1.2.3.4", max: 100 }], t + i, false)).toBe(true);
+    }
+    // The budget is untouched: two real submissions still fit.
+    expect(l.allowKeys([], t + 100)).toBe(true);
+    expect(l.allowKeys([], t + 101)).toBe(true);
+    expect(l.allowKeys([], t + 102)).toBe(false);
+  });
+
+  it("the per-key caps still bite at admission", () => {
+    // Not charging the global budget must not turn admission into a free pass.
+    const l = createSlidingWindowLimiter({ ...cfg, maxPerIp: 3 });
+    const t = 2_000;
+    for (let i = 0; i < 3; i++) {
+      expect(l.allowKeys([{ key: "ip:9.9.9.9", max: 3 }], t + i, false)).toBe(true);
+    }
+    expect(l.allowKeys([{ key: "ip:9.9.9.9", max: 3 }], t + 4, false)).toBe(false);
+  });
+
+  it("charging global with no keys records exactly one hit", () => {
+    const l = createSlidingWindowLimiter(cfg);
+    expect(l.allowKeys([], 3_000)).toBe(true);
+    expect(l.allowKeys([], 3_001)).toBe(true);
+    expect(l.allowKeys([], 3_002)).toBe(false);
+  });
+});
+
+describe("SlidingWindowLimiter.peek — asking without paying", () => {
+  it("does not record, so peeking cannot exhaust the budget it is checking", () => {
+    // The property the whole outcome-charged budget rests on. If peek
+    // recorded, the pre-check would spend the very budget it is testing and
+    // an honest caller would be throttled by being looked at.
+    const l = createSlidingWindowLimiter({ maxPerPayer: 2, maxGlobal: 0, windowMs: 1000 });
+    for (let i = 0; i < 50; i++) expect(l.peek("k", 100, 2)).toBe(true);
+    expect(l.allow("k", 100)).toBe(true);
+    expect(l.allow("k", 100)).toBe(true);
+    expect(l.peek("k", 100, 2)).toBe(false); // now genuinely full
+    expect(l.allow("k", 100)).toBe(false);
+  });
+
+  it("max <= 0 is uncapped, and an aged-out bucket peeks true again", () => {
+    const l = createSlidingWindowLimiter({ maxPerPayer: 1, maxGlobal: 0, windowMs: 1000 });
+    expect(l.allow("k", 100)).toBe(true);
+    expect(l.peek("k", 100, 1)).toBe(false);
+    expect(l.peek("k", 100, 0)).toBe(true); // disabled cap
+    expect(l.peek("k", 100 + 1001, 1)).toBe(true); // window rolled past
+  });
+})

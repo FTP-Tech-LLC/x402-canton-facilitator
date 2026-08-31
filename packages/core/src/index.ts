@@ -3,3 +3,8 @@ export * from "./caip2.js";
 export * from "./encoding.js";
 export * from "./amount.js";
 export * from "./resource-url.js";
+export * from "./prepared-transfer.js";
+export * from "./inline-codec.js";
+export * from "./inline-payload.js";
+export * from "./redeemed-store.js";
+export * from "./network-failure.js";

@@ -16,7 +16,7 @@ export type CantonNetwork =
   | `canton:${string}`; // canton:<global-synchronizer-id>
 
 /** x402 scheme discriminator. Per the x402-ENVELOPE upstream convention
- *  (PR #2634) the scheme NAME is `"exact"` and Canton is a NETWORK of the exact
+ *  (upstream scheme review) the scheme NAME is `"exact"` and Canton is a NETWORK of the exact
  *  scheme (CAIP-2 `canton:*`). This is the ONLY scheme this stack speaks. */
 export type ExactScheme = "exact";
 
@@ -73,39 +73,51 @@ export type CantonPaymentRequirementsExtra =
       synchronizerId: string;
       instrumentId: { admin: string; id: string };
       /** Relative deadline (seconds from now) the client uses to compute the
-       *  transfer's absolute `executeBefore`. The relay-stashed signed
-       *  submission expires with it (see CantonPaymentPayload). */
+       *  transfer's absolute `executeBefore`. The payer-signed transfer expires
+       *  with it (see CantonPaymentPayload). */
       executeBeforeSeconds: number;
       memo?: string;
     };
 
-/** Canton-specific `payload` block in PaymentPayload. */
-export type CantonPaymentPayload =
-  | {
-      /** Token-standard direct transfer ("V3"). The heavy signed artifact does
-       *  NOT travel in this payload: a prepared Canton tx plus its disclosed
-       *  contracts (AmuletRules blob, open mining round, one blob per input
-       *  holding) is hundreds of KB and cannot fit an X-PAYMENT header
-       *  (~8–16 KB server limits). Instead the client PREPARED and SIGNED via
-       *  the facilitator relay (`POST /v1/wallet/pay/prepare` +
-       *  `POST /v1/wallet/pay/commit`), the relay stashed the signed submission
-       *  (TTL = the transfer's executeBefore), and this payload carries only
-       *  the small reference. /verify checks the relay-recorded transfer fields
-       *  against PaymentRequirements; /settle loads the stash and relays it
-       *  (ExecuteSubmission). Replay: the ledger rejects a respend of the
-       *  archived input holdings; a facilitator success-record makes a LEGIT
-       *  retry of an already-settled ref idempotent (returns the recorded
-       *  success) instead of failing it. */
-      assetTransferMethod: "transfer-factory";
-      /** Payer party id. Aligns with `SettleResponse`/`VerifyResponse` `payer`. */
-      payer: string;
-      /** Opaque stash reference returned by the relay's pay/prepare. */
-      submissionRef: string;
-      /** Hex hash of the prepared tx the payer signed. Binds the ref to the
-       *  exact bytes: the facilitator re-checks it against the stash before
-       *  relaying, so a swapped/stale stash entry fails closed. */
-      preparedTxHash?: string;
-    };
+/**
+ * INLINE carriage — the form the merged upstream scheme defines, and the one
+ * new clients emit. The payer-signed transaction travels in the payload itself,
+ * so the payload is self-contained and ANY facilitator can relay it.
+ *
+ * This is what the old `submissionRef` stash form could never be. A stash reference
+ * is meaningful only to the one facilitator that prepared it, which forces the
+ * payer and the merchant onto the same facilitator — but in x402 the MERCHANT
+ * picks the facilitator and the payer is never told which one. The pointer form
+ * therefore only ever worked because both ends happened to be ours.
+ *
+ * Size was the original objection to going inline, and it was measured wrong: a
+ * real signed `TransferFactory_Transfer` on MainNet is ~22-27 KB, not the
+ * "hundreds of KB" this comment used to claim. Gzipped it is ~5 KB — too big
+ * for an HTTP header, comfortable in a request body.
+ */
+export interface CantonInlinePayload {
+  assetTransferMethod: "transfer-factory";
+  /** `base64(gzip(prepared TransferFactory_Transfer))`, disclosed contracts
+   *  embedded. Bounded on decode — see `decodeInlinePaymentPayload`. */
+  preparedTransaction: string;
+  /** Lower-case hex hash of the prepared tx the payer signed. A CLAIM until the
+   *  facilitator recomputes it from the decoded bytes. */
+  preparedTxHash: string;
+  /** Base64 Ed25519 signature over `preparedTxHash`. The facilitator wraps it
+   *  into the ledger's nested `partySignatures` for the proven payer; `signedBy`
+   *  is the payer party's own namespace fingerprint, so flattening to one string
+   *  drops nothing the facilitator cannot reconstruct. */
+  signature: string;
+  /** Canton hashing scheme used for `preparedTxHash`. Defaults to V2. */
+  hashingSchemeVersion?: "HASHING_SCHEME_VERSION_V1" | "HASHING_SCHEME_VERSION_V2";
+}
+
+/** Canton-specific `payload` block in PaymentPayload. The inline carriage is the
+ *  ONLY form: the payer-signed transaction travels in the payload itself, so the
+ *  payload is self-contained and any facilitator can relay it. (The legacy
+ *  `submissionRef` stash carriage — which pinned payer and merchant to the one
+ *  facilitator that prepared it — was removed; inline is what upstream adopted.) */
+export type CantonPaymentPayload = CantonInlinePayload;
 
 /** Resource being paid for. Echoed from the server's 402 PAYMENT-REQUIRED
  *  header into every PaymentPayload per x402 v2. */
@@ -163,6 +175,22 @@ export type SupportedResponse = {
        *  facilitator settles on. Advertised here so a 402 `extra` MAY omit
        *  `synchronizerId` and the client sources it from /supported. */
       synchronizerId?: string;
+      /** Payload forms this facilitator's /settle accepts. "inline" carries the
+       *  payer-signed transaction itself, so any facilitator can relay it — the
+       *  only carriage the stack speaks. Optional and additive. */
+      carriages?: Array<"inline">;
+      /** Non-Amulet CIP-56 instruments this deployment is configured to settle.
+       *  Always carries the registrar/admin party; when the operator configures
+       *  instrument identity it also carries the full `instrumentId` ({admin,id})
+       *  and a display `symbol`, so a merchant reads the instrumentId here instead
+       *  of hardcoding it. Canton Coin is implied by the scheme and never listed.
+       *  Optional and additive. */
+      instruments?: Array<{
+        admin: string;
+        id?: string;
+        instrumentId?: { admin: string; id: string };
+        symbol?: string;
+      }>;
     };
   }>;
   extensions: string[];
@@ -208,16 +236,21 @@ export type CantonErrorCode =
   | "invalid_exact_canton_expired"
   | "invalid_exact_canton_nonce_reuse"
   | "invalid_exact_canton_merchant_mismatch"
-  | "invalid_exact_canton_signature"
-  // NOTE (PR #2634): the facilitator no longer MATCHES memo or resourceUrl on
-  // the Token-Standard paths (allocation-api + cip56-transfer-factory). `memo`
-  // stays an OPTIONAL pass-through field on PaymentRequirements.extra (the client
-  // MAY stamp transferLeg.meta x402.memo for its own reconciliation; the
-  // facilitator does NOT validate it), and resourceUrl is no longer bound on the
-  // allocation path (reuse protection = receiver+amount+delegate + contract
-  // archival; the URL must not be committed on-ledger for privacy). The former
-  // `invalid_exact_canton_resource_url_mismatch` / `invalid_exact_canton_memo_mismatch`
-  // codes were therefore removed.
+  // merchant-set `extra.memo` not carried, or mismatched, in the signed
+  // transfer's `x402.memo` meta entry (transfer-factory path; fail-closed).
+  | "invalid_exact_canton_memo_mismatch"
+  // NOTE (upstream scheme review, revised): `extra.memo`, WHEN SET by the merchant, IS enforced
+  // on the transfer-factory path. The payer's signed transfer must carry exactly
+  // that value in its meta as `x402.memo`; the inline verify
+  // (assertPreparedTransferMatches, Rule 12) pins it and rejects a missing OR
+  // divergent memo with `invalid_exact_canton_memo_mismatch` (fail-closed: a
+  // signed transfer without a memo while the merchant requires one is a
+  // mismatch). A payer MAY still carry a memo
+  // the merchant did NOT require (no check runs then). `resourceUrl` remains
+  // UNMATCHED on the Token-Standard paths (reuse protection = receiver+amount+
+  // delegate + contract archival; the URL must not be committed on-ledger for
+  // privacy), so the former `invalid_exact_canton_resource_url_mismatch` code
+  // stays removed.
   | "invalid_exact_canton_merchant_not_registered"
   | "invalid_exact_canton_counter_not_ready"
   // CIP-56-specific
@@ -233,6 +266,18 @@ export type CantonErrorCode =
   | "invalid_exact_canton_instrument_id_mismatch"
   | "invalid_exact_canton_transfer_factory_not_found"
   | "invalid_exact_canton_missing_proof"
+  // ── Inline-carriage codes, from the merged scheme's normative table ──
+  // `preparedTransaction` is not canonical base64 / not a single gzip member,
+  // or breaches the compressed, decompressed or decode bound.
+  | "invalid_exact_canton_malformed_payload"
+  // `signature` does not verify against the proven payer over `preparedTxHash`.
+  | "invalid_exact_canton_signature_invalid"
+  // `extra.feePayer` is not this facilitator's own relaying party — it would be
+  // paying traffic for a transfer that names someone else as fee payer.
+  | "invalid_exact_canton_fee_payer_mismatch"
+  // The prepared transaction's input holdings do not have distinct contract ids,
+  // or do not sum to the amount plus fees.
+  | "invalid_exact_canton_insufficient_inputs"
   // CIP-56 completed path: the receiver's created Holding carries a `lock`
   // (Splice.Api.Token.HoldingV1 `HoldingView.lock : Optional Lock`) held by
   // a party other than the receiver — the tokens are escrowed, not freely
@@ -240,6 +285,19 @@ export type CantonErrorCode =
   // the receiver exists. Reject rather than deliver against funds that may
   // unwind. (audit H1)
   | "invalid_exact_canton_holding_locked"
+  // The transfer's executeBefore is further out than the facilitator will
+  // accept. Distinct from `invalid_exact_canton_expired`, which is the same
+  // field failing the other way: expired means "too late to settle", this one
+  // means "you asked us to keep this settleable for too long". A payer that
+  // sees it can re-prepare with a shorter horizon and retry.
+  //
+  // The bound exists because the deadline is what makes a payment replayable:
+  // a settled inline payment is answered from the facilitator's record for as
+  // long as it could still be settled, and everything downstream — the
+  // merchant's one-payment-one-delivery ticket above all — has to remember it
+  // for at least that long. Letting the PAYER choose that window unbounded
+  // made it unbounded for everyone else too.
+  | "invalid_exact_canton_execute_before_too_far"
   // The payment (on-ledger updateId / paymentId) was already settled —
   // single-use replay protection for the CIP-56 completed path (audit M2).
   | "invalid_exact_canton_payment_already_settled"
@@ -248,22 +306,37 @@ export type CantonErrorCode =
   // relay/execute itself failed. Default-bucketed by classifySettleFailure (→
   // validation_failed).
   | "invalid_exact_canton_execute_failed"
-  // x402-ENVELOPE additive guards (PR #2634 review points 8 & 9). Both
+  // x402-ENVELOPE additive guards (upstream review points 8 & 9). Both
   // default-bucket to validation_failed in classifySettleFailure (neither maps
   // to already_settled / counter_not_ready), so no settle-metrics change needed.
   //
-  // (8) /verify real-balance check: the proven payer's token balance on the
-  // facilitator's participant ACS is below the required amount.
+  // (8) insufficient balance: returned by /settle when the ledger rejects the
+  // relayed `TransferFactory_Transfer` ExecuteSubmission with
+  // `ITR_InsufficientFunds`. The transfer-factory flow is UTXO-style — the input
+  // holdings are pinned at build time (pay/prepare) and enforced on-ledger at
+  // execute — so there is NO off-chain balance read; the ledger rejection is the
+  // authoritative signal that the payer's chosen inputs no longer cover the
+  // amount.
   | "invalid_exact_canton_insufficient_balance"
+  // input contention: the ledger refused the relayed transfer because its PINNED
+  // input holdings were already consumed, or are locked by a concurrent
+  // in-flight transaction. Split out of `execute_failed` because the two demand
+  // opposite client behaviour: `execute_failed` is the catch-all around the
+  // submit and may hide a network failure over a submission that committed, so
+  // a client must stop and let a human check the ledger. This one is a verdict
+  // that ARRIVED, from conflict detection, before any effect — nothing moved,
+  // and a re-pay over fresh holdings is a retry rather than a second payment.
+  //
+  // It is reachable on the honest path: pay/prepare picks input Amulets
+  // largest-first from the ACS and keeps no record, so two payments from one
+  // party overlapping in time are built over the same holding and the ledger
+  // settles exactly one of them.
+  | "invalid_exact_canton_input_contention"
   // (9) self-payment safety guard: the proven sender equals the executor /
   // feePayer (the facilitator). Fail-closed — the facilitator must never move
   // its own funds.
   | "invalid_exact_canton_self_payment"
   // transfer-factory ("V3") specific codes:
-  // - submission_not_found: the payload's submissionRef is unknown, expired
-  //   (past executeBefore), not yet committed (unsigned), or its stored hash
-  //   does not match payload.preparedTxHash. Fail-closed at /verify + /settle.
-  | "invalid_exact_canton_submission_not_found"
   // - preapproval_missing: the merchant (payTo) has no live TransferPreapproval,
   //   so the transfer cannot complete in one tx. /settle refuses BEFORE relaying
   //   (never a silent half-settled Pending). Merchant setup:

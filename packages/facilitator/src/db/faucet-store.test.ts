@@ -403,3 +403,59 @@ describe("createFaucetStore factory", () => {
     expect(calls.some((c) => c.startsWith("INSERT"))).toBe(true);
   });
 });
+
+describe("tryClaim serialises claimants when a transaction is available", () => {
+  /** An executor that records the statement order and reports whether the
+   *  claim ran inside a transaction. */
+  function tracking() {
+    const seen: string[] = [];
+    let inTx = 0;
+    const exec: PgExecutor = {
+      async query(sql: string) {
+        seen.push(sql.trim().split(/\s+/).slice(0, 3).join(" "));
+        return { rows: [], rowCount: sql.startsWith("INSERT INTO faucet_claims") ? 1 : 0 };
+      },
+      async transaction<T>(fn: (tx: PgExecutor) => Promise<T>): Promise<T> {
+        inTx += 1;
+        return fn(exec);
+      },
+    };
+    return { exec, seen, txCount: () => inTx };
+  }
+
+  const args = {
+    party: "agent::1220aa", ip: "1.2.3.4", amountCc: "0.27",
+    nowMs: 1_700_000_000_000, windowMs: 86_400_000,
+    dailyBudgetCc: "500", lifetimeCapCc: "0",
+  };
+
+  it("takes the advisory lock BEFORE the claim statement", async () => {
+    // Order is the whole point. The budget sub-SELECTs read the snapshot taken
+    // when their statement begins, so the lock has to be held before that
+    // statement starts — acquiring it afterwards would serialise nothing.
+    const { exec, seen, txCount } = tracking();
+    const store = createPostgresFaucetStore(exec);
+    expect(await store.tryClaim(args)).toBe("ok");
+    expect(txCount()).toBe(1);
+    const lockAt = seen.findIndex((s) => s.includes("pg_advisory_xact_lock"));
+    const insertAt = seen.findIndex((s) => s.startsWith("INSERT INTO faucet_claims"));
+    expect(lockAt).toBeGreaterThanOrEqual(0);
+    expect(insertAt).toBeGreaterThan(lockAt);
+  });
+
+  it("still claims, without a lock, when the executor cannot transact", async () => {
+    // The in-memory and test executors have no connection to hold. The party
+    // guard still holds exactly-once there; only the budget guards weaken, and
+    // the code says so rather than pretending otherwise.
+    const seen: string[] = [];
+    const exec: PgExecutor = {
+      async query(sql: string) {
+        seen.push(sql.trim().split(/\s+/).slice(0, 3).join(" "));
+        return { rows: [], rowCount: sql.startsWith("INSERT INTO faucet_claims") ? 1 : 0 };
+      },
+    };
+    const store = createPostgresFaucetStore(exec);
+    expect(await store.tryClaim(args)).toBe("ok");
+    expect(seen.some((s) => s.includes("pg_advisory_xact_lock"))).toBe(false);
+  });
+});
