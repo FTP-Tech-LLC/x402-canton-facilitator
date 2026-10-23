@@ -8,12 +8,12 @@
 #   2. `runtime` — minimal Alpine image with just the production
 #      install + the compiled dist. Non-root user.
 #
-# Build context MUST be the repo root (so the monorepo is visible to
-# pnpm). Build from there:
+# Build context MUST be the repo root (so the pnpm workspace is visible).
+# Build from there:
 #
 #   docker build -f packages/facilitator/Dockerfile -t canton-x402-facilitator .
 #
-# Run with the env vars documented in packages/facilitator/README.md:
+# Run with the env vars documented in docs/deployment.md:
 #
 #   docker run --rm -p 4022:4022 \
 #     -e CANTON_NETWORK=canton:devnet \
@@ -27,6 +27,10 @@
 #     -e OIDC_CLIENT_ID=... \
 #     -e OIDC_CLIENT_SECRET=... \
 #     -e LEDGER_API_AUDIENCE=... \
+#     -e CANTON_USER_ID=... \
+#     -e CANTON_X402_TF_ENABLED=true \
+#     -e CANTON_X402_TOPOLOGY_READER_URL=... \
+#     -e CANTON_X402_TOPOLOGY_READER_TOKEN=... \
 #     canton-x402-facilitator
 
 # ────────────────────────────── build stage ──────────────────────────────
@@ -40,9 +44,6 @@ COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
 COPY packages/core/package.json    packages/core/package.json
 COPY packages/ledger/package.json  packages/ledger/package.json
 COPY packages/facilitator/package.json packages/facilitator/package.json
-COPY packages/client/package.json  packages/client/package.json
-COPY packages/express/package.json packages/express/package.json
-COPY packages/next/package.json    packages/next/package.json
 
 RUN pnpm install --frozen-lockfile \
       --filter @ftptech/x402-canton-core... \
