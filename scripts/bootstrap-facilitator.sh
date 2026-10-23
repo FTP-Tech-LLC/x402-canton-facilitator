@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Bootstrap a Canton participant to host the x402 facilitator.
+# Bootstrap a LocalNet participant (unsafe HMAC auth) to host the x402
+# facilitator. For OIDC participants (DevNet, TestNet, MainNet) follow
+# "Party and rights" in docs/deployment.md instead.
 #
-# Run once per fresh participant. Idempotent — re-runs do nothing if
+# Run once per fresh participant. Idempotent: re-runs do nothing if
 # the party already exists and rights are already granted.
 #
 # Steps:
@@ -17,8 +19,7 @@
 #                              App Provider participant)
 #   CANTON_USER_ID          — ledger user id to grant rights to
 #                              (default "ledger-api-user")
-#   JWT_ISSUER              — "unsafe-hmac" (default for LocalNet /
-#                              cn-quickstart) or "oidc" (production)
+#   JWT_ISSUER              — must be "unsafe-hmac" (the default)
 #   JWT_SECRET              — HMAC secret if JWT_ISSUER=unsafe-hmac
 #                              (default "unsafe")
 #   PARTY_HINT              — partyIdHint (default "ftp_facilitator")
@@ -32,7 +33,8 @@ JWT_SECRET="${JWT_SECRET:-unsafe}"
 PARTY_HINT="${PARTY_HINT:-ftp_facilitator}"
 
 if [[ "$JWT_ISSUER" != "unsafe-hmac" ]]; then
-  echo "ERROR: only JWT_ISSUER=unsafe-hmac is supported for now. OIDC bootstrap is pending." >&2
+  echo "ERROR: this script supports JWT_ISSUER=unsafe-hmac (LocalNet) only." >&2
+  echo "For OIDC participants see \"Party and rights\" in docs/deployment.md." >&2
   exit 1
 fi
 
