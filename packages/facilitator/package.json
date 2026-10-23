@@ -5,14 +5,14 @@
   "description": "x402 facilitator for Canton Network — /verify and /settle compliant with the x402 spec",
   "license": "Apache-2.0",
   "author": "FTP team",
-  "homepage": "https://github.com/sunstrike228/canton-x402/tree/main/packages/facilitator#readme",
+  "homepage": "https://github.com/FTP-Tech-LLC/x402-canton-facilitator/tree/main/packages/facilitator#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sunstrike228/canton-x402.git",
+    "url": "git+https://github.com/FTP-Tech-LLC/x402-canton-facilitator.git",
     "directory": "packages/facilitator"
   },
   "bugs": {
-    "url": "https://github.com/sunstrike228/canton-x402/issues"
+    "url": "https://github.com/FTP-Tech-LLC/x402-canton-facilitator/issues"
   },
   "keywords": [
     "x402",
