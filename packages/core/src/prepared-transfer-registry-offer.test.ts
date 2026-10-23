@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
 import {
   assertPreparedTransferMatches,
+  isRegistrarInstrumentConfiguration,
   PreparedTransferMismatchError,
   type PreparedTransferExpectation,
 } from "./prepared-transfer.js";
@@ -56,12 +57,22 @@ describe("registry two-step offer to a Tradecraft pool (CBTC sell) — verify-be
     );
   });
 
-  it("REFUSES when cbtc-beneficiary is not a trusted registry party — the foreign-party backstop holds", () => {
+  it("accepts without listing cbtc-beneficiary — it sits only in the registrar's own InstrumentConfiguration", () => {
+    expect(() =>
+      assertPreparedTransferMatches(BYTES, {
+        ...base,
+        trustedRegistryParties: new Set([DA_OPERATOR]), // beneficiary NOT listed
+      })
+    ).not.toThrow();
+  });
+
+  it("REFUSES the beneficiary when the registrar is not pinned — the configuration is admitted only for a trusted admin", () => {
+    const { instrumentAdmin: _unpinned, ...unpinned } = base;
     let err: unknown;
     try {
       assertPreparedTransferMatches(BYTES, {
-        ...base,
-        trustedRegistryParties: new Set([DA_OPERATOR]), // beneficiary NOT trusted
+        ...unpinned,
+        trustedRegistryParties: new Set([DA_OPERATOR]),
       });
     } catch (e) {
       err = e;
@@ -71,6 +82,16 @@ describe("registry two-step offer to a Tradecraft pool (CBTC sell) — verify-be
     expect((err as Error).message).toContain("cbtc-beneficiary");
   });
 
+  it("REFUSES when the pinned admin is another registrar — its configuration is not the payment's", () => {
+    expect(() =>
+      assertPreparedTransferMatches(BYTES, {
+        ...base,
+        instrumentAdmin: "other-registrar::1220aa",
+        trustedRegistryParties: new Set([DA_OPERATOR]),
+      })
+    ).toThrow(PreparedTransferMismatchError);
+  });
+
   it("REFUSES when the receiver is not the intended pool — the money barrier stays pinned", () => {
     expect(() =>
       assertPreparedTransferMatches(BYTES, {
@@ -78,5 +99,67 @@ describe("registry two-step offer to a Tradecraft pool (CBTC sell) — verify-be
         receiver: "attacker::1220deadbeef",
       })
     ).toThrow(PreparedTransferMismatchError);
+  });
+});
+
+// A REAL MainNet CBTC offer to the same pool, captured 2026-10-16 after BitSafe
+// replaced the reward beneficiary: the registrar's InstrumentConfiguration now
+// names cbtc-beneficiary-2, which no fixed list of this package knows.
+const BYTES_BENEFICIARY2 = readFileSync(
+  new URL(
+    "../../agent-wallet/src/__fixtures__/mainnet-cbtc-registry-offer-beneficiary2.b64",
+    import.meta.url
+  ),
+  "utf8"
+).trim();
+/** preparationTime 1792132332764201µs → a nowMs inside the fixture's window. */
+const NOW_MS_BENEFICIARY2 = 1792132400000;
+
+describe("CBTC after the beneficiary change (cbtc-beneficiary-2) — verify-before-sign", () => {
+  const live: PreparedTransferExpectation = {
+    ...base,
+    amount: "0.0000001",
+    trustedRegistryParties: new Set([DA_OPERATOR]),
+    nowMs: NOW_MS_BENEFICIARY2,
+  };
+
+  it("accepts with only the DA operator trusted — the new beneficiary is admitted from the registrar's configuration", () => {
+    expect(() => assertPreparedTransferMatches(BYTES_BENEFICIARY2, live)).not.toThrow();
+  });
+
+  it("REFUSES cbtc-beneficiary-2 when the registrar is not pinned", () => {
+    const { instrumentAdmin: _unpinned, ...unpinned } = live;
+    expect(() => assertPreparedTransferMatches(BYTES_BENEFICIARY2, unpinned)).toThrow(
+      /cbtc-beneficiary-2/
+    );
+  });
+
+  it("REFUSES when the receiver is not the intended pool", () => {
+    expect(() =>
+      assertPreparedTransferMatches(BYTES_BENEFICIARY2, { ...live, receiver: "attacker::1220deadbeef" })
+    ).toThrow(PreparedTransferMismatchError);
+  });
+});
+
+describe("isRegistrarInstrumentConfiguration — which input contract is the registrar's own configuration", () => {
+  const TEMPLATE = "Utility.Registry.V0.Configuration.Instrument:InstrumentConfiguration";
+
+  it("is the configuration template signed by the admin", () => {
+    expect(isRegistrarInstrumentConfiguration(TEMPLATE, [CBTC_ADMIN], CBTC_ADMIN)).toBe(true);
+    expect(isRegistrarInstrumentConfiguration(TEMPLATE, ["Bridge-Operator::1220", CBTC_ADMIN], CBTC_ADMIN)).toBe(true);
+  });
+
+  it("is not a configuration the admin did not sign", () => {
+    expect(isRegistrarInstrumentConfiguration(TEMPLATE, [DA_OPERATOR], CBTC_ADMIN)).toBe(false);
+    expect(isRegistrarInstrumentConfiguration(TEMPLATE, [], CBTC_ADMIN)).toBe(false);
+    expect(isRegistrarInstrumentConfiguration(TEMPLATE, undefined, CBTC_ADMIN)).toBe(false);
+  });
+
+  it("is not any other template, even one the admin signed", () => {
+    expect(
+      isRegistrarInstrumentConfiguration("Utility.Registry.Holding.V0.Holding:Holding", [CBTC_ADMIN], CBTC_ADMIN)
+    ).toBe(false);
+    expect(isRegistrarInstrumentConfiguration(undefined, [CBTC_ADMIN], CBTC_ADMIN)).toBe(false);
+    expect(isRegistrarInstrumentConfiguration(`${TEMPLATE}X`, [CBTC_ADMIN], CBTC_ADMIN)).toBe(false);
   });
 });

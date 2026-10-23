@@ -1,6 +1,6 @@
 {
   "name": "@ftptech/x402-canton-ledger",
-  "version": "0.4.0",
+  "version": "0.6.2",
   "description": "Shared Canton ledger primitives — JSON Ledger API v2 client, Ed25519 external-party signing, Scan API client. Used by @ftptech/x402-canton-facilitator and @ftptech/x402-canton-client.",
   "license": "Apache-2.0",
   "author": "FTP team",

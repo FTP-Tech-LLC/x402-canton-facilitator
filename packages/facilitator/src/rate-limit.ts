@@ -224,6 +224,126 @@ export function createSlidingWindowLimiter(
   };
 }
 
+export interface PenaltyBoxConfig {
+  /** Strikes within `strikeWindowMs` that open a ban. `<= 0` disables the whole
+   *  box (no strikes recorded, nothing ever banned). */
+  strikesToBan: number;
+  /** Window (ms) over which strikes accumulate toward `strikesToBan`. Strikes
+   *  older than this age out, so an honest slow drip never reaches a ban. */
+  strikeWindowMs: number;
+  /** First ban duration (ms). Each subsequent ban of the same key multiplies
+   *  this by `multiplier ^ priorBans`, capped at `maxBanMs`. */
+  baseBanMs: number;
+  /** Per-offense escalation factor for the ban duration (e.g. 2 = doubles). */
+  multiplier: number;
+  /** Hard ceiling (ms) on any single ban, so escalation cannot run away. */
+  maxBanMs: number;
+  /** Minimum gap (ms) between two strikes that COUNT for the same key.
+   *  Refusals closer together than this are one episode (a client retrying a
+   *  soft 429 without backoff) and count once, so "repeat abuser" means
+   *  repeated across separate minutes, not one burst. `0` counts every
+   *  refusal. */
+  strikeSpacingMs?: number;
+}
+
+export interface PenaltyBox {
+  /** Record one abuse strike for `key`. When strikes within the window reach
+   *  `strikesToBan`, opens (or escalates) a ban and clears the strike count.
+   *  No-op when the box is disabled. */
+  strike(key: string, now: number): void;
+  /** 0 if `key` is not currently banned, else the epoch-ms the ban lifts. */
+  bannedUntil(key: string, now: number): number;
+  /** Live key count. Introspection hook for tests/metrics. */
+  _size(): number;
+  /** Force the aged-out-entry sweep at `now`. Test hook. */
+  _sweep(now: number): void;
+}
+
+/**
+ * Escalating temporary ban for repeat abusers. Distinct from the sliding-window
+ * limiter (which handles honest bursts with a soft per-request 429) and from the
+ * circuit breaker (which reacts to OUR failures): this reacts to a caller who
+ * keeps getting refused and makes them stop for a growing period. Strikes are
+ * fed from the routes' existing per-IP refusals, so only REPEATED abuse escalates;
+ * a one-off bug never earns a ban. Service-layer only, keyed on the caller.
+ */
+export function createPenaltyBox(cfg?: PenaltyBoxConfig): PenaltyBox {
+  const strikesToBan = cfg?.strikesToBan ?? 0;
+  const strikeWindowMs = cfg?.strikeWindowMs ?? 600_000;
+  const baseBanMs = cfg?.baseBanMs ?? 3_600_000;
+  const multiplier = cfg?.multiplier ?? 2;
+  const maxBanMs = cfg?.maxBanMs ?? 86_400_000;
+  const strikeSpacingMs = cfg?.strikeSpacingMs ?? 0;
+  const enabled = strikesToBan > 0;
+
+  /** Per-key state: recent strike timestamps, current ban expiry, and how many
+   *  bans this key has served (for escalation). */
+  type Entry = { strikes: number[]; bannedUntil: number; priorBans: number };
+  const box = new Map<string, Entry>();
+  let lastSweepAt = -Infinity;
+
+  const get = (key: string): Entry => {
+    let e = box.get(key);
+    if (!e) {
+      e = { strikes: [], bannedUntil: 0, priorBans: 0 };
+      box.set(key, e);
+    }
+    return e;
+  };
+
+  // Drop entries that are neither banned nor holding recent strikes, and whose
+  // escalation memory has decayed (a clean stretch of >= maxBanMs since the ban
+  // lifted returns a reformed caller to baseline). Bounded memory under key churn.
+  const sweep = (now: number): void => {
+    for (const [key, e] of box) {
+      e.strikes = e.strikes.filter((t) => now - t < strikeWindowMs);
+      const decayed = e.bannedUntil > 0 && now - e.bannedUntil >= maxBanMs;
+      if (decayed) {
+        e.priorBans = 0;
+        e.bannedUntil = 0;
+      }
+      if (e.strikes.length === 0 && e.bannedUntil === 0 && e.priorBans === 0) {
+        box.delete(key);
+      }
+    }
+    lastSweepAt = now;
+  };
+
+  return {
+    strike(key: string, now: number): void {
+      if (!enabled) return;
+      const e = get(key);
+      e.strikes = e.strikes.filter((t) => now - t < strikeWindowMs);
+      // Same episode as the last counted strike: a retry storm against one
+      // soft 429 is one offense, not five. Only a fresh minute counts again.
+      const last = e.strikes[e.strikes.length - 1];
+      if (last !== undefined && now - last < strikeSpacingMs) return;
+      e.strikes.push(now);
+      if (e.strikes.length >= strikesToBan) {
+        const dur = Math.min(baseBanMs * multiplier ** e.priorBans, maxBanMs);
+        e.bannedUntil = now + dur;
+        e.priorBans += 1;
+        e.strikes = [];
+      }
+      if (now - lastSweepAt >= strikeWindowMs) sweep(now);
+    },
+    bannedUntil(key: string, now: number): number {
+      if (!enabled) return 0;
+      const e = box.get(key);
+      if (!e) return 0;
+      // A key whose ban has lapsed keeps its priorBans for escalation until the
+      // decay sweep clears it, but reports as not-currently-banned.
+      return e.bannedUntil > now ? e.bannedUntil : 0;
+    },
+    _size(): number {
+      return box.size;
+    },
+    _sweep(now: number): void {
+      sweep(now);
+    },
+  };
+}
+
 export interface CircuitBreakerConfig {
   /** Failures (within `windowMs`) that trip the breaker OPEN. `<= 0` disables
    *  the breaker entirely (both the count arm AND the rate arm). Historically

@@ -2258,3 +2258,15 @@ describe("KeyedTtlSingleFlightCache — the cap", () => {
     expect(fresh).not.toHaveBeenCalled(); // "a" survived
   });
 });
+
+describe("isTransientScanError — a 403 from one SV fails over to the next", () => {
+  it("treats 403 as transient (per-gateway refusal, not a stable answer)", () => {
+    const err = new CantonError("GET /api/scan/v0/dso returned HTTP 403", "HTTP_ERROR", 403, "RBAC: access denied");
+    expect(isTransientScanError(err)).toBe(true);
+  });
+  it("still treats 404 and 400 as stable answers", () => {
+    expect(isTransientScanError(new CantonError("nf", "HTTP_ERROR", 404, ""))).toBe(false);
+    expect(isTransientScanError(new CantonError("bad", "HTTP_ERROR", 400, ""))).toBe(false);
+  });
+});
+

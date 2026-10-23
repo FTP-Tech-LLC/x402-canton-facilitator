@@ -367,3 +367,105 @@ describe("createTransferPreapproval — stale disclosed round", () => {
     expect(fresh).not.toHaveBeenCalled();
   });
 });
+
+describe("self-preapproval goes to the participant hosting the merchant", () => {
+  function twoNodes() {
+    const node = () => ({
+      queryActiveContracts: vi.fn(async () => AMULETS),
+      interactiveSubmissionPrepare: vi.fn(async () => ({ preparedTransaction: "pt", preparedTransactionHash: "h" })),
+      getLedgerEnd: vi.fn(async () => ({ offset: 5 })),
+      interactiveSubmissionExecute: vi.fn(async () => ({ updateId: "u-self" })),
+      pollCompletionUpdateId: vi.fn(async () => "u-self"),
+    });
+    const primary = node();
+    const secondary = node();
+    const svc = new PreapprovalService({
+      client: primary as unknown as PreapprovalServiceDeps["client"],
+      scan: {
+        getAmuletRules: vi.fn(async () => AMULET),
+        getOpenAndIssuingMiningRounds: vi.fn(async () => ROUNDS),
+      } as unknown as PreapprovalServiceDeps["scan"],
+      facilitatorParty: "ftp_facilitator::1220fff",
+      userId: "node2-user",
+      router: {
+        forParty: async () => ({
+          client: secondary as unknown as PreapprovalServiceDeps["client"],
+          userId: "node1-user",
+        }),
+      },
+    });
+    return { svc, primary, secondary };
+  }
+
+  it("prepare reads the merchant's holdings and prepares there, as our user there", async () => {
+    const { svc, primary, secondary } = twoNodes();
+    await svc.prepareSelfPreapproval({ party: "merchant::1220m", expiresAt: "2026-12-01T00:00:00Z" });
+    expect(secondary.queryActiveContracts).toHaveBeenCalled();
+    expect(secondary.interactiveSubmissionPrepare).toHaveBeenCalledWith(expect.objectContaining({ userId: "node1-user" }));
+    expect(primary.queryActiveContracts).not.toHaveBeenCalled();
+    expect(primary.interactiveSubmissionPrepare).not.toHaveBeenCalled();
+  });
+
+  it("commit executes there, with the offset and completion on the same participant", async () => {
+    const { svc, primary, secondary } = twoNodes();
+    await svc.executeSelfPreapproval({
+      party: "merchant::1220m",
+      preparedTransaction: "pt",
+      hashingSchemeVersion: "HASHING_SCHEME_VERSION_V2",
+      partySignatures: { signatures: [] },
+    });
+    expect(secondary.getLedgerEnd).toHaveBeenCalled();
+    expect(secondary.interactiveSubmissionExecute).toHaveBeenCalled();
+    expect(primary.interactiveSubmissionExecute).not.toHaveBeenCalled();
+  });
+});
+
+describe("fee inputs for a party with more Amulets than one participant read lists", () => {
+  const dust = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      contractId: `00dust${i}`,
+      templateId: "#splice-amulet:Splice.Amulet:Amulet",
+      createArgument: { amount: { initialAmount: "1.0000000000" } },
+    }));
+  function capped(slice?: (f: unknown, limit: number) => Promise<unknown>) {
+    const { svc, submit } = makeService();
+    const client = (svc as unknown as { deps: { client: Record<string, unknown> } }).deps.client;
+    client.queryActiveContracts = vi.fn(async () => {
+      throw Object.assign(new Error("element limit"), { code: "ACS_LIMIT_EXCEEDED" });
+    });
+    if (slice) client.queryActiveContractsSlice = vi.fn(slice);
+    return { svc, submit, client };
+  }
+  const inputsOf = (submit: ReturnType<typeof vi.fn>) =>
+    (submit.mock.calls[0]![0] as { commands: Array<{ ExerciseCommand: { choiceArgument: { inputs: unknown[] } } }> })
+      .commands[0]!.ExerciseCommand.choiceArgument.inputs;
+
+  it("reads the oldest slice in ONE bounded read (no plain read refused first), and spends at most 70 inputs", async () => {
+    const { svc, submit, client } = capped(async (_f, limit) => ({ events: dust(limit), complete: false, limit }));
+    await svc.createTransferPreapproval({ merchant: "merchant::1220m", expiresAt: "2026-09-01T00:00:00Z" });
+    expect((client.queryActiveContractsSlice as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+    expect((client.queryActiveContractsSlice as ReturnType<typeof vi.fn>).mock.calls[0]![1]).toBe(200);
+    expect(client.queryActiveContracts).not.toHaveBeenCalled();
+    // 1 CC each: the 50 CC fee target is reached at 50 inputs, under the cap.
+    expect(inputsOf(submit)).toHaveLength(50);
+  });
+
+  it("caps the number of fee inputs at 70 even when the target is not yet reached", async () => {
+    const tiny = Array.from({ length: 200 }, (_, i) => ({
+      contractId: `00t${i}`,
+      templateId: "#splice-amulet:Splice.Amulet:Amulet",
+      createArgument: { amount: { initialAmount: "0.1000000000" } },
+    }));
+    const { svc, submit } = capped(async () => ({ events: tiny, complete: false, limit: 200 }));
+    await svc.createTransferPreapproval({ merchant: "merchant::1220m", expiresAt: "2026-09-01T00:00:00Z" });
+    expect(inputsOf(submit)).toHaveLength(70);
+  });
+
+  it("without the slice capability the 413 still surfaces (no silent empty selection)", async () => {
+    const { svc } = capped();
+    const err = await svc
+      .createTransferPreapproval({ merchant: "merchant::1220m", expiresAt: "2026-09-01T00:00:00Z" })
+      .catch((e: unknown) => e);
+    expect((err as { code?: string }).code).toBe("ACS_LIMIT_EXCEEDED");
+  });
+});

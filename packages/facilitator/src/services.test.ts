@@ -67,6 +67,28 @@ describe("buildServices", () => {
     else process.env.CANTON_USER_ID = savedUser;
   });
 
+  it("one participant by default; with a secondary, the router knows both, each with its own user", () => {
+    const one = buildServices(baseConfig());
+    expect(one.router.secondary).toBeUndefined();
+    expect(one.router.primary.client).toBe(one.client);
+    const two = buildServices(
+      baseConfig({
+        secondaryParticipant: {
+          url: "http://node1:7575",
+          userId: "node1-user",
+          oidcTokenEndpoint: undefined,
+          oidcClientId: undefined,
+          oidcClientSecret: undefined,
+          oidcScope: undefined,
+          ledgerApiAudience: undefined,
+        },
+      })
+    );
+    expect(two.router.primary.userId).toBe("ledger-api-user");
+    expect(two.router.secondary?.userId).toBe("node1-user");
+    expect(two.router.secondary?.client).not.toBe(two.client);
+  });
+
   it("wires all services and copies config fields through", () => {
     const svc = buildServices(baseConfig());
     expect(svc.facilitatorParty).toBe("ftp_facilitator::1220");

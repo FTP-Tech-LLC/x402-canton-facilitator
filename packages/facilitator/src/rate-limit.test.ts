@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   createSlidingWindowLimiter,
   createCircuitBreaker,
+  createPenaltyBox,
   isTrafficError,
   isSubmissionAlreadyInFlight,
 } from "./rate-limit.js";
@@ -513,3 +514,113 @@ describe("SlidingWindowLimiter.peek — asking without paying", () => {
     expect(l.peek("k", 100 + 1001, 1)).toBe(true); // window rolled past
   });
 })
+
+describe("createPenaltyBox", () => {
+  const cfg = {
+    strikesToBan: 3,
+    strikeWindowMs: 10_000,
+    baseBanMs: 60_000,
+    multiplier: 2,
+    maxBanMs: 240_000,
+  };
+
+  it("does not ban below the strike threshold", () => {
+    const p = createPenaltyBox(cfg);
+    p.strike("ip", 0);
+    p.strike("ip", 1);
+    expect(p.bannedUntil("ip", 2)).toBe(0);
+  });
+
+  it("bans for baseBanMs once strikes reach the threshold", () => {
+    const p = createPenaltyBox(cfg);
+    p.strike("ip", 0);
+    p.strike("ip", 1);
+    p.strike("ip", 2);
+    expect(p.bannedUntil("ip", 3)).toBe(2 + 60_000);
+  });
+
+  it("escalates: the second ban doubles", () => {
+    const p = createPenaltyBox(cfg);
+    for (let i = 0; i < 3; i++) p.strike("ip", i); // ban until 2+60000
+    // After the first ban lapses, three more strikes -> 2x ban.
+    const t = 62_003;
+    for (let i = 0; i < 3; i++) p.strike("ip", t + i);
+    expect(p.bannedUntil("ip", t + 3)).toBe(t + 2 + 120_000);
+  });
+
+  it("caps the ban at maxBanMs", () => {
+    const p = createPenaltyBox(cfg);
+    let t = 0;
+    // Four offenses: 60k, 120k, 240k, then would-be 480k capped to 240k.
+    for (let offense = 0; offense < 4; offense++) {
+      for (let i = 0; i < 3; i++) p.strike("ip", t + i);
+      const until = p.bannedUntil("ip", t + 3);
+      t = until + 1; // wait out this ban before the next offense
+    }
+    const last = p.bannedUntil("ip", t - 1);
+    // The 4th ban's duration is capped at maxBanMs (240k), not 480k.
+    expect(last - (t - 1 - 3)).toBeLessThanOrEqual(240_000 + 3);
+  });
+
+  it("reports not-banned after the ban expires", () => {
+    const p = createPenaltyBox(cfg);
+    for (let i = 0; i < 3; i++) p.strike("ip", i);
+    const until = p.bannedUntil("ip", 3);
+    expect(p.bannedUntil("ip", until + 1)).toBe(0);
+  });
+
+  it("strikesToBan=0 disables the box entirely", () => {
+    const p = createPenaltyBox({ ...cfg, strikesToBan: 0 });
+    for (let i = 0; i < 10; i++) p.strike("ip", i);
+    expect(p.bannedUntil("ip", 11)).toBe(0);
+  });
+
+  it("isolates keys — one IP's ban does not affect another", () => {
+    const p = createPenaltyBox(cfg);
+    for (let i = 0; i < 3; i++) p.strike("a", i);
+    expect(p.bannedUntil("a", 3)).toBeGreaterThan(0);
+    expect(p.bannedUntil("b", 3)).toBe(0);
+  });
+
+  it("ages out stale strikes so an honest slow drip never bans", () => {
+    const p = createPenaltyBox(cfg);
+    // One strike every 6s: never 3 within the 10s window.
+    p.strike("ip", 0);
+    p.strike("ip", 6_000);
+    p.strike("ip", 12_000);
+    expect(p.bannedUntil("ip", 12_001)).toBe(0);
+  });
+})
+
+describe("createPenaltyBox — strike spacing (one episode = one strike)", () => {
+  const cfg = {
+    strikesToBan: 3,
+    strikeWindowMs: 600_000,
+    baseBanMs: 60_000,
+    multiplier: 2,
+    maxBanMs: 240_000,
+    strikeSpacingMs: 60_000,
+  };
+
+  it("a burst of refusals inside the spacing counts once, so a retry storm never bans", () => {
+    const p = createPenaltyBox(cfg);
+    for (let i = 0; i < 20; i++) p.strike("ip", i * 100); // 20 refusals in 2s
+    expect(p.bannedUntil("ip", 3_000)).toBe(0);
+  });
+
+  it("refusals in separate minutes each count, and three of them ban", () => {
+    const p = createPenaltyBox(cfg);
+    p.strike("ip", 0);
+    p.strike("ip", 60_000);
+    p.strike("ip", 120_000);
+    expect(p.bannedUntil("ip", 120_001)).toBe(120_000 + 60_000);
+  });
+
+  it("spacing 0 counts every refusal", () => {
+    const p = createPenaltyBox({ ...cfg, strikeSpacingMs: 0 });
+    p.strike("ip", 0);
+    p.strike("ip", 1);
+    p.strike("ip", 2);
+    expect(p.bannedUntil("ip", 3)).toBe(2 + 60_000);
+  });
+});

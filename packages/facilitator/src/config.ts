@@ -3,6 +3,7 @@
  * for DevNet, TestNet, and MainNet by changing CANTON_NETWORK +
  * CANTON_PARTICIPANT_URL.
  */
+import { participantId } from "./participant-router.js";
 
 export interface FacilitatorConfig {
   port: number;
@@ -33,11 +34,14 @@ export interface FacilitatorConfig {
   network: "canton:devnet" | "canton:testnet" | "canton:mainnet";
   participantUrl: string;            // JSON Ledger API v2 base URL
   facilitatorParty: string;          // our facilitator party id
-  /** Participant MEMBER id (e.g. `PAR::ftp-validator-1::1220abc`) used by the
-   *  GS traffic-budget monitor's getTrafficStatus call. OPTIONAL: the
-   *  facilitator does not otherwise need its own member id. When unset the
-   *  traffic monitor logs once and stays inert (nothing else depends on it).
-   *  Set via CANTON_FACILITATOR_MEMBER_ID. */
+  /** Participant MEMBER id (e.g. `PAR::ftp-validator-1::1220abc`) whose
+   *  traffic the marker worker prices and the GS traffic-budget monitor
+   *  watches. REQUIRED when the marker worker is enabled: it used to be guessed
+   *  as `PAR::<facilitatorParty>`, which is only right when the facilitator
+   *  party is the participant's own operator party — for any other FA party the
+   *  guess names no member and every round is skipped without a word. Without
+   *  markers it stays optional; the traffic monitor then logs once and is
+   *  inert. Set via CANTON_FACILITATOR_MEMBER_ID. */
   facilitatorMemberId: string | undefined;
   synchronizerId: string;            // Global Synchronizer id we settle on
   scanUrl: string;                   // SV Scan or validator-local Scan proxy
@@ -155,6 +159,16 @@ export interface FacilitatorConfig {
   inlineMerchantPolicy: "open" | "provider" | "allowlist" | "provider-or-allowlist";
   /** Merchant parties accepted by the `allowlist` arms above. */
   inlineMerchantAllowlist: string[];
+  /**
+   * Extra parties accepted as the payment's `extra.feePayer`, besides
+   * `facilitatorParty` (`CANTON_X402_ACCEPTED_FEE_PAYERS`, comma-separated).
+   * For a change of facilitator party: merchants quote the feePayer in static
+   * config, so the old party is kept accepted until their configs move, while
+   * /supported advertises only the new one. Every listed party is also treated
+   * as "us" by the self-payment guard, but NOT as a provider proof under the
+   * `provider` merchant policy. Default empty.
+   */
+  acceptedFeePayers: string[];
   /** Rollout stage for the /settle unknown-outcome guard: off (default,
    *  identical to the pre-guard build) | observe (record + metric, response
    *  unchanged) | enforce (503 on an unresolved mark). */
@@ -185,6 +199,38 @@ export interface FacilitatorConfig {
    * into a hard ceiling the operator can lower.
    */
   walletOnboardRateMaxGlobal: number;
+  /**
+   * ABSOLUTE ceiling on party allocations per 24h, across everyone. The
+   * per-minute global above bounds the burst rate but not the total: a script
+   * pacing just under it has no daily limit and could exhaust the participant's
+   * user-rights slots (Canton default max-rights-per-user = 1000, which we have
+   * hit), locking onboarding for every user. This is the hard daily stop.
+   * `0` disables. Default 200/day: ~4x the observed peak (~2/hour) while
+   * holding a slot-exhaustion attack to a fifth of the 1000-slot budget per
+   * day. A default equal to the whole budget only stretches a 12h exhaustion
+   * to 24h, which is no protection at all.
+   */
+  walletOnboardDailyMax: number;
+  /**
+   * Escalating cooldown for repeat abusers (the ToS "temporary suspension"
+   * clause). A caller (by IP) that keeps getting refused on agent-side money
+   * routes accrues strikes; `abuseStrikesToBan` strikes within
+   * `abuseStrikeWindowMs` open a temporary ban of `abuseBaseBanMs`, doubling
+   * (`abuseBanMultiplier`) on each further offense up to `abuseMaxBanMs`.
+   * `abuseStrikesToBan <= 0` disables the whole mechanism. Distinct from the
+   * per-request rate limits (soft, honest bursts) and the circuit breaker
+   * (our failures).
+   */
+  abuseStrikesToBan: number;
+  abuseStrikeWindowMs: number;
+  abuseBaseBanMs: number;
+  abuseBanMultiplier: number;
+  abuseMaxBanMs: number;
+  /** Minimum gap between two COUNTED strikes for one caller: refusals inside
+   *  it are one episode (a retry storm against a soft 429). Default 60s, the
+   *  soft limiter's own window, so a ban needs refusals in five separate
+   *  minutes, not five requests in one second. */
+  abuseStrikeSpacingMs: number;
   /**
    * How many pay/prepare attempts one payer may WASTE per window before the
    * route stops doing the expensive part at all, and the window length.
@@ -232,6 +278,44 @@ export interface FacilitatorConfig {
   oidcClientSecret: string | undefined;
   oidcScope: string | undefined;
   ledgerApiAudience: string | undefined;
+  /**
+   * A second participant that still hosts parties not yet moved to the primary
+   * (party replication). When set, every relay call for a party goes to the
+   * participant that hosts it (see participant-router.ts); new wallets and
+   * everything not tied to one party stay on the primary. Unset: one
+   * participant, exactly as before. Env: CANTON_SECONDARY_PARTICIPANT_URL,
+   * CANTON_SECONDARY_USER_ID and, with JWT_ISSUER=oidc, the matching
+   * CANTON_SECONDARY_OIDC_* / CANTON_SECONDARY_LEDGER_API_AUDIENCE.
+   */
+  /**
+   * Co-host every NEW wallet on the secondary participant too
+   * (`CANTON_X402_ONBOARD_CO_HOST_UID`: that participant's uid, no PAR::).
+   * The party is generated with both participants confirming, threshold 1, and
+   * allocated on both, so it never needs replicating later. Needs
+   * `secondaryParticipant`. Unset: new wallets are hosted on the primary only.
+   */
+  onboardCoHostParticipantUid: string | undefined;
+  /**
+   * Grant our ledger user CanActAs on each wallet onboarded, on the primary
+   * (`CANTON_GRANT_PARTY_RIGHTS`, default true). Set false where the user holds
+   * CanReadAsAnyParty + CanExecuteAsAnyParty instead: per-party grants are then
+   * unnecessary and would run into the participant's rights-per-user cap.
+   */
+  grantPartyRights: boolean;
+  secondaryParticipant:
+    | {
+        url: string;
+        userId: string;
+        /** Same as `grantPartyRights`, for the co-host grant on this participant
+         *  (`CANTON_SECONDARY_GRANT_PARTY_RIGHTS`, default true). */
+        grantPartyRights: boolean;
+        oidcTokenEndpoint: string | undefined;
+        oidcClientId: string | undefined;
+        oidcClientSecret: string | undefined;
+        oidcScope: string | undefined;
+        ledgerApiAudience: string | undefined;
+      }
+    | undefined;
   dbUrl: string | undefined;         // Postgres connection string (wired in M1.2)
   logLevel: "debug" | "info" | "warn" | "error";
   /** Register POST /close (graceful-shutdown route). Default false:
@@ -266,6 +350,14 @@ export interface FacilitatorConfig {
    * who knowingly wants the old behaviour.
    */
   walletSubmitChoiceAllowlist: readonly string[];
+  /** Templates (`Module:Entity`, package-independent) the wallet relay's
+   *  submit/prepare will CREATE directly. Empty (default) = no CreateCommand at
+   *  all. The Tradecraft queued mode needs
+   *  `TC.V4.Settle.WithdrawalRequest:SettlementWithdrawalRequest`. */
+  walletSubmitCreateTemplates: readonly string[];
+  /** Exact template / interface ids (`#package-name:Module:Entity`) the relay's
+   *  `GET /v1/wallet/:party/contracts` may list. Empty (default) = route off. */
+  walletReadIds: readonly string[];
   /** Agent CC faucet (out-of-box e2e). OFF by default on EVERY network incl.
    *  mainnet; the caps below are the guardrail when enabled. The faucet sends a
    *  tiny one-time CC seed from the facilitator's OWN party to an agent party
@@ -317,6 +409,13 @@ export interface FacilitatorConfig {
    *  callers. Comma-separated; empty (default) → no exemptions.
    *  CANTON_X402_FAUCET_IP_EXEMPT. */
   faucetIpExempt: string[];
+  /** Pay every newly onboarded wallet one faucet grant (`faucetAmountCc`) right
+   *  after its party is allocated, so an agent's new wallet starts funded. Same
+   *  guards as the faucet route: once per party, the daily budget, the lifetime
+   *  cap. New parties are themselves capped by the onboarding daily limit, so
+   *  the worst case per day is min(that limit, the daily budget) grants. Needs
+   *  the faucet enabled. CANTON_X402_FAUCET_ON_ONBOARD=true. */
+  faucetOnOnboard: boolean;
   /** Bearer token required for merchant-registry MUTATIONS
    *  (POST /v1/merchants/register and /:cid/accept). These make the
    *  facilitator party submit on-ledger writes, so they must not be
@@ -341,10 +440,16 @@ export interface FacilitatorConfig {
    *  mining round with weight = Σ traffic bytes / 1e6 * $60/MB. Requires
    *  DATABASE_URL (same DB as attribution). */
   markerEnabled: boolean;
-  /** FTP party that holds the FeaturedAppRight and receives the app reward. */
+  /** FTP party that holds the FeaturedAppRight and submits the markers; it also
+   *  receives the app reward unless `markerBeneficiary` names another party. */
   markerFtpParty: string | undefined;
   /** Ledger userId for the FeaturedAppRight_CreateActivityMarker submission. */
   markerUserId: string | undefined;
+  /** Who mints the marker reward (`CANTON_X402_MARKER_BENEFICIARY`). Unset:
+   *  `markerFtpParty`. Set it when the marker party is not a wallet user on
+   *  any validator (nobody would mint its coupons): name the validator operator
+   *  whose wallet mints them, e.g. the one paying the facilitator's traffic. */
+  markerBeneficiary: string | undefined;
   /** Marker weight multiplier (`CANTON_X402_MARKER_WEIGHT_MULTIPLIER`) — the
    *  overuse / cost-recovery coefficient applied to the round's total GS traffic
    *  weight (target 1.15 = +15%). Env-driven, re-tunable with a restart and no
@@ -576,6 +681,79 @@ export function loadConfig(): FacilitatorConfig {
   const faucetDailyBudgetCc = process.env.CANTON_X402_FAUCET_DAILY_BUDGET_CC ?? "1";
   const faucetLifetimeCapCc =
     process.env.CANTON_X402_FAUCET_LIFETIME_CAP_CC ?? "25";
+  const secondaryUrl = process.env.CANTON_SECONDARY_PARTICIPANT_URL || undefined;
+  const coHostUid = process.env.CANTON_X402_ONBOARD_CO_HOST_UID || undefined;
+  if (coHostUid && !secondaryUrl) {
+    throw new Error(
+      "CANTON_X402_ONBOARD_CO_HOST_UID allocates new wallets on the secondary participant too: " +
+        "it needs CANTON_SECONDARY_PARTICIPANT_URL"
+    );
+  }
+  if (coHostUid) {
+    // Every onboarding would fail on a malformed uid, and on the primary's own
+    // uid (left set after the swap) the co-host allocation lands on a
+    // participant the topology does not name.
+    if (!/^[^:\s]+::1220[0-9a-f]{64}$/.test(coHostUid)) {
+      throw new Error(
+        "CANTON_X402_ONBOARD_CO_HOST_UID must be a participant uid <name>::1220<64 hex> " +
+          `(no PAR:: prefix), got ${coHostUid}`
+      );
+    }
+    if (process.env.CANTON_FACILITATOR_MEMBER_ID === `PAR::${coHostUid}`) {
+      throw new Error(
+        "CANTON_X402_ONBOARD_CO_HOST_UID names the participant this facilitator runs on " +
+          "(CANTON_FACILITATOR_MEMBER_ID); it must be the secondary. Unset it once the secondary is retired."
+      );
+    }
+  }
+  if (secondaryUrl && process.env.CANTON_PARTICIPANT_URL &&
+      participantId(secondaryUrl) === participantId(process.env.CANTON_PARTICIPANT_URL)) {
+    // A settle records the participant by URL; two names for one URL make
+    // that record ambiguous.
+    throw new Error("CANTON_SECONDARY_PARTICIPANT_URL must be a different participant from CANTON_PARTICIPANT_URL");
+  }
+  if (secondaryUrl) {
+    const needs = ["CANTON_SECONDARY_USER_ID"];
+    if (jwtIssuer === "oidc") {
+      needs.push(
+        "CANTON_SECONDARY_OIDC_TOKEN_ENDPOINT",
+        "CANTON_SECONDARY_OIDC_CLIENT_ID",
+        "CANTON_SECONDARY_OIDC_CLIENT_SECRET",
+        "CANTON_SECONDARY_LEDGER_API_AUDIENCE"
+      );
+    }
+    for (const v of needs) {
+      if (!process.env[v]) {
+        throw new Error(`CANTON_SECONDARY_PARTICIPANT_URL is set, so ${v} is required`);
+      }
+    }
+  }
+
+  // The marker weight is this member's traffic. Guessing the member from the
+  // facilitator party silently skips every round once the FA party is not the
+  // participant's own operator party, so the member id must be explicit.
+  if (process.env.CANTON_X402_MARKER_ENABLED === "true" && !process.env.CANTON_FACILITATOR_MEMBER_ID) {
+    throw new Error(
+      "CANTON_X402_MARKER_ENABLED=true needs CANTON_FACILITATOR_MEMBER_ID " +
+        "(the participant member whose traffic the markers price, e.g. PAR::<participant uid>)"
+    );
+  }
+  // A malformed beneficiary would be rejected by the ledger on every round,
+  // silently ending emission; refuse to start instead.
+  const markerBeneficiary = process.env.CANTON_X402_MARKER_BENEFICIARY?.trim();
+  if (markerBeneficiary && !/^[^:\s]+::1220[0-9a-f]{64}$/.test(markerBeneficiary)) {
+    throw new Error(
+      "CANTON_X402_MARKER_BENEFICIARY must be a party id <hint>::1220<64 hex>, " +
+        `got ${markerBeneficiary}`
+    );
+  }
+  if (process.env.CANTON_X402_FAUCET_ON_ONBOARD === "true" && !faucetEnabled) {
+    // Otherwise every new wallet is told nothing and silently gets nothing.
+    throw new Error(
+      "CANTON_X402_FAUCET_ON_ONBOARD=true pays the starter grant from the faucet: " +
+        "it needs CANTON_X402_FAUCET_ENABLED=true"
+    );
+  }
   if (faucetEnabled) {
     const amt = Number(faucetAmountCc);
     const budget = Number(faucetDailyBudgetCc);
@@ -798,6 +976,34 @@ export function loadConfig(): FacilitatorConfig {
       process.env.CANTON_X402_WALLET_ONBOARD_RATE_MAX_GLOBAL,
       60
     ),
+    walletOnboardDailyMax: numericEnv(
+      process.env.CANTON_X402_WALLET_ONBOARD_DAILY_MAX,
+      200
+    ),
+    abuseStrikesToBan: numericEnv(
+      process.env.CANTON_X402_ABUSE_STRIKES_TO_BAN,
+      5
+    ),
+    abuseStrikeWindowMs: numericEnv(
+      process.env.CANTON_X402_ABUSE_STRIKE_WINDOW_MS,
+      600_000
+    ),
+    abuseBaseBanMs: numericEnv(
+      process.env.CANTON_X402_ABUSE_BASE_BAN_MS,
+      3_600_000
+    ),
+    abuseBanMultiplier: numericEnv(
+      process.env.CANTON_X402_ABUSE_BAN_MULTIPLIER,
+      2
+    ),
+    abuseMaxBanMs: numericEnv(
+      process.env.CANTON_X402_ABUSE_MAX_BAN_MS,
+      86_400_000
+    ),
+    abuseStrikeSpacingMs: numericEnv(
+      process.env.CANTON_X402_ABUSE_STRIKE_SPACING_MS,
+      60_000
+    ),
     walletSubmitRateMaxPerIp: numericEnv(
       process.env.CANTON_X402_WALLET_SUBMIT_RATE_MAX_PER_IP,
       240
@@ -851,6 +1057,14 @@ export function loadConfig(): FacilitatorConfig {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean),
+    acceptedFeePayers: [
+      ...new Set(
+        (process.env.CANTON_X402_ACCEPTED_FEE_PAYERS ?? "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s && s !== process.env.CANTON_FACILITATOR_PARTY)
+      ),
+    ],
     // 120 (was 60): /verify is also keyed on the MERCHANT IP, so a merchant
     // fronting many agents shares one /verify bucket. Raised to match the
     // settle per-IP cap so /verify does not become the new bottleneck once the
@@ -871,6 +1085,20 @@ export function loadConfig(): FacilitatorConfig {
     oidcClientSecret: process.env.OIDC_CLIENT_SECRET,
     oidcScope: process.env.OIDC_SCOPE,
     ledgerApiAudience: process.env.LEDGER_API_AUDIENCE,
+    onboardCoHostParticipantUid: coHostUid,
+    grantPartyRights: process.env.CANTON_GRANT_PARTY_RIGHTS !== "false",
+    secondaryParticipant: secondaryUrl
+      ? {
+          url: secondaryUrl,
+          userId: process.env.CANTON_SECONDARY_USER_ID!,
+          grantPartyRights: process.env.CANTON_SECONDARY_GRANT_PARTY_RIGHTS !== "false",
+          oidcTokenEndpoint: process.env.CANTON_SECONDARY_OIDC_TOKEN_ENDPOINT,
+          oidcClientId: process.env.CANTON_SECONDARY_OIDC_CLIENT_ID,
+          oidcClientSecret: process.env.CANTON_SECONDARY_OIDC_CLIENT_SECRET,
+          oidcScope: process.env.CANTON_SECONDARY_OIDC_SCOPE,
+          ledgerApiAudience: process.env.CANTON_SECONDARY_LEDGER_API_AUDIENCE,
+        }
+      : undefined,
     dbUrl: process.env.DATABASE_URL,
     logLevel: (process.env.LOG_LEVEL ?? "info") as FacilitatorConfig["logLevel"],
     enableCloseRoute: process.env.CANTON_X402_ENABLE_CLOSE_ROUTE === "true",
@@ -890,6 +1118,16 @@ export function loadConfig(): FacilitatorConfig {
       return Object.freeze(
         raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0)
       );
+    })(),
+    walletSubmitCreateTemplates: (() => {
+      const raw = process.env.CANTON_X402_WALLET_SUBMIT_CREATE_TEMPLATES;
+      if (raw === undefined || raw.trim() === "") return Object.freeze([] as string[]);
+      return Object.freeze(raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0));
+    })(),
+    walletReadIds: (() => {
+      const raw = process.env.CANTON_X402_WALLET_READ_IDS;
+      if (raw === undefined || raw.trim() === "") return Object.freeze([] as string[]);
+      return Object.freeze(raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0));
     })(),
     faucetEnabled,
     faucetAmountCc,
@@ -916,6 +1154,7 @@ export function loadConfig(): FacilitatorConfig {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean),
+    faucetOnOnboard: process.env.CANTON_X402_FAUCET_ON_ONBOARD === "true",
     operatorToken: process.env.CANTON_X402_OPERATOR_TOKEN,
     attributionScanUrls: (process.env.CANTON_ATTRIBUTION_SCAN_URLS ?? "")
       .split(",")
@@ -934,6 +1173,7 @@ export function loadConfig(): FacilitatorConfig {
     markerEnabled: process.env.CANTON_X402_MARKER_ENABLED === "true",
     markerFtpParty: process.env.CANTON_X402_MARKER_FTP_PARTY,
     markerUserId: process.env.CANTON_X402_MARKER_USER_ID,
+    markerBeneficiary: markerBeneficiary || undefined,
     markerWeightMultiplier: (() => {
       const raw = Number(process.env.CANTON_X402_MARKER_WEIGHT_MULTIPLIER);
       return Number.isFinite(raw) && raw > 0 ? raw : 1.15;

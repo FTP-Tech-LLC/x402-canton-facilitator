@@ -15,12 +15,14 @@
  */
 import { describe, it, expect, vi } from "vitest";
 import {
+  classifySubmitFailure,
   processAllRounds,
   processRound,
   startPaidMarkerWorker,
   type PaidMarkerWorkerServices,
 } from "./paid-marker-worker.js";
-import type { MarkerRoundRow, MarkerStore } from "../db/marker-store.js";
+import type { MarkerRoundFields, MarkerRoundRow, MarkerStore } from "../db/marker-store.js";
+import { CantonError, type CommandCompletion } from "@ftptech/x402-canton-ledger";
 
 // Mirror the worker's own constants so the assertions are self-checking.
 const TRAFFIC_PRICE_USD_PER_MB = 60;
@@ -64,6 +66,9 @@ class FakeMarkerStore implements MarkerStore {
       weight: null,
       update_id: null,
       error_message: null,
+      submission_id: null,
+      dedup_offset: null,
+      submitted_at: null,
       created_at,
       updated_at: created_at,
     });
@@ -72,14 +77,7 @@ class FakeMarkerStore implements MarkerStore {
   async updateStatus(
     roundNumber: number,
     status: string,
-    fields: {
-      traffic_bytes?: bigint;
-      traffic_consumed?: bigint;
-      traffic_usd?: string;
-      weight?: string;
-      update_id?: string;
-      error_message?: string;
-    } = {}
+    fields: MarkerRoundFields = {}
   ): Promise<void> {
     const r = this.rows.get(roundNumber);
     if (!r) return;
@@ -90,6 +88,9 @@ class FakeMarkerStore implements MarkerStore {
     if (fields.weight !== undefined) r.weight = fields.weight;
     if (fields.update_id !== undefined) r.update_id = fields.update_id;
     if (fields.error_message !== undefined) r.error_message = fields.error_message;
+    if (fields.submission_id !== undefined) r.submission_id = fields.submission_id;
+    if (fields.dedup_offset !== undefined) r.dedup_offset = fields.dedup_offset;
+    if (fields.submitted) r.submitted_at = new Date();
     r.updated_at = new Date();
   }
 
@@ -123,6 +124,25 @@ class FakeMarkerStore implements MarkerStore {
       }
     }
   }
+
+  async getUnknown(minRound: number): Promise<MarkerRoundRow[]> {
+    return [...this.rows.values()]
+      .filter((r) => r.status === "unknown" && r.round_number >= minRound)
+      .sort((a, b) => a.round_number - b.round_number)
+      .map((r) => ({ ...r }));
+  }
+
+  async expireUnknown(belowRound: number, reason: string): Promise<MarkerRoundRow[]> {
+    const out: MarkerRoundRow[] = [];
+    for (const r of this.rows.values()) {
+      if (r.status === "unknown" && r.round_number < belowRound) {
+        r.status = "expired";
+        r.error_message = reason;
+        out.push({ ...r });
+      }
+    }
+    return out;
+  }
 }
 
 /** Mock Scan. `state.consumed` is mutable so a test can advance it between ticks;
@@ -146,14 +166,58 @@ function makeScan(initialRound: number) {
   return { scan, state };
 }
 
-function makeClient(opts: { emitThrows?: boolean } = {}) {
+type SubmittedMarker = {
+  commandId: string;
+  submissionId?: string;
+  deduplicationPeriod?: { DeduplicationOffset: { value: number } };
+  actAs: string[];
+  commands: Array<{
+    ExerciseCommand: { choiceArgument: { beneficiaries: Array<{ beneficiary: string }> } };
+  }>;
+};
+
+/**
+ * Mock participant. `emitThrows` makes every submit fail with that error (true =
+ * a bare transport error, i.e. outcome unknown). `commitsAnyway` models the
+ * 2026-10-17 incident: the submit fails, but the command commits and its
+ * accepted completion shows up on the stream. `completions` is that stream.
+ */
+function makeClient(opts: { emitThrows?: boolean | Error; commitsAnyway?: boolean } = {}) {
   const commandIds: string[] = [];
-  const submitAndWaitForTransaction = vi.fn(async (req: { commandId: string }) => {
+  const requests: SubmittedMarker[] = [];
+  const completions: Array<CommandCompletion & { commandId: string }> = [];
+  const ledger = { end: 5000 };
+  const submitAndWaitForTransaction = vi.fn(async (req: SubmittedMarker) => {
     commandIds.push(req.commandId);
-    if (opts.emitThrows) throw new Error("ledger unavailable");
+    requests.push(req);
+    if (opts.emitThrows) {
+      if (opts.commitsAnyway) {
+        ledger.end += 1;
+        completions.push({
+          commandId: req.commandId,
+          submissionId: req.submissionId!,
+          updateId: `upd-${req.commandId}-${completions.length}`,
+          offset: ledger.end,
+        });
+      }
+      throw opts.emitThrows === true ? new Error("ledger unavailable") : opts.emitThrows;
+    }
     return { updateId: `upd-${req.commandId}`, offset: 0 };
   });
-  return { client: { submitAndWaitForTransaction }, commandIds };
+  const getLedgerEnd = vi.fn(async () => ({ offset: ledger.end }));
+  const findCommandCompletions = vi.fn(
+    async (_u: string, _p: string, commandId: string, beginExclusive: number) =>
+      completions
+        .filter((c) => c.commandId === commandId && (c.offset ?? 0) > beginExclusive)
+        .map(({ commandId: _c, ...rest }) => rest)
+  );
+  return {
+    client: { submitAndWaitForTransaction, getLedgerEnd, findCommandCompletions },
+    commandIds,
+    requests,
+    completions,
+    ledger,
+  };
 }
 
 function makeServices(opts: {
@@ -162,16 +226,22 @@ function makeServices(opts: {
   multiplier?: number;
   maxWeight?: number;
   freeBytes?: number;
-  emitThrows?: boolean;
+  emitThrows?: boolean | Error;
+  commitsAnyway?: boolean;
+  beneficiary?: string;
 }) {
   const { scan, state } = makeScan(opts.scanRound);
-  const client = makeClient({ emitThrows: opts.emitThrows ?? false });
+  const client = makeClient({
+    emitThrows: opts.emitThrows ?? false,
+    commitsAnyway: opts.commitsAnyway ?? false,
+  });
   const services = {
     markerStore: opts.store,
     client: client.client,
     scan,
     markerFtpParty: FTP,
     markerUserId: "ftp-user",
+    ...(opts.beneficiary ? { markerBeneficiary: opts.beneficiary } : {}),
     markerWeightMultiplier: opts.multiplier ?? 1.15,
     facilitatorMemberId: MEMBER,
     maxWeightPerRound: opts.maxWeight ?? 1000,
@@ -179,6 +249,26 @@ function makeServices(opts: {
     freeBytesPerRound: opts.freeBytes ?? 0,
   } as unknown as PaidMarkerWorkerServices;
   return { services, scan, client, traffic: state };
+}
+
+/** A definite refusal by the participant: nothing committed. */
+function rejected400(): CantonError {
+  return new CantonError(
+    "POST /v2/commands/submit-and-wait-for-transaction returned HTTP 400",
+    "HTTP_ERROR",
+    400,
+    JSON.stringify({ code: "DAML_FAILURE", cause: "Weight >= 1.0 was not met" })
+  );
+}
+
+/** A JSON Ledger API error with a Canton id in its body. */
+function cantonHttpError(status: number, id: string): CantonError {
+  return new CantonError(
+    `POST /v2/commands/submit-and-wait-for-transaction returned HTTP ${status}`,
+    "HTTP_ERROR",
+    status,
+    JSON.stringify({ code: id, cause: id })
+  );
 }
 
 /** Expected USD weight for a round whose consumed grew by `deltaBytes`, under a
@@ -208,6 +298,29 @@ describe("marker worker — total-traffic weight (processRound)", () => {
     expect(Number(row?.traffic_consumed)).toBe(1_600_000);
     expect(row?.update_id).toBe("upd-x402-round-marker-100");
     expect(client.commandIds).toEqual(["x402-round-marker-100"]);
+  });
+
+  it("the reward goes to the configured beneficiary; unset, to the marker party", async () => {
+    const VALIDATOR = "FTP-validator-2::1220" + "da".repeat(32);
+    for (const [beneficiary, expected] of [[VALIDATOR, VALIDATOR], [undefined, FTP]] as const) {
+      const store = new FakeMarkerStore();
+      await seedPrev(store, 99, 1_000_000n);
+      const { services, traffic, client } = makeServices({
+        store,
+        scanRound: 100,
+        ...(beneficiary ? { beneficiary } : {}),
+      });
+      traffic.consumed = 1_600_000;
+
+      await processRound(100, 100, services, FA_RIGHT, SYNC, silentLog);
+
+      const req = client.requests[0]!;
+      // Always submitted by the marker party, which holds the FeaturedAppRight.
+      expect(req.actAs).toEqual([FTP]);
+      expect(req.commands[0]!.ExerciseCommand.choiceArgument.beneficiaries).toEqual([
+        { beneficiary: expected, weight: "1.0000000000" },
+      ]);
+    }
   });
 
   it("first run (prev has no snapshot): seeds forward, no emit", async () => {
@@ -334,7 +447,20 @@ describe("marker worker — total-traffic weight (processRound)", () => {
     expect(client.commandIds).toHaveLength(0);
   });
 
-  it("emit failure: marks failed (currentRound == target)", async () => {
+  it("a definite rejection marks failed (currentRound == target)", async () => {
+    const store = new FakeMarkerStore();
+    await seedPrev(store, 99, 1_000_000n);
+    const { services, traffic } = makeServices({ store, scanRound: 100, emitThrows: rejected400() });
+    traffic.consumed = 1_000_000 + 600_000;
+
+    await processRound(100, 100, services, FA_RIGHT, SYNC, silentLog);
+
+    const row = await store.getRow(100);
+    expect(row?.status).toBe("failed");
+    expect(row?.error_message).toContain("HTTP 400");
+  });
+
+  it("a transport error is NOT a failure: the outcome is unknown", async () => {
     const store = new FakeMarkerStore();
     await seedPrev(store, 99, 1_000_000n);
     const { services, traffic } = makeServices({ store, scanRound: 100, emitThrows: true });
@@ -343,7 +469,7 @@ describe("marker worker — total-traffic weight (processRound)", () => {
     await processRound(100, 100, services, FA_RIGHT, SYNC, silentLog);
 
     const row = await store.getRow(100);
-    expect(row?.status).toBe("failed");
+    expect(row?.status).toBe("unknown");
     expect(row?.error_message).toContain("ledger unavailable");
   });
 });
@@ -379,7 +505,7 @@ describe("a retried round prices from its own snapshot, not from now", () => {
     // Round 100 runs, its emit FAILS. The failure path still records the
     // snapshot it read (1.6 MB), which is the whole point: that number is the
     // right edge of round 100's window and it is a historical fact.
-    const a = makeServices({ store, scanRound: 100, emitThrows: true });
+    const a = makeServices({ store, scanRound: 100, emitThrows: rejected400() });
     a.traffic.consumed = 1_600_000;
     await processRound(100, 100, a.services, FA_RIGHT, SYNC, silentLog);
     const failed = await store.getRow(100);
@@ -550,5 +676,286 @@ describe("the ledger refuses a weight below 1.0, so we must not send one", () =>
 
     expect((await store.getRow(100))?.status).toBe("emitted");
     expect(client.commandIds).toEqual(["x402-round-marker-100"]);
+  });
+});
+
+/**
+ * The 2026-10-17 MainNet incident, replayed: submit-and-wait answered 503 while
+ * the marker went on to commit, the worker resubmitted every minute, and the
+ * participant let the repeats through — 24 extra markers. Every test here fails
+ * on the pre-fix worker.
+ */
+describe("a lost answer is not a failure: at most one marker per round", () => {
+  const lost503 = () =>
+    new CantonError(
+      "POST /v2/commands/submit-and-wait-for-transaction returned HTTP 503",
+      "HTTP_ERROR",
+      503,
+      "upstream request timeout"
+    );
+
+  it("503 that committed anyway: ticks for the rest of the round submit nothing more", async () => {
+    const store = new FakeMarkerStore();
+    await seedPrev(store, 99, 1_000_000n);
+    const { services, traffic, client, scan } = makeServices({
+      store,
+      scanRound: 100,
+      emitThrows: lost503(),
+      commitsAnyway: true,
+    });
+    traffic.consumed = 1_600_000;
+
+    // Ten ticks inside round 100 — the incident retried once a minute.
+    for (let i = 0; i < 10; i++) await processAllRounds(services, FA_RIGHT, SYNC, silentLog);
+
+    expect(client.commandIds).toEqual(["x402-round-marker-100"]);
+    expect(client.completions).toHaveLength(1);
+    const row = await store.getRow(100);
+    expect(row?.status).toBe("emitted");
+    expect(row?.update_id).toBe(client.completions[0]!.updateId);
+    expect(Number(row?.weight)).toBeCloseTo(expectedWeight(600_000, 1.15), 6);
+    expect(scan.getTrafficStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("the attempt is written down BEFORE the submit, with its submissionId and dedup offset", async () => {
+    const store = new FakeMarkerStore();
+    await seedPrev(store, 99, 1_000_000n);
+    const { services, traffic, client } = makeServices({ store, scanRound: 100 });
+    traffic.consumed = 1_600_000;
+    let seenAtSubmit: MarkerRoundRow | undefined;
+    const real = client.client.submitAndWaitForTransaction;
+    client.client.submitAndWaitForTransaction = vi.fn(async (req: SubmittedMarker) => {
+      seenAtSubmit = await store.getRow(100);
+      return real(req);
+    }) as typeof real;
+
+    await processRound(100, 100, services, FA_RIGHT, SYNC, silentLog);
+
+    expect(seenAtSubmit?.status).toBe("unknown");
+    expect(seenAtSubmit?.submission_id).toBe(client.requests[0]!.submissionId);
+    expect(Number(seenAtSubmit?.dedup_offset)).toBe(5000);
+    expect(seenAtSubmit?.submitted_at).toBeInstanceOf(Date);
+    expect(client.requests[0]!.deduplicationPeriod).toEqual({ DeduplicationOffset: { value: 5000 } });
+  });
+
+  it("a crash after the submit (row left unknown) is never resubmitted blind", async () => {
+    const store = new FakeMarkerStore();
+    await seedPrev(store, 99, 1_000_000n);
+    await store.insertPending(100);
+    await store.updateStatus(100, "unknown", {
+      traffic_consumed: 1_600_000n,
+      traffic_usd: "41.4",
+      submission_id: "sub-before-crash",
+      dedup_offset: 4000n,
+      submitted: true,
+    });
+    const { services, client } = makeServices({ store, scanRound: 100 });
+
+    for (let i = 0; i < 5; i++) await processAllRounds(services, FA_RIGHT, SYNC, silentLog);
+
+    expect(client.commandIds).toHaveLength(0);
+    expect((await store.getRow(100))?.status).toBe("unknown");
+  });
+
+  it("a lost attempt that is PROVED rejected is retried once, same dedup offset, new submissionId", async () => {
+    const store = new FakeMarkerStore();
+    await seedPrev(store, 99, 1_000_000n);
+    const a = makeServices({ store, scanRound: 100, emitThrows: lost503() });
+    a.traffic.consumed = 1_600_000;
+    await processRound(100, 100, a.services, FA_RIGHT, SYNC, silentLog);
+    const first = a.client.requests[0]!;
+
+    // The participant later reports that attempt as never sequenced.
+    a.client.completions.push({
+      commandId: "x402-round-marker-100",
+      submissionId: first.submissionId!,
+      offset: 5001,
+      rejection: "NOT_SEQUENCED_TIMEOUT",
+    });
+    // Same participant, now healthy.
+    const b = makeServices({ store, scanRound: 100 });
+    b.client.client.findCommandCompletions = a.client.client.findCommandCompletions;
+    await processAllRounds(b.services, FA_RIGHT, SYNC, silentLog);
+
+    expect(b.client.requests).toHaveLength(1);
+    const second = b.client.requests[0]!;
+    expect(second.submissionId).not.toBe(first.submissionId);
+    expect(second.deduplicationPeriod).toEqual(first.deduplicationPeriod);
+    expect((await store.getRow(100))?.status).toBe("emitted");
+  });
+
+  it("an unknown attempt that never resolves expires after the window and is never resubmitted", async () => {
+    const store = new FakeMarkerStore();
+    await seedPrev(store, 99, 1_000_000n);
+    const { services, traffic, client } = makeServices({ store, scanRound: 100, emitThrows: lost503() });
+    traffic.consumed = 1_600_000;
+    await processAllRounds(services, FA_RIGHT, SYNC, silentLog);
+
+    for (let r = 101; r <= 113; r++) {
+      traffic.round = r;
+      traffic.consumed = 1_600_000 + (r - 100) * 50_000;
+      await processAllRounds(services, FA_RIGHT, SYNC, silentLog);
+    }
+
+    const row = await store.getRow(100);
+    expect(row?.status).toBe("expired");
+    expect(row?.error_message).toContain("not resubmitted");
+    expect(client.commandIds.filter((c) => c === "x402-round-marker-100")).toHaveLength(1);
+  });
+
+  it("409 DUPLICATE_COMMAND means an earlier attempt WAS accepted: resolved to emitted, not retried", async () => {
+    const store = new FakeMarkerStore();
+    await seedPrev(store, 99, 1_000_000n);
+    const { services, traffic, client } = makeServices({
+      store,
+      scanRound: 100,
+      emitThrows: cantonHttpError(409, "DUPLICATE_COMMAND"),
+    });
+    traffic.consumed = 1_600_000;
+    await processRound(100, 100, services, FA_RIGHT, SYNC, silentLog);
+    expect((await store.getRow(100))?.status).toBe("unknown");
+
+    client.completions.push({ commandId: "x402-round-marker-100", submissionId: "earlier", updateId: "upd-earlier", offset: 5002 });
+    await processAllRounds(services, FA_RIGHT, SYNC, silentLog);
+
+    const row = await store.getRow(100);
+    expect(row?.status).toBe("emitted");
+    expect(row?.update_id).toBe("upd-earlier");
+    expect(client.commandIds).toHaveLength(1);
+  });
+
+  it("two accepted completions for one round are reported as duplicates", async () => {
+    const store = new FakeMarkerStore();
+    await seedPrev(store, 99, 1_000_000n);
+    const { services, traffic, client } = makeServices({ store, scanRound: 100, emitThrows: lost503() });
+    traffic.consumed = 1_600_000;
+    await processRound(100, 100, services, FA_RIGHT, SYNC, silentLog);
+    client.completions.push(
+      { commandId: "x402-round-marker-100", submissionId: "a", updateId: "u1", offset: 5001 },
+      { commandId: "x402-round-marker-100", submissionId: "b", updateId: "u2", offset: 5002 }
+    );
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    await processAllRounds(services, FA_RIGHT, SYNC, log);
+
+    expect(log.error).toHaveBeenCalledWith(
+      expect.objectContaining({ round: 100, count: 2 }),
+      expect.stringContaining("DUPLICATE")
+    );
+    expect((await store.getRow(100))?.status).toBe("emitted");
+  });
+
+  it("ledger-end unreadable: nothing is submitted and the round keeps its right edge", async () => {
+    const store = new FakeMarkerStore();
+    await seedPrev(store, 99, 1_000_000n);
+    const { services, traffic, client } = makeServices({ store, scanRound: 100 });
+    client.client.getLedgerEnd = vi.fn(async () => {
+      throw new Error("participant down");
+    });
+    traffic.consumed = 1_600_000;
+
+    await processRound(100, 100, services, FA_RIGHT, SYNC, silentLog);
+
+    const row = await store.getRow(100);
+    expect(client.commandIds).toHaveLength(0);
+    expect(row?.status).toBe("pending");
+    expect(Number(row?.traffic_consumed)).toBe(1_600_000);
+  });
+
+  it("a legacy failed round (pre-fix worker, no submissionId) is expired, never retried", async () => {
+    const store = new FakeMarkerStore();
+    await seedPrev(store, 99, 1_000_000n);
+    await store.insertPending(100);
+    await store.updateStatus(100, "failed", {
+      traffic_consumed: 1_600_000n,
+      traffic_usd: "41.4",
+      error_message: "POST /v2/commands/submit-and-wait-for-transaction returned HTTP 503",
+    });
+    const { services, client } = makeServices({ store, scanRound: 100 });
+
+    await processAllRounds(services, FA_RIGHT, SYNC, silentLog);
+
+    expect(client.commandIds).toHaveLength(0);
+    const row = await store.getRow(100);
+    expect(row?.status).toBe("expired");
+    expect(row?.error_message).toContain("not retried");
+  });
+
+  it("a completion read that FAILS leaves the row unknown and says so", async () => {
+    const store = new FakeMarkerStore();
+    await seedPrev(store, 99, 1_000_000n);
+    const { services, traffic, client } = makeServices({ store, scanRound: 100, emitThrows: lost503() });
+    traffic.consumed = 1_600_000;
+    await processRound(100, 100, services, FA_RIGHT, SYNC, silentLog);
+    client.client.findCommandCompletions = vi.fn(async () => {
+      throw new CantonError("POST /v2/commands/completions returned HTTP 403", "HTTP_ERROR", 403);
+    });
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    await processAllRounds(services, FA_RIGHT, SYNC, log);
+
+    expect((await store.getRow(100))?.status).toBe("unknown");
+    expect(client.commandIds).toHaveLength(1);
+    expect(log.warn).toHaveBeenCalledWith(expect.objectContaining({ round: 100 }), expect.stringContaining("completion read failed"));
+  });
+
+  it("giving up on an unknown round is logged as an error", async () => {
+    const store = new FakeMarkerStore();
+    await seedPrev(store, 99, 1_000_000n);
+    const { services, traffic } = makeServices({ store, scanRound: 100, emitThrows: lost503() });
+    traffic.consumed = 1_600_000;
+    await processAllRounds(services, FA_RIGHT, SYNC, silentLog);
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    traffic.round = 113;
+    traffic.consumed = 2_000_000;
+
+    await processAllRounds(services, FA_RIGHT, SYNC, log);
+
+    expect(log.error).toHaveBeenCalledWith(expect.objectContaining({ round: 100 }), expect.stringContaining("gave up"));
+  });
+
+  it("emitted but the DB write failed: the row stays unknown and reconcile records it", async () => {
+    const store = new FakeMarkerStore();
+    await seedPrev(store, 99, 1_000_000n);
+    const { services, traffic, client } = makeServices({ store, scanRound: 100 });
+    traffic.consumed = 1_600_000;
+    const realUpdate = store.updateStatus.bind(store);
+    store.updateStatus = vi.fn(async (r: number, st: string, f?: MarkerRoundFields) => {
+      if (st === "emitted") throw new Error("db down");
+      return realUpdate(r, st, f);
+    }) as typeof store.updateStatus;
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    await processRound(100, 100, services, FA_RIGHT, SYNC, log);
+
+    expect((await store.getRow(100))?.status).toBe("unknown");
+    expect(log.error).toHaveBeenCalledWith(expect.objectContaining({ updateId: "upd-x402-round-marker-100" }), expect.stringContaining("recording it failed"));
+    store.updateStatus = realUpdate;
+    client.completions.push({ commandId: "x402-round-marker-100", submissionId: client.requests[0]!.submissionId!, updateId: "upd-x402-round-marker-100", offset: 5001 });
+    await processAllRounds(services, FA_RIGHT, SYNC, silentLog);
+    expect((await store.getRow(100))?.status).toBe("emitted");
+    expect(client.commandIds).toHaveLength(1);
+  });
+});
+
+describe("classifySubmitFailure", () => {
+  it.each([
+    ["DUPLICATE_COMMAND (409)", cantonHttpError(409, "DUPLICATE_COMMAND"), "duplicate"],
+    ["SUBMISSION_ALREADY_IN_FLIGHT (409)", cantonHttpError(409, "SUBMISSION_ALREADY_IN_FLIGHT"), "unknown"],
+    ["MEDIATOR_SAYS_TX_TIMED_OUT (409)", cantonHttpError(409, "MEDIATOR_SAYS_TX_TIMED_OUT"), "rejected"],
+    ["NOT_SEQUENCED_TIMEOUT (409)", cantonHttpError(409, "NOT_SEQUENCED_TIMEOUT"), "rejected"],
+    ["DAML_FAILURE (400)", rejected400(), "rejected"],
+    ["REQUEST_TIME_OUT (504)", cantonHttpError(504, "REQUEST_TIME_OUT"), "unknown"],
+    ["503 from the ingress", new CantonError("x", "HTTP_ERROR", 503, "upstream request timeout"), "unknown"],
+    ["408", cantonHttpError(408, "REQUEST_TIMEOUT"), "unknown"],
+    ["429 PARTICIPANT_BACKPRESSURE (refused before registration)", cantonHttpError(429, "PARTICIPANT_BACKPRESSURE"), "rejected"],
+    ["503 SERVICE_NOT_RUNNING (refused before registration)", cantonHttpError(503, "SERVICE_NOT_RUNNING"), "rejected"],
+    ["429 without an id", new CantonError("x", "HTTP_ERROR", 429, "slow down"), "unknown"],
+    ["409 whose id could not be read", new CantonError("x", "HTTP_ERROR", 409, "conflict"), "unknown"],
+    ["409 with a body cut by the 1 KiB cap", new CantonError("x", "HTTP_ERROR", 409, '{"code":"DUPLICATE_COMMAND","cause":"' + "x".repeat(2000)), "duplicate"],
+    ["client timeout", new CantonError("aborted", "TIMEOUT"), "unknown"],
+    ["network error", new Error("ECONNRESET"), "unknown"],
+  ])("%s → %s", (_name, err, expected) => {
+    expect(classifySubmitFailure(err)).toBe(expected);
   });
 });

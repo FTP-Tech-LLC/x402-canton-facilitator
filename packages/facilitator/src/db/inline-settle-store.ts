@@ -57,7 +57,15 @@ export type InlineSettleRecord =
    *  the ledger offset captured just before it was sent. Both may be absent on
    *  a row written by an older build — the caller then still refuses to relay,
    *  it just cannot resolve automatically. */
-  | { state: "dispatched"; submissionId?: string; beginExclusive?: number };
+  | {
+      state: "dispatched";
+      submissionId?: string;
+      beginExclusive?: number;
+      /** Id of the participant the submission went to (its normalized Ledger
+       *  API URL). The offset and the completion stream are local to it, so a
+       *  resolve must ask the same one. Absent on older rows. */
+      participant?: string;
+    };
 
 export interface InlineSettleStore {
   /** What we know about this transaction, or null if we have never seen it. */
@@ -70,7 +78,7 @@ export interface InlineSettleStore {
    */
   recordDispatched(
     txHashHex: string,
-    meta?: { submissionId?: string; beginExclusive?: number }
+    meta?: { submissionId?: string; beginExclusive?: number; participant?: string }
   ): Promise<boolean>;
   /**
    * Record `updateId` against `txHashHex`, promoting a "dispatched" row to
@@ -109,7 +117,13 @@ export function createInMemoryInlineSettleStore(
   // Insertion-ordered, which gives FIFO eviction for free.
   const rows = new Map<
     string,
-    { updateId: string | null; at: number; submissionId?: string; beginExclusive?: number }
+    {
+      updateId: string | null;
+      at: number;
+      submissionId?: string;
+      beginExclusive?: number;
+      participant?: string;
+    }
   >();
   const evict = (): void => {
     while (rows.size > maxSize) {
@@ -127,6 +141,7 @@ export function createInMemoryInlineSettleStore(
         state: "dispatched",
         ...(r.submissionId !== undefined ? { submissionId: r.submissionId } : {}),
         ...(r.beginExclusive !== undefined ? { beginExclusive: r.beginExclusive } : {}),
+        ...(r.participant !== undefined ? { participant: r.participant } : {}),
       };
     },
     async recordDispatched(txHashHex, meta) {
@@ -136,6 +151,7 @@ export function createInMemoryInlineSettleStore(
         at: now(),
         ...(meta?.submissionId !== undefined ? { submissionId: meta.submissionId } : {}),
         ...(meta?.beginExclusive !== undefined ? { beginExclusive: meta.beginExclusive } : {}),
+        ...(meta?.participant !== undefined ? { participant: meta.participant } : {}),
       });
       evict();
       return true;
@@ -210,6 +226,12 @@ export function createPostgresInlineSettleStore(
             []
           )
         )
+        .then(() =>
+          exec.query(
+            `ALTER TABLE inline_settles ADD COLUMN IF NOT EXISTS participant text`,
+            []
+          )
+        )
         .then(() => undefined);
       // Clear the memo on failure so a LATER call retries the DDL. Without this
       // one transient error — a restart, a failover, a saturated pool — leaves a
@@ -230,7 +252,7 @@ export function createPostgresInlineSettleStore(
       try {
         await ensure();
         const r = await exec.query(
-          `SELECT update_id, submission_id, begin_exclusive
+          `SELECT update_id, submission_id, begin_exclusive, participant
              FROM inline_settles WHERE tx_hash = $1`,
           [txHashHex]
         );
@@ -239,6 +261,7 @@ export function createPostgresInlineSettleStore(
               update_id?: string | null;
               submission_id?: string | null;
               begin_exclusive?: string | number | null;
+              participant?: string | null;
             }>
           | undefined;
         if (!rows || rows.length === 0) return null;
@@ -255,6 +278,7 @@ export function createPostgresInlineSettleStore(
           state: "dispatched" as const,
           ...(row.submission_id ? { submissionId: row.submission_id } : {}),
           ...(off !== undefined && Number.isFinite(off) ? { beginExclusive: off } : {}),
+          ...(row.participant ? { participant: row.participant } : {}),
         };
       } catch (err) {
         // Fail-open, and say plainly what that now costs. Before the dispatch
@@ -271,10 +295,10 @@ export function createPostgresInlineSettleStore(
       try {
         await ensure();
         const r = await exec.query(
-          `INSERT INTO inline_settles (tx_hash, update_id, submission_id, begin_exclusive)
-           VALUES ($1, NULL, $2, $3)
+          `INSERT INTO inline_settles (tx_hash, update_id, submission_id, begin_exclusive, participant)
+           VALUES ($1, NULL, $2, $3, $4)
            ON CONFLICT (tx_hash) DO NOTHING`,
-          [txHashHex, meta?.submissionId ?? null, meta?.beginExclusive ?? null]
+          [txHashHex, meta?.submissionId ?? null, meta?.beginExclusive ?? null, meta?.participant ?? null]
         );
         return (r.rowCount ?? 0) > 0;
       } catch (err) {

@@ -1154,7 +1154,7 @@ describe("MerchantContractService.findMerchantContract", () => {
 
     expect(capturedAcsBody).not.toBeNull();
     const partyFilter =
-      capturedAcsBody.filter.filtersByParty[FACILITATOR];
+      capturedAcsBody.eventFormat.filtersByParty[FACILITATOR];
     expect(partyFilter).toBeDefined();
     const cumulative = partyFilter.cumulative as any[];
     expect(cumulative.length).toBeGreaterThan(0);

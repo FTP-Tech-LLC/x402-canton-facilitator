@@ -1,7 +1,7 @@
 {
   "name": "@ftptech/x402-canton-facilitator",
   "private": true,
-  "version": "0.0.10",
+  "version": "0.0.12",
   "description": "x402 facilitator for Canton Network — /verify and /settle compliant with the x402 spec",
   "license": "Apache-2.0",
   "author": "FTP team",

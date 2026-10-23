@@ -76,6 +76,7 @@ export interface ValidationServices {
         | "merchantAllowlist"
         | "tokenRegistries"
         | "registryTrustedParties"
+        | "acceptedFeePayers"
       >
     | undefined;
   facilitatorParty: string;
@@ -267,6 +268,9 @@ async function validateTransferFactoryPath(
         : {}),
       ...(svc.inline?.registryTrustedParties
         ? { registryTrustedParties: svc.inline.registryTrustedParties }
+        : {}),
+      ...(svc.inline?.acceptedFeePayers?.length
+        ? { acceptedFeePayers: svc.inline.acceptedFeePayers }
         : {}),
     });
     if (!r.ok) {

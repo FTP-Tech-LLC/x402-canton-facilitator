@@ -1,8 +1,9 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import type { MerchantContractService } from "../canton/merchant-contract.js";
-import type { ScanClient } from "@ftptech/x402-canton-ledger";
+import type { CantonClient, ScanClient } from "@ftptech/x402-canton-ledger";
 import type { PreapprovalService } from "../canton/preapproval.js";
+import { createSlidingWindowLimiter } from "../rate-limit.js";
 
 /**
  * Merchant registration HTTP API.
@@ -33,6 +34,17 @@ export interface RegistryRouteServices {
   // `getTransferPreapprovalByParty` reads `expiresAt`, which the transfer-kind
   // resolve does not carry — see the preapproval-status route.
   scan: Pick<ScanClient, "resolveTransferKind" | "getTransferPreapprovalByParty">;
+  /** Instrument admin → DA Registry Utility base URL, for non-Amulet tokens
+   *  (FacilitatorConfig.tokenRegistries). Their preapproval is a registry
+   *  matter; the SV Scan answers for Canton Coin only. */
+  tokenRegistries?: Record<string, string> | undefined;
+  /** Ledger reads, for a registry token's TransferPreapproval contract. */
+  client?: Pick<CantonClient, "queryActiveContracts"> | undefined;
+  /** The participant hosting a party (participant-router.ts); the read goes
+   *  there. Absent: `client`. */
+  router?:
+    | { forParty(party: string): Promise<{ client: Pick<CantonClient, "queryActiveContracts"> }> }
+    | undefined;
   /** Probe sender for the resolve (any party works; the check is on receiver). */
   facilitatorParty: string;
   synchronizerId: string;
@@ -92,10 +104,32 @@ function authorizeOperator(
   return true;
 }
 
+/** A DA Registry Utility preapproval: the receiver lets that registrar's
+ *  instruments arrive one-shot. Created by the receiver itself (see the wallet
+ *  route preapproval/registry/self/prepare); the receiver is a stakeholder. */
+const REGISTRY_PREAPPROVAL_TEMPLATE =
+  "#utility-registry-app-v0:Utility.Registry.App.V0.Model.TransferPreapproval:TransferPreapproval";
+
+/** Does this allowance list cover instrument `id`? Empty covers every
+ *  instrument of the registrar (the shape our wallets create, proven by live
+ *  swaps); otherwise it has to name `id` somewhere. */
+function allowancesCover(allowances: unknown, id: string): boolean {
+  if (!Array.isArray(allowances) || allowances.length === 0) return true;
+  const names = (v: unknown): boolean =>
+    v !== null &&
+    typeof v === "object" &&
+    ((v as { id?: unknown }).id === id || Object.values(v as object).some(names));
+  return allowances.some(names);
+}
+
 export async function registerRegistryRoutes(
   app: FastifyInstance,
   svc: RegistryRouteServices
 ): Promise<void> {
+  // The registry preapproval check is a public GET that reads the ledger with
+  // the facilitator's rights; per caller IP and overall, so a loop of them
+  // cannot become a load on the participant.
+  const registryReadLimiter = createSlidingWindowLimiter({ maxPerPayer: 30, maxGlobal: 600, windowMs: 60_000 });
   app.post<{ Body: RegisterBody }>(
     "/v1/merchants/register",
     async (req, reply) => {
@@ -191,6 +225,92 @@ export async function registerRegistryRoutes(
     }
     const id = req.query.id ?? "Amulet";
     const now = Date.now();
+    // A registry token (USDCx, CBTC…) is not Canton Coin: the SV Scan knows
+    // Canton Coin only, and asked about another instrument it answered for the
+    // merchant's Canton Coin preapproval — what callers checking "our
+    // preapprovals per registry" used to get back.
+    const registryBaseUrl = svc.tokenRegistries?.[admin];
+    if (registryBaseUrl) {
+      // Not the registry's transfer-factory either: it answers only with the
+      // SENDER's real holdings as inputs ("No holdings provided"), and this
+      // facilitator holds none of a registry token. The preapproval is a
+      // contract the receiver is a stakeholder of, so read it — possible for a
+      // party this participant hosts (every wallet onboarded here).
+      const party = req.params.party;
+      if (!registryReadLimiter.allow(req.ip, Date.now())) {
+        return reply.status(429).send({ error: "too many preapproval checks; retry in a minute" });
+      }
+      try {
+        const reader = svc.router ? (await svc.router.forParty(party)).client : svc.client;
+        if (!reader) throw new Error("no ledger client");
+        const events = await reader.queryActiveContracts({
+          filtersByParty: {
+            [party]: {
+              cumulative: [
+                {
+                  identifierFilter: {
+                    TemplateFilter: {
+                      value: { templateId: REGISTRY_PREAPPROVAL_TEMPLATE, includeCreatedEventBlob: false },
+                    },
+                  },
+                },
+              ],
+            },
+          },
+        });
+        const has = events.some((e) => {
+          const a = e.createArgument as
+            | { receiver?: unknown; instrumentAdmin?: unknown; instrumentAllowances?: unknown }
+            | undefined;
+          return a?.receiver === party && a?.instrumentAdmin === admin && allowancesCover(a?.instrumentAllowances, id);
+        });
+        return reply.status(200).send({
+          merchant: party,
+          instrumentId: { admin, id },
+          transferKind: has ? "direct" : "offer",
+          hasPreapproval: has,
+          ...(has
+            ? {}
+            : {
+                guidance:
+                  `This party has no ${id} preapproval with its registry, so x402 ${id} ` +
+                  "payments to it resolve to a two-step Pending transfer and will not settle " +
+                  "in one round-trip. The party creates its own " +
+                  "Utility.Registry.App.V0.Model.TransferPreapproval (receiver = the party, " +
+                  "instrumentAdmin = the registrar) to enable atomic settlement.",
+              }),
+        });
+      } catch (err) {
+        const refused =
+          (err as { code?: unknown })?.code === "HTTP_ERROR" && (err as { status?: unknown })?.status === 403;
+        return reply.status(200).send({
+          merchant: party,
+          instrumentId: { admin, id },
+          transferKind: "unknown",
+          hasPreapproval: null,
+          note: refused
+            ? "This facilitator cannot read this party (it is not hosted on this participant, or " +
+              "the facilitator has no read rights for it), so its registry preapproval cannot be " +
+              `read here. A registry preapproval is a ${REGISTRY_PREAPPROVAL_TEMPLATE} contract ` +
+              "with the party as receiver and the registrar as instrumentAdmin: list it on a " +
+              "participant that can read the party."
+            : "The registry preapproval could not be read. hasPreapproval null does NOT mean " +
+              "there is none.",
+          ...(refused ? {} : { detail: (err instanceof Error ? err.message : String(err)).slice(0, 200) }),
+        });
+      }
+    }
+    if (id !== "Amulet") {
+      return reply.status(200).send({
+        merchant: req.params.party,
+        instrumentId: { admin, id },
+        transferKind: "unknown",
+        hasPreapproval: null,
+        note:
+          "No registry is configured on this facilitator for this instrument admin, so its " +
+          "preapproval cannot be checked here. hasPreapproval null does NOT mean there is none.",
+      });
+    }
     let transferKind: string;
     try {
       transferKind = await svc.scan.resolveTransferKind({

@@ -510,3 +510,94 @@ describe("a registry transfer is proven delivered by the standard's own result t
     ).toBeUndefined();
   });
 });
+
+describe("two participants: the payer's participant executes and is read, end to end", () => {
+  // Offsets and completion streams are local to a participant: the execute,
+  // the offset before it, the completion poll and the confirm read must all go
+  // to the same one — the one hosting the payer, or the one recorded for it.
+  function node() {
+    return {
+      getLedgerEnd: vi.fn(async () => ({ offset: 7 })),
+      interactiveSubmissionExecute: vi.fn(async () => ({ updateId: "" })),
+      pollCompletionUpdateId: vi.fn(async () => UPDATE),
+      findCompletion: vi.fn(async () => ({ kind: "absent" as const })),
+      getTransactionById: vi.fn(async () => ({ events: [] })),
+    };
+  }
+  function setup() {
+    const primary = node();
+    const secondary = node();
+    const P = { id: "https://node2", client: primary as never, userId: "node2-user" };
+    const S = { id: "https://node1", client: secondary as never, userId: "node1-user" };
+    const router = {
+      forParty: vi.fn(async (p: string) => (p === PAYER ? S : P)),
+      byId: (id: string) => [P, S].find((l) => l.id === id),
+    };
+    const tf = new TransferFactoryService({
+      client: primary as never,
+      scan: { resolveTransferKind: vi.fn() } as never,
+      facilitatorParty: "ftp::1220",
+      userId: "node2-user",
+      router,
+      confirmRetry: { attempts: 1, delayMs: 0 },
+    });
+    return { primary, secondary, tf };
+  }
+
+  it("executes, polls and confirms on the participant hosting the payer, as our user there", async () => {
+    const { primary, secondary, tf } = setup();
+    await tf.execute(input);
+    expect(secondary.getLedgerEnd).toHaveBeenCalled();
+    expect(secondary.interactiveSubmissionExecute).toHaveBeenCalled();
+    expect(secondary.pollCompletionUpdateId).toHaveBeenCalledWith("node1-user", PAYER, "sub-1", 7);
+    expect(secondary.getTransactionById).toHaveBeenCalled();
+    expect(primary.interactiveSubmissionExecute).not.toHaveBeenCalled();
+    expect(primary.getTransactionById).not.toHaveBeenCalled();
+  });
+
+  it("a recorded participant wins over the current hosting answer", async () => {
+    const { primary, secondary, tf } = setup();
+    await tf.execute({ ...input, participant: "https://node2", beginExclusive: 3 });
+    expect(primary.interactiveSubmissionExecute).toHaveBeenCalled();
+    expect(primary.pollCompletionUpdateId).toHaveBeenCalledWith("node2-user", PAYER, "sub-1", 3);
+    expect(secondary.interactiveSubmissionExecute).not.toHaveBeenCalled();
+  });
+
+  it("a missed outcome is looked up on the participant the submission went to", async () => {
+    const { primary, secondary, tf } = setup();
+    const r = await tf.resolveDispatched({ payer: "moved::1220bb", submissionId: "sub-2", beginExclusive: 5, participant: "https://node1" });
+    expect(r.state).toBe("unknown");
+    expect(secondary.findCompletion).toHaveBeenCalledWith("node1-user", "moved::1220bb", "sub-2", 5);
+    expect(primary.findCompletion).not.toHaveBeenCalled();
+  });
+
+  it("ledgerEndFor names the participant the offset belongs to", async () => {
+    const { tf } = setup();
+    expect(await tf.ledgerEndFor(PAYER)).toEqual({ offset: 7, participant: "https://node1" });
+  });
+
+  it("the recorded participant is an identity, so a primary/secondary swap still resolves on the right one", async () => {
+    // Recorded as node1 while node1 was the secondary; after the swap node1 is
+    // the primary. A role label would now point at node2 and search node1's
+    // offset there.
+    const { primary, secondary, tf } = setup();
+    await tf.resolveDispatched({ payer: "p::1220cc", submissionId: "sub-3", beginExclusive: 9, participant: "https://node1" });
+    expect(secondary.findCompletion).toHaveBeenCalledWith("node1-user", "p::1220cc", "sub-3", 9);
+    expect(primary.findCompletion).not.toHaveBeenCalled();
+  });
+
+  it("a submission recorded on a participant that is no longer configured stays unknown and asks no one else", async () => {
+    const { primary, secondary, tf } = setup();
+    const r = await tf.resolveDispatched({ payer: PAYER, submissionId: "sub-4", beginExclusive: 5, participant: "https://removed" });
+    expect(r).toEqual({ state: "unknown" });
+    expect(primary.findCompletion).not.toHaveBeenCalled();
+    expect(secondary.findCompletion).not.toHaveBeenCalled();
+  });
+
+  it("execute refuses an unconfigured participant before anything is submitted", async () => {
+    const { primary, secondary, tf } = setup();
+    await expect(tf.execute({ ...input, participant: "https://removed", beginExclusive: 3 })).rejects.toThrow(/not configured/);
+    expect(primary.interactiveSubmissionExecute).not.toHaveBeenCalled();
+    expect(secondary.interactiveSubmissionExecute).not.toHaveBeenCalled();
+  });
+});

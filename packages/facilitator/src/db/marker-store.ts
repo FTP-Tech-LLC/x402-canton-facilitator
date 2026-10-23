@@ -16,8 +16,28 @@ export interface MarkerRoundRow {
   weight: string | null;
   update_id: string | null;
   error_message: string | null;
+  /** The latest attempt's submissionId. Written BEFORE the submit. */
+  submission_id?: string | null;
+  /** Ledger offset taken before the first attempt; every retry deduplicates
+   *  against it and the completion lookup starts after it. */
+  dedup_offset?: bigint | string | null;
+  submitted_at?: Date | null;
   created_at: Date;
   updated_at: Date;
+}
+
+/** Fields updateStatus can set. */
+export interface MarkerRoundFields {
+  traffic_bytes?: bigint;
+  traffic_consumed?: bigint;
+  traffic_usd?: string;
+  weight?: string;
+  update_id?: string;
+  error_message?: string;
+  submission_id?: string;
+  dedup_offset?: bigint;
+  /** true: stamp submitted_at = now(). */
+  submitted?: boolean;
 }
 
 export interface MarkerStore {
@@ -35,14 +55,7 @@ export interface MarkerStore {
   updateStatus(
     roundNumber: number,
     status: string,
-    fields?: {
-      traffic_bytes?: bigint;
-      traffic_consumed?: bigint;
-      traffic_usd?: string;
-      weight?: string;
-      update_id?: string;
-      error_message?: string;
-    }
+    fields?: MarkerRoundFields
   ): Promise<void>;
 
   /** Highest round_number strictly below belowRound. */
@@ -56,6 +69,13 @@ export interface MarkerStore {
 
   /** Mark pending/failed rows with round_number < belowRound as expired. */
   expireRows(belowRound: number): Promise<void>;
+
+  /** `unknown` rows (submitted, outcome not yet known) with round_number >= minRound. */
+  getUnknown(minRound: number): Promise<MarkerRoundRow[]>;
+
+  /** Give up on `unknown` rows below belowRound: status expired, never
+   *  resubmitted. Returns the rows it gave up on, so each can be reported. */
+  expireUnknown(belowRound: number, reason: string): Promise<MarkerRoundRow[]>;
 }
 
 const DDL =
@@ -74,7 +94,12 @@ const DDL =
   // `total_consumed` snapshot whose delta drives the weight. Run as a second
   // statement in the same param-less init query so init stays one round-trip.
   // Idempotent (ADD COLUMN IF NOT EXISTS), mirrors attribution-store.ts.
-  "; ALTER TABLE marker_rounds ADD COLUMN IF NOT EXISTS traffic_consumed bigint";
+  "; ALTER TABLE marker_rounds ADD COLUMN IF NOT EXISTS traffic_consumed bigint" +
+  // Outcome tracking for a submit whose answer was lost (see the worker's
+  // `unknown` status). Additive and nullable: an older image ignores them.
+  "; ALTER TABLE marker_rounds ADD COLUMN IF NOT EXISTS submission_id text" +
+  "; ALTER TABLE marker_rounds ADD COLUMN IF NOT EXISTS dedup_offset bigint" +
+  "; ALTER TABLE marker_rounds ADD COLUMN IF NOT EXISTS submitted_at timestamptz";
 
 export function createPostgresMarkerStore(executor: PgExecutor): MarkerStore {
   let ready: Promise<void> | null = null;
@@ -147,6 +172,15 @@ export function createPostgresMarkerStore(executor: PgExecutor): MarkerStore {
         sets.push(`error_message=$${i++}`);
         params.push(fields.error_message);
       }
+      if (fields.submission_id !== undefined) {
+        sets.push(`submission_id=$${i++}`);
+        params.push(fields.submission_id);
+      }
+      if (fields.dedup_offset !== undefined) {
+        sets.push(`dedup_offset=$${i++}`);
+        params.push(fields.dedup_offset);
+      }
+      if (fields.submitted) sets.push("submitted_at=now()");
       await executor.query(
         `UPDATE marker_rounds SET ${sets.join(", ")} WHERE round_number=$1`,
         params
@@ -184,6 +218,30 @@ export function createPostgresMarkerStore(executor: PgExecutor): MarkerStore {
         "UPDATE marker_rounds SET status='expired', updated_at=now()" +
           " WHERE status IN ('pending','failed') AND round_number < $1",
         [belowRound]
+      );
+    },
+
+    async getUnknown(minRound) {
+      await init();
+      const r = await executor.query(
+        "SELECT * FROM marker_rounds WHERE status='unknown' AND round_number >= $1" +
+          " ORDER BY round_number ASC",
+        [minRound]
+      );
+      return (r.rows as (MarkerRoundRow & { round_number: string })[]).map(
+        (raw) => ({ ...raw, round_number: Number(raw.round_number) })
+      );
+    },
+
+    async expireUnknown(belowRound, reason) {
+      await init();
+      const r = await executor.query(
+        "UPDATE marker_rounds SET status='expired', error_message=$2, updated_at=now()" +
+          " WHERE status='unknown' AND round_number < $1 RETURNING *",
+        [belowRound, reason]
+      );
+      return (r.rows as (MarkerRoundRow & { round_number: string })[]).map(
+        (raw) => ({ ...raw, round_number: Number(raw.round_number) })
       );
     },
   };

@@ -874,7 +874,16 @@ export interface DecodedNode {
    *  party-leaf backstop cannot see. undefined for non-create nodes / a create
    *  carrying no decodable template / argument. */
   create?:
-    | { templateQualifiedName?: string | undefined; argument?: Uint8Array | undefined }
+    | {
+        templateQualifiedName?: string | undefined;
+        /** The created template's package id. Read by arms that pin WHICH
+         *  package a top-level create runs (see identifierPackageId). */
+        packageId?: string | undefined;
+        argument?: Uint8Array | undefined;
+        /** Create.signatories / stakeholders (also folded into partyMeta). */
+        signatories?: string[] | undefined;
+        stakeholders?: string[] | undefined;
+      }
     | undefined;
   /** node_id references this node declares as its children (Exercise.children /
    *  Rollback.children). Used to prove reachability from the single root so no
@@ -991,6 +1000,29 @@ function identifierQualifiedName(idBytes: Uint8Array): string | undefined {
 }
 
 /**
+ * The package id of an `Identifier` (structured field 1, or the leading segment
+ * of a flat "pkg:module:entity"), or undefined. Most arms deliberately ignore
+ * it (see identifierQualifiedName); it is read only where WHICH package runs is
+ * the whole question — a top-level create the agent authorizes alone.
+ */
+function identifierPackageId(idBytes: Uint8Array): string | undefined {
+  try {
+    const f = decodeMessage(idBytes);
+    const pkg = lenFieldUnique(f, ID_PACKAGE_ID, "Identifier.package_id");
+    if (pkg !== undefined) return utf8(pkg);
+    if (f.some((x) => x.field === ID_MODULE_NAME || x.field === ID_ENTITY_NAME)) return undefined;
+  } catch {
+    /* flat string form below */
+  }
+  try {
+    const parts = utf8(idBytes).split(":");
+    return parts.length >= 3 && parts[0] ? parts[0] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Decode the inner `transaction.v1.Node` (the node_type oneof). Returns the
  * single set member and the per-kind payload we validate. A node that sets NO
  * known member, or MORE THAN ONE, is reported as `kind: undefined` so the
@@ -1008,9 +1040,7 @@ function identifierQualifiedName(idBytes: Uint8Array): string | undefined {
 function decodeV1Node(v1Body: Uint8Array): {
   kind?: NodeKind | undefined;
   exercise?: DecodedExercise | undefined;
-  create?:
-    | { templateQualifiedName?: string | undefined; argument?: Uint8Array | undefined }
-    | undefined;
+  create?: DecodedNode["create"];
   children: string[];
   values: Uint8Array[];
   partyMeta: string[];
@@ -1084,7 +1114,10 @@ function decodeV1Node(v1Body: Uint8Array): {
       // the party-leaf backstop cannot see.
       create: {
         templateQualifiedName: cTmpl !== undefined ? identifierQualifiedName(cTmpl) : undefined,
+        packageId: cTmpl !== undefined ? identifierPackageId(cTmpl) : undefined,
         argument: arg,
+        signatories: stringFields(cFields, CREATE_SIGNATORIES),
+        stakeholders: stringFields(cFields, CREATE_STAKEHOLDERS),
       },
       children: [],
       values: arg !== undefined ? [arg] : [],
@@ -1735,6 +1768,41 @@ export interface DecodedInputContract {
 interface TaggedLeaves {
   templateQualifiedName: string | undefined;
   parties: string[];
+  /** Input contracts only: the contract's signatories, authenticated with it. */
+  signatories?: string[];
+}
+
+/** `module:entity` of the DA Registry Utility instrument configuration. */
+const REGISTRY_INSTRUMENT_CONFIGURATION_TEMPLATE =
+  "Utility.Registry.V0.Configuration.Instrument:InstrumentConfiguration";
+
+/**
+ * Whether an input contract is the instrument configuration of the pinned
+ * registrar: the DA Registry Utility `InstrumentConfiguration`, signed by
+ * `admin`.
+ *
+ * The registry passes this contract to every transfer of its token. Its
+ * argument names parties that hold no value in the transfer: the registrar's
+ * app-reward beneficiaries and credential issuers. The registrar changes them
+ * at will (CBTC replaced `cbtc-beneficiary` with `cbtc-beneficiary-2` on
+ * 2026-10-14), so a fixed list of them breaks every transfer of the token at
+ * the next change. An input contract is authenticated against its contract id
+ * at execution, signatories included, so a relay cannot forge one signed by the
+ * registrar. Its parties are therefore admitted in that contract's own argument
+ * and nowhere else: an owner or recipient position still rejects them.
+ *
+ * @internal Exported for tests.
+ */
+export function isRegistrarInstrumentConfiguration(
+  templateQualifiedName: string | undefined,
+  signatories: readonly string[] | undefined,
+  admin: string
+): boolean {
+  return (
+    templateQualifiedName === REGISTRY_INSTRUMENT_CONFIGURATION_TEMPLATE &&
+    signatories !== undefined &&
+    signatories.includes(admin)
+  );
 }
 
 interface SplitPartyLeaves {
@@ -1804,7 +1872,11 @@ function collectSplitPartyLeaves(decoded: DecodedPrepared, rootNodeId: string): 
     const parties: string[] = [];
     collectPartyLeaves(ic.argument, parties, 0);
     if (parties.length > 0) {
-      inputArgs.push({ templateQualifiedName: ic.templateQualifiedName, parties });
+      inputArgs.push({
+        templateQualifiedName: ic.templateQualifiedName,
+        parties,
+        signatories: ic.signatories,
+      });
     }
   }
   // Metadata.input_contracts Create signatories/stakeholders/key (also SIGNED via
@@ -1938,8 +2010,17 @@ function assertNoForeignParties(
     }
   }
   // Authenticated input-contract ARGUMENTS. Same rule; the provider is admitted
-  // only inside the preapproval it provides and its own featured-app right.
+  // only inside the preapproval it provides and its own featured-app right, and
+  // the pinned registrar's own instrument configuration is admitted whole (see
+  // isRegistrarInstrumentConfiguration).
   for (const bucket of leaves.inputArgs) {
+    if (
+      adminDso !== undefined &&
+      adminDsoTrusted &&
+      isRegistrarInstrumentConfiguration(bucket.templateQualifiedName, bucket.signatories, adminDso)
+    ) {
+      continue;
+    }
     for (const p of bucket.parties) {
       if (allowed.has(p)) continue;
       if (adminDso !== undefined && adminDsoTrusted && p === adminDso) continue;
@@ -2621,6 +2702,20 @@ const EVENT_LOG_HOLDINGS_CHANGE = {
   templates: [
     "Splice.ExternalPartyConfigState:ExternalPartyConfigState",
     "Splice.AmuletEventLog:AmuletEventLog",
+    // DA Registry Utility Holding (splice utility bundle 0.14.4 / holding-v0 0.3.2):
+    // after that bundle, a registry-token transfer emits the SAME token-standard
+    // `EventLog_HoldingsChange` accounting event on the registrar's Holding template,
+    // not just the Amulet ones. It is the same virtual `EventLog` interface method,
+    // implemented by DA's audited registry-utility package (the same family whose
+    // value-moving choices `TransferRule_DirectTransfer` / `AllocationFactory_
+    // TransferInternal` we already trust). Value is bound independently of this node:
+    // the single pinned root `TransferFactory_Transfer` fixes amount/sender/receiver/
+    // instrument, every create is pinned to the owner's Holdings (+ at most one offer),
+    // the foreign-party backstop scans all leaves, and any consuming effect surfaces
+    // as the already-allowed `Archive` — so an observability event here cannot move or
+    // re-own funds. Leaving it out rejects EVERY registry-token SEND from a participant
+    // on 0.14.4 (token->CC swaps, registry withdrawals, token x402 payments).
+    "Utility.Registry.Holding.V0.Holding:Holding",
   ],
 } as const;
 
@@ -3311,5 +3406,1027 @@ export function assertPreparedRegistrySelfPreapproval(
     true /* admin is caller-intent, independently trusted */,
     undefined /* no Amulet preapproval-provider role here */,
     expect.trustedRegistryParties ?? new Set()
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Amulet SELF-PREAPPROVAL — verify-before-sign for
+ * `AmuletRules_CreateTransferPreapproval` built by the relay for a merchant
+ * that is BOTH provider and receiver.
+ *
+ * THREAT MODEL: the relay is MALICIOUS. Unlike the registry create above, this
+ * is a CHOICE, and it spends the merchant's own Amulet for the fee. Checking
+ * only the choice NAME proves nothing about the code that runs: any package can
+ * declare a choice called `AmuletRules_CreateTransferPreapproval`, and a body
+ * that runs under the merchant's signature can move the merchant's Amulet
+ * anywhere. So, mirroring the other arms:
+ *   - the root is exactly that choice ON `Splice.AmuletRules:AmuletRules`;
+ *   - every other exercise is one of the consequences the honest choice emits,
+ *     each pinned to its template (measured on two MainNet captures: without
+ *     and with fee inputs);
+ *   - creates are only the preapproval, the merchant's Amulet change, and the
+ *     validator reward coupon — and an Amulet created here must name the
+ *     merchant (change goes back to it);
+ *   - act_as is exactly the merchant; receiver and provider are the merchant;
+ *     `expiresAt` equals what the relay stated, when given;
+ *   - the all-nodes party backstop: the only parties anywhere are the merchant
+ *     and the out-of-band-trusted DSO.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+const AMULET_RULES_TEMPLATE = "Splice.AmuletRules:AmuletRules";
+const AMULET_SELF_PREAPPROVAL_CHOICE = "AmuletRules_CreateTransferPreapproval";
+const AMULET_SELF_PREAPPROVAL_CONSEQUENCES: readonly ConsequenceChoiceRule[] = [
+  { choiceId: "Archive", templates: ["Splice.Amulet:Amulet"] },
+  { choiceId: "EventLog_HoldingsChange", templates: [AMULET_RULES_TEMPLATE] },
+  { choiceId: "OpenMiningRound_Fetch", templates: ["Splice.Round:OpenMiningRound"] },
+];
+const AMULET_TEMPLATE = "Splice.Amulet:Amulet";
+const AMULET_SELF_PREAPPROVAL_CREATES: ReadonlySet<string> = new Set([
+  "Splice.AmuletRules:TransferPreapproval",
+  AMULET_TEMPLATE,
+  "Splice.Amulet:ValidatorRewardCoupon",
+]);
+
+export interface AmuletSelfPreapprovalExpectation {
+  /** The merchant: act_as, receiver and provider. */
+  party: string;
+  /** The network's DSO, from an OUT-OF-BAND source (never the relay). It signs
+   *  AmuletRules and the round contracts, so it appears throughout an honest
+   *  tree; admitting it is safe only because it is pinned. */
+  dso: string;
+  /** The relay's own statement of the expiry it built; bound to the bytes. */
+  expectedExpiresAt?: string;
+}
+
+/** Assert the relay-prepared transaction is EXACTLY this merchant's Amulet
+ *  self-preapproval. Throws PreparedTransferMismatchError otherwise. Call
+ *  BEFORE signing. */
+export function assertPreparedAmuletSelfPreapproval(
+  preparedTransactionB64: string,
+  expect: AmuletSelfPreapprovalExpectation
+): void {
+  const decoded = decodePrepared(preparedTransactionB64);
+  const { exercise: root, rootNodeId } = assertSingleAllowedRootExercise(
+    decoded,
+    AMULET_SELF_PREAPPROVAL_CHOICE,
+    "self-preapproval",
+    AMULET_SELF_PREAPPROVAL_CONSEQUENCES
+  );
+  assertTemplateMatches(root, AMULET_RULES_TEMPLATE);
+  assertActAsIsSender(decoded.actAs, expect.party);
+
+  for (const node of decoded.nodes) {
+    if (node.create === undefined) continue;
+    const tmpl = node.create.templateQualifiedName;
+    if (tmpl === undefined || !AMULET_SELF_PREAPPROVAL_CREATES.has(tmpl)) {
+      throw new PreparedTransferMismatchError(
+        `self-preapproval creates ${JSON.stringify(tmpl ?? null)} — refusing to sign (it may only ` +
+          `create the preapproval, the merchant's Amulet change and the validator reward coupon)`
+      );
+    }
+    if (tmpl === AMULET_TEMPLATE) {
+      if (node.create.argument === undefined) {
+        throw new PreparedTransferMismatchError(
+          "self-preapproval creates an Amulet whose argument could not be decoded — refusing to sign"
+        );
+      }
+      const leaves: string[] = [];
+      collectPartyLeaves(node.create.argument, leaves, 0);
+      if (!leaves.includes(expect.party)) {
+        throw new PreparedTransferMismatchError(
+          `self-preapproval creates an Amulet that does not name the merchant — refusing to sign ` +
+            `(the only Amulet this choice creates is the merchant's own change)`
+        );
+      }
+    }
+  }
+
+  const arg = extractSelfPreapproval(root.chosenValue);
+  for (const [field, value] of [
+    ["receiver", arg.receiver],
+    ["provider", arg.provider],
+  ] as const) {
+    if (value !== expect.party) {
+      throw new PreparedTransferMismatchError(
+        `self-preapproval verify: choice argument ${field} is ${JSON.stringify(value)}, not ` +
+          `${JSON.stringify(expect.party)} — refusing to sign (this would pay to create a ` +
+          `preapproval for somebody else)`
+      );
+    }
+  }
+  if (expect.expectedExpiresAt !== undefined) {
+    const wantMs = Date.parse(expect.expectedExpiresAt);
+    if (!Number.isFinite(wantMs)) {
+      throw new PreparedTransferMismatchError(
+        `self-preapproval verify: expected expiresAt ${JSON.stringify(expect.expectedExpiresAt)} is ` +
+          `not a parseable timestamp — refusing to sign`
+      );
+    }
+    // Daml `Time` is µs since epoch; the expectation is milliseconds.
+    const wantMicros = (BigInt(wantMs) * 1000n).toString();
+    if (arg.expiresAtMicros !== wantMicros) {
+      throw new PreparedTransferMismatchError(
+        `self-preapproval verify: choice argument expiresAt is ${arg.expiresAtMicros}µs but ` +
+          `${wantMicros}µs was stated (${expect.expectedExpiresAt}) — refusing to sign`
+      );
+    }
+  }
+
+  // DSO-AUTHORED NETWORK STATE is not a party list of this transaction.
+  // AmuletRules and the mining rounds are input contracts whose only signatory
+  // and stakeholder is the (pinned) DSO; the participant authenticates them at
+  // execute, so the relay cannot forge one, and the parties inside their
+  // arguments are network configuration (e.g. AmuletRules names the
+  // development-fund manager), not destinations of the merchant's funds. Only
+  // such contracts are set aside; anything else the merchant co-signs, or that
+  // names another stakeholder, stays in the backstop.
+  const isDsoState = (c: DecodedInputContract): boolean =>
+    c.signatories.length > 0 &&
+    c.signatories.every((p) => p === expect.dso) &&
+    c.stakeholders.every((p) => p === expect.dso);
+  const leaves = collectSplitPartyLeaves(
+    { ...decoded, inputContracts: decoded.inputContracts.filter((c) => !isDsoState(c)) },
+    rootNodeId
+  );
+  assertNoForeignParties(
+    leaves,
+    new Set([expect.party]),
+    expect.dso,
+    1 /* expectedDso in the root argument */,
+    true /* the DSO is caller-pinned, out of band */
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Tradecraft QUEUED orders — verify-before-sign for the four transactions an
+ * agent signs to trade through committed allocations instead of a pool-address
+ * transfer (Tradecraft DAR 1.3.12, integration guide 3.3):
+ *
+ *   1. `AMMRules_CreateSwapOrderBatcher`    — once per agent; moves no value.
+ *   2. `AMMRules_CreateSettlementAllocation` — once per agent, pool and
+ *      instrument; LOCKS the agent's holdings in a committed token-standard V2
+ *      allocation that only the venue can settle or cancel. The money-critical
+ *      one.
+ *   3. `SwapOrderBatcher_CreateOrdersV2`     — the trades: pure intent, no
+ *      token moves in this transaction (the venue fills and settles later in
+ *      its own transaction, inside the allocations).
+ *   4. a plain create of `SettlementWithdrawalRequest` — asks the venue to
+ *      release an allocation back to the wallet; moves no value itself.
+ *
+ * THREAT MODEL: the relay is MALICIOUS. Every rule below is read from the
+ * signed bytes and compared with caller intent; the venue and vault parties
+ * are wallet constants, never relay data. All shapes, field orders and
+ * templates were MEASURED on real MainNet prepared transactions (2026-10-17,
+ * fixtures `mainnet-tc-*.b64`), and agree with the DAR's declared orders.
+ *
+ * THE TRUST WE CANNOT REMOVE: once funded, a committed allocation is settled by
+ * its executor, the venue. Verify proves the executor IS the pinned venue (not
+ * a relay-chosen party), that the allocation is the agent's own, and that the
+ * locked holdings stay owned by the agent; it cannot prove what the venue will
+ * do with its executor right. That trust is the queued mode's design.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+const TC_AMM_RULES_TEMPLATE = "Obsidian.CantonSwap.V3:AMMRules";
+const TC_AMM_TEMPLATE = "TC.V4:AMM";
+const TC_BATCHER_TEMPLATE = "TC.V4.OrderBatch:SwapOrderBatcher";
+const TC_SWAP_ORDER_TEMPLATE = "TC.V4.SwapOrderV2:SwapOrder";
+const TC_WITHDRAWAL_REQUEST_TEMPLATE = "TC.V4.Settle.WithdrawalRequest:SettlementWithdrawalRequest";
+const AMULET_ALLOCATION_V2_TEMPLATE = "Splice.AmuletAllocationV2:AmuletAllocationV2";
+const REGISTRY_ALLOCATION_V2_TEMPLATE = "Utility.Registry.V0.Holding.AllocationV2:AllocationV2";
+const LOCKED_AMULET_TEMPLATE = "Splice.Amulet:LockedAmulet";
+const EXTERNAL_PARTY_AMULET_RULES_TEMPLATE = "Splice.ExternalPartyAmuletRules:ExternalPartyAmuletRules";
+const REGISTRY_ALLOCATION_FACTORY_TEMPLATE =
+  "Utility.Registry.App.V0.Service.AllocationFactory:AllocationFactory";
+/** Allocation metadata keys Tradecraft binds an allocation to its pool with. */
+const TC_META_AMM_ID = "tradecraft.fi/amm-id";
+const TC_META_INSTRUMENT_ID = "tradecraft.fi/instrument-id";
+
+/** The two Tradecraft operator parties, both WALLET CONSTANTS: `venue` is the
+ *  sole settlement executor and signs the AMM contracts with `vault`. */
+export interface TradecraftParties {
+  venue: string;
+  vault: string;
+}
+
+interface TcCommon {
+  /** The agent: act_as, order actor, allocation owner. */
+  party: string;
+  tradecraft: TradecraftParties;
+  synchronizerId?: string;
+  nowMs?: number;
+}
+
+/** Field `position` (Daml declaration order) of a record, cross-checked against
+ *  its label; absent ⇒ refuse. */
+function tcField(entries: RecordEntry[], position: number, label: string, what: string): Uint8Array {
+  const e = entryByDeclOrder(entries, position, label);
+  if (e === undefined) {
+    throw new PreparedDecodeError(`${what}: record has no field ${JSON.stringify(label)} at position ${position}`);
+  }
+  return e.value;
+}
+
+function tcLeaf(value: Uint8Array, kind: Leaf["kind"], what: string): string {
+  const leaf = leafOf(value);
+  if (!leaf || leaf.kind !== kind) throw new PreparedDecodeError(`${what} is not a ${kind}`);
+  return leaf.value;
+}
+
+/** `Value.optional`: the inner Value, or null for None. Refuses a non-optional. */
+function tcOptional(value: Uint8Array, what: string): Uint8Array | null {
+  assertSingleValueMember(value);
+  const opt = lenFieldUnique(decodeMessage(value), V_OPTIONAL, "Value.optional");
+  if (opt === undefined) throw new PreparedDecodeError(`${what} is not an optional`);
+  return lenFieldUnique(decodeMessage(opt), OPTIONAL_VALUE, "Optional.value") ?? null;
+}
+
+function tcList(value: Uint8Array, what: string): Uint8Array[] {
+  assertSingleValueMember(value);
+  const list = lenFieldUnique(decodeMessage(value), V_LIST, "Value.list");
+  if (list === undefined) throw new PreparedDecodeError(`${what} is not a list`);
+  return lenFields(decodeMessage(list), LIST_ELEMENTS);
+}
+
+/** `Value.text_map` as ordered entries; a duplicate key is refused. */
+function tcTextMap(value: Uint8Array, what: string): Map<string, Uint8Array> {
+  assertSingleValueMember(value);
+  const tm = lenFieldUnique(decodeMessage(value), V_TEXT_MAP, "Value.text_map");
+  if (tm === undefined) throw new PreparedDecodeError(`${what} is not a text map`);
+  const out = new Map<string, Uint8Array>();
+  for (const entry of lenFields(decodeMessage(tm), TEXT_MAP_ENTRIES)) {
+    const ef = decodeMessage(entry);
+    const key = lenFieldUnique(ef, TM_KEY, "TextMap.Entry.key");
+    const val = lenFieldUnique(ef, TM_VALUE, "TextMap.Entry.value");
+    if (val === undefined) throw new PreparedDecodeError(`${what} has an entry without a value`);
+    const k = key !== undefined ? utf8(key) : "";
+    if (out.has(k)) throw new PreparedDecodeError(`${what} carries key ${JSON.stringify(k)} twice`);
+    out.set(k, val);
+  }
+  return out;
+}
+
+/** A Daml `Bool`: the Value must be exactly one varint `Value.bool`. */
+function tcBool(value: Uint8Array, what: string): boolean {
+  const fields = decodeMessage(value);
+  const b = fields[0];
+  if (fields.length !== 1 || b === undefined || b.field !== V_BOOL || b.wire !== WIRE_VARINT) {
+    throw new PreparedDecodeError(`${what} is not a bool`);
+  }
+  return b.varint === 1;
+}
+
+function tcContractId(value: Uint8Array, what: string): string {
+  assertSingleValueMember(value);
+  const cid = lenFieldUnique(decodeMessage(value), V_CONTRACT_ID, "Value.contract_id");
+  if (cid === undefined) throw new PreparedDecodeError(`${what} is not a contract id`);
+  return utf8(cid);
+}
+
+/** `Value.variant`: constructor name + inner Value. */
+function tcVariant(value: Uint8Array, what: string): { constructor: string; value: Uint8Array } {
+  assertSingleValueMember(value);
+  const variant = lenFieldUnique(decodeMessage(value), V_VARIANT, "Value.variant");
+  if (variant === undefined) throw new PreparedDecodeError(`${what} is not a variant`);
+  const vf = decodeMessage(variant);
+  const cons = lenFieldUnique(vf, 2, "Variant.constructor");
+  const inner = lenFieldUnique(vf, VARIANT_VALUE, "Variant.value");
+  if (cons === undefined || inner === undefined) throw new PreparedDecodeError(`${what} is a malformed variant`);
+  return { constructor: utf8(cons), value: inner };
+}
+
+function tcRefuse(what: string, detail: string): never {
+  throw new PreparedTransferMismatchError(`tradecraft ${what}: ${detail} — refusing to sign`);
+}
+
+function sameParties(a: readonly string[], b: readonly string[]): boolean {
+  const sa = new Set(a);
+  const sb = new Set(b);
+  return sa.size === sb.size && [...sa].every((p) => sb.has(p));
+}
+
+/** Instrument {admin, id} must equal intent. */
+function tcAssertInstrument(
+  value: Uint8Array,
+  want: { admin: string; id: string },
+  what: string,
+  field: string
+): void {
+  const got = readInstrument(value);
+  if (got.admin !== want.admin || got.id !== want.id) {
+    tcRefuse(what, `${field} is ${JSON.stringify(got)}, not ${JSON.stringify(want)}`);
+  }
+}
+
+/** Numeric must equal intent (canonical 10-dp comparison). */
+function tcAssertAmount(value: Uint8Array, want: string, what: string, field: string): void {
+  const got = tcLeaf(value, "numeric", `${what} ${field}`);
+  if (canonicalAmount(got) !== canonicalAmount(want)) {
+    tcRefuse(what, `${field} is ${got}, not ${want}`);
+  }
+}
+
+/** Token-standard V2 `Account` {owner: Optional Party, provider: Optional Party,
+ *  id: Text} must be the agent's plain account: owner = agent, no provider,
+ *  empty id (the shape Tradecraft documents and the registries issue). */
+function tcAssertOwnAccount(value: Uint8Array, party: string, what: string, field: string): void {
+  const e = recordEntries(value);
+  const owner = tcOptional(tcField(e, 0, "owner", `${what} ${field}`), `${what} ${field}.owner`);
+  const provider = tcOptional(tcField(e, 1, "provider", `${what} ${field}`), `${what} ${field}.provider`);
+  const id = tcLeaf(tcField(e, 2, "id", `${what} ${field}`), "text", `${what} ${field}.id`);
+  if (owner === null || tcLeaf(owner, "party", `${what} ${field}.owner`) !== party) {
+    tcRefuse(what, `${field}.owner is not this wallet`);
+  }
+  if (provider !== null) tcRefuse(what, `${field}.provider is set (expected none)`);
+  if (id !== "") tcRefuse(what, `${field}.id is ${JSON.stringify(id)} (expected empty)`);
+}
+
+/** The exercised root must be an AUTHENTICATED input contract of `template`
+ *  whose signatories are exactly `signatories`. Input contracts are verified
+ *  against their contract id at execution, signatories included, so a relay
+ *  cannot substitute a look-alike contract from another package or party. */
+function tcAssertRootContract(
+  decoded: DecodedPrepared,
+  root: DecodedExercise,
+  template: string,
+  signatories: readonly string[],
+  what: string
+): DecodedInputContract {
+  assertTemplateMatches(root, template);
+  const ic = decoded.inputContracts.filter((c) => c.contractId !== undefined && c.contractId === root.contractId);
+  if (ic.length !== 1 || ic[0]?.templateQualifiedName !== template) {
+    tcRefuse(what, `the exercised ${template} is not exactly one disclosed input contract`);
+  }
+  const c = ic[0] as DecodedInputContract;
+  if (!sameParties(c.signatories, signatories)) {
+    tcRefuse(
+      what,
+      `the exercised ${template} is signed by ${JSON.stringify(c.signatories)}, not ` +
+        `${JSON.stringify(signatories)}`
+    );
+  }
+  return c;
+}
+
+/** Input contracts that are pure operator/network state: signed (and only
+ *  stakeheld) by a fixed, pinned set. Their arguments name parties that hold no
+ *  value in this transaction (AMMRules lists every pool's instrument admins;
+ *  DSO rules name network configuration), so they are set aside before the
+ *  backstop, exactly like the DSO state in the Amulet self-preapproval. */
+function isStateOf(signers: readonly string[]): (c: DecodedInputContract) => boolean {
+  return (c) =>
+    c.signatories.length > 0 &&
+    sameParties(c.signatories, signers) &&
+    c.stakeholders.every((p) => signers.includes(p));
+}
+
+/** How far max_ledger_effective_time may already lie behind `now`. The
+ *  Tradecraft choices read the ledger time (`createdAt`), so the participant
+ *  bounds max_ledger_effective_time at the prepare instant itself (measured:
+ *  equal to preparation_time on every MainNet capture) and the command still
+ *  commits within the synchronizer's ledger/record-time tolerance — they
+ *  executed 3–8 s after prepare. A lapsed bound can only make the command
+ *  fail, never move value, so the grace is a liveness allowance, not a trust. */
+const TC_LET_GRACE_MS = 120_000;
+
+/** Common tail: act_as, synchronizer, timing. Timing is the shared rule with
+ *  max_ledger_effective_time relaxed by TC_LET_GRACE_MS (see above). */
+function tcAssertEnvelope(decoded: DecodedPrepared, expect: TcCommon): void {
+  assertActAsIsSender(decoded.actAs, expect.party);
+  assertSynchronizerMatches(decoded.synchronizerId, expect.synchronizerId);
+  const nowMs = expect.nowMs ?? Date.now();
+  const maxLet = microsToMs(decoded.maxLedgerEffectiveTime);
+  if (Number.isFinite(maxLet) && maxLet <= nowMs - TC_LET_GRACE_MS) {
+    throw new PreparedTransferMismatchError(
+      `relay-prepared transaction max_ledger_effective_time (${new Date(maxLet).toISOString()}) ` +
+        `is already in the past — refusing to sign`
+    );
+  }
+  assertTimingPlausible({ ...decoded, maxLedgerEffectiveTime: undefined }, nowMs);
+}
+
+// ── 1. SwapOrderBatcher ────────────────────────────────────────────────────
+
+export type TcCreateBatcherExpectation = TcCommon;
+
+/** Assert the relay-prepared transaction is EXACTLY this agent's
+ *  `AMMRules_CreateSwapOrderBatcher`: one `SwapOrderBatcher` {actor = agent,
+ *  venue, vault}, nothing else. Call BEFORE signing. */
+export function assertPreparedTcCreateBatcher(
+  preparedTransactionB64: string,
+  expect: TcCreateBatcherExpectation
+): void {
+  const what = "create-batcher";
+  const { venue, vault } = expect.tradecraft;
+  const decoded = decodePrepared(preparedTransactionB64);
+  const { exercise: root, rootNodeId } = assertSingleAllowedRootExercise(
+    decoded,
+    "AMMRules_CreateSwapOrderBatcher"
+  );
+  tcAssertRootContract(decoded, root, TC_AMM_RULES_TEMPLATE, [venue, vault], what);
+  const actor = tcLeaf(tcField(recordEntries(root.chosenValue), 0, "actor", what), "party", `${what} actor`);
+  if (actor !== expect.party) tcRefuse(what, `actor is ${JSON.stringify(actor)}, not this wallet`);
+
+  const creates = decoded.nodes.filter((n) => n.kind === "create");
+  if (creates.length !== 1 || creates[0]?.create?.templateQualifiedName !== TC_BATCHER_TEMPLATE) {
+    tcRefuse(what, "it must create exactly one SwapOrderBatcher");
+  }
+  tcAssertBatcherArgs(creates[0]?.create?.argument, expect, what);
+
+  tcAssertEnvelope(decoded, expect);
+  const leaves = collectSplitPartyLeaves(
+    { ...decoded, inputContracts: decoded.inputContracts.filter((c) => !isStateOf([venue, vault])(c)) },
+    rootNodeId
+  );
+  assertNoForeignParties(leaves, new Set([expect.party, venue, vault]), undefined, 0, false);
+}
+
+/** SwapOrderBatcher {actor, venue, vault} (declaration order). */
+function tcAssertBatcherArgs(arg: Uint8Array | undefined, expect: TcCommon, what: string): void {
+  if (arg === undefined) tcRefuse(what, "the SwapOrderBatcher argument could not be decoded");
+  const e = recordEntries(arg);
+  const got = [
+    tcLeaf(tcField(e, 0, "actor", what), "party", `${what} batcher.actor`),
+    tcLeaf(tcField(e, 1, "venue", what), "party", `${what} batcher.venue`),
+    tcLeaf(tcField(e, 2, "vault", what), "party", `${what} batcher.vault`),
+  ];
+  const want = [expect.party, expect.tradecraft.venue, expect.tradecraft.vault];
+  if (got.some((p, i) => p !== want[i])) {
+    tcRefuse(what, `SwapOrderBatcher is ${JSON.stringify(got)}, not ${JSON.stringify(want)}`);
+  }
+}
+
+// ── 2. Committed settlement allocation ─────────────────────────────────────
+
+export interface TcCreateAllocationExpectation extends TcCommon {
+  /** The pool, as Tradecraft's /pools `lp_token_name` (e.g. "TC CBTC/CC LP"). */
+  ammId: string;
+  /** One of the pool's instruments. */
+  instrument: { admin: string; id: string };
+  /** Amount to lock; undefined ⇒ an empty receiving allocation. */
+  funding?: string;
+  /** The network's DSO, OUT OF BAND (Canton Coin allocations run on DSO rules). */
+  dso: string;
+  /** Out-of-band trusted registry infrastructure parties for `instrument`. */
+  trustedRegistryParties?: ReadonlySet<string>;
+}
+
+/** Consequences of `AMMRules_CreateSettlementAllocation`, measured on MainNet
+ *  (Canton Coin funded; CBTC empty and funded). The allocation factory is an
+ *  INTERFACE, so its choices are pinned to the two audited implementations:
+ *  DSO's `ExternalPartyAmuletRules` and DA's registry `AllocationFactory`. */
+const TC_ALLOCATION_CONSEQUENCES: readonly ConsequenceChoiceRule[] = [
+  {
+    choiceId: "AllocationFactory_PublicFetch",
+    templates: [EXTERNAL_PARTY_AMULET_RULES_TEMPLATE, REGISTRY_ALLOCATION_FACTORY_TEMPLATE],
+  },
+  {
+    choiceId: "AllocationFactory_Allocate",
+    templates: [EXTERNAL_PARTY_AMULET_RULES_TEMPLATE, REGISTRY_ALLOCATION_FACTORY_TEMPLATE],
+  },
+  { choiceId: "Archive", templates: [AMULET_TEMPLATE, REGISTRY_HOLDING_TEMPLATE] },
+  EVENT_LOG_HOLDINGS_CHANGE,
+];
+
+/** Assert the relay-prepared transaction is EXACTLY this agent's committed
+ *  allocation for `ammId`/`instrument`, funded with `funding` (or empty), with
+ *  the pinned venue as its sole executor. Call BEFORE signing. */
+export function assertPreparedTcCreateAllocation(
+  preparedTransactionB64: string,
+  expect: TcCreateAllocationExpectation
+): void {
+  const what = "create-allocation";
+  const { venue, vault } = expect.tradecraft;
+  const isAmulet = expect.instrument.admin === expect.dso && expect.instrument.id === "Amulet";
+  const decoded = decodePrepared(preparedTransactionB64);
+  const { exercise: root, rootNodeId } = assertSingleAllowedRootExercise(
+    decoded,
+    "AMMRules_CreateSettlementAllocation",
+    "AMMRules_CreateSettlementAllocation",
+    TC_ALLOCATION_CONSEQUENCES
+  );
+  tcAssertRootContract(decoded, root, TC_AMM_RULES_TEMPLATE, [venue, vault], what);
+
+  // Choice argument: actor, ammCid, instrument, authorizerAccount,
+  // initialFunding, inputHoldingCids, allocationFactoryCid, extraArgs.
+  const a = recordEntries(root.chosenValue);
+  const actor = tcLeaf(tcField(a, 0, "actor", what), "party", `${what} actor`);
+  if (actor !== expect.party) tcRefuse(what, `actor is ${JSON.stringify(actor)}, not this wallet`);
+  const ammCid = tcContractId(tcField(a, 1, "ammCid", what), `${what} ammCid`);
+  const amm = decoded.inputContracts.filter((c) => c.contractId === ammCid);
+  if (
+    amm.length !== 1 ||
+    amm[0]?.templateQualifiedName !== TC_AMM_TEMPLATE ||
+    !sameParties(amm[0].signatories, [venue, vault])
+  ) {
+    tcRefuse(what, "ammCid is not a disclosed TC.V4:AMM signed by the venue and vault");
+  }
+  tcAssertInstrument(tcField(a, 2, "instrument", what), expect.instrument, what, "instrument");
+  tcAssertOwnAccount(tcField(a, 3, "authorizerAccount", what), expect.party, what, "authorizerAccount");
+  const initialFunding = tcOptional(tcField(a, 4, "initialFunding", what), `${what} initialFunding`);
+  if (expect.funding === undefined) {
+    if (initialFunding !== null) tcRefuse(what, "initialFunding is set for an empty allocation");
+    if (tcList(tcField(a, 5, "inputHoldingCids", what), `${what} inputHoldingCids`).length > 0) {
+      tcRefuse(what, "an empty allocation spends input holdings");
+    }
+  } else {
+    if (initialFunding === null) tcRefuse(what, "initialFunding is missing");
+    tcAssertAmount(initialFunding, expect.funding, what, "initialFunding");
+  }
+
+  // Creates: exactly one allocation of the instrument's family, plus the
+  // agent's own (locked and change) holdings. Nothing else.
+  const allocationTemplate = isAmulet ? AMULET_ALLOCATION_V2_TEMPLATE : REGISTRY_ALLOCATION_V2_TEMPLATE;
+  const holdingTemplates = isAmulet ? [AMULET_TEMPLATE, LOCKED_AMULET_TEMPLATE] : [REGISTRY_HOLDING_TEMPLATE];
+  let allocations = 0;
+  for (const node of decoded.nodes) {
+    if (node.create === undefined) continue;
+    const tmpl = node.create.templateQualifiedName;
+    const arg = node.create.argument;
+    if (arg === undefined) tcRefuse(what, `a ${String(tmpl)} create could not be decoded`);
+    if (tmpl === allocationTemplate) {
+      allocations++;
+      tcAssertAllocationArgs(arg, isAmulet, expect, expect.funding === undefined ? [] : [expect.funding], what);
+    } else if (tmpl !== undefined && holdingTemplates.includes(tmpl)) {
+      tcAssertHoldingOwner(arg, tmpl, expect.party, what);
+    } else {
+      tcRefuse(what, `it creates ${JSON.stringify(tmpl ?? null)}`);
+    }
+  }
+  if (allocations !== 1) tcRefuse(what, `it creates ${allocations} allocations (want exactly one)`);
+
+  tcAssertEnvelope(decoded, expect);
+  const isState = (c: DecodedInputContract): boolean =>
+    isStateOf([venue, vault])(c) || isStateOf([expect.dso])(c);
+  const leaves = collectSplitPartyLeaves(
+    { ...decoded, inputContracts: decoded.inputContracts.filter((c) => !isState(c)) },
+    rootNodeId
+  );
+  assertNoForeignParties(
+    leaves,
+    new Set([expect.party, venue, vault]),
+    expect.instrument.admin,
+    1 /* instrument.admin in the root argument */,
+    true /* caller intent */,
+    undefined,
+    expect.trustedRegistryParties ?? new Set()
+  );
+}
+
+/** The created allocation: `settlement` and `allocation` sit at positions 1/2
+ *  on `AmuletAllocationV2` and 3/4 on the registry `AllocationV2`. */
+function tcAssertAllocationArgs(
+  arg: Uint8Array,
+  isAmulet: boolean,
+  expect: TcCommon & { ammId: string; instrument: { admin: string; id: string } },
+  /** The funding amounts this allocation may carry; empty ⇒ it must be unfunded. */
+  allowedFunding: readonly string[],
+  what: string
+): void {
+  const e = recordEntries(arg);
+  const settlement = recordEntries(tcField(e, isAmulet ? 1 : 3, "settlement", what));
+  const spec = recordEntries(tcField(e, isAmulet ? 2 : 4, "allocation", what));
+
+  // SettlementInfo {executors, id, cid, meta}: the venue alone may settle.
+  const executors = tcList(tcField(settlement, 0, "executors", what), `${what} executors`).map((x) =>
+    tcLeaf(x, "party", `${what} executor`)
+  );
+  if (executors.length !== 1 || executors[0] !== expect.tradecraft.venue) {
+    tcRefuse(what, `allocation executors are ${JSON.stringify(executors)}, not the venue alone`);
+  }
+  if (tcOptional(tcField(settlement, 2, "cid", what), `${what} settlement.cid`) !== null) {
+    tcRefuse(what, "allocation settlement.cid is set");
+  }
+
+  // AllocationSpecification {admin, authorizer, transferLegSides,
+  // settlementDeadline, nextIterationFunding, committed, meta}.
+  const admin = tcLeaf(tcField(spec, 0, "admin", what), "party", `${what} allocation.admin`);
+  if (admin !== expect.instrument.admin) tcRefuse(what, `allocation admin is ${JSON.stringify(admin)}`);
+  tcAssertOwnAccount(tcField(spec, 1, "authorizer", what), expect.party, what, "allocation.authorizer");
+  if (tcList(tcField(spec, 2, "transferLegSides", what), `${what} transferLegSides`).length > 0) {
+    tcRefuse(what, "allocation carries pre-set transfer legs");
+  }
+  if (tcOptional(tcField(spec, 3, "settlementDeadline", what), `${what} settlementDeadline`) !== null) {
+    tcRefuse(what, "allocation has a settlement deadline (Tradecraft allocations have none)");
+  }
+  const funding = tcOptional(tcField(spec, 4, "nextIterationFunding", what), `${what} nextIterationFunding`);
+  const fundingMap = funding === null ? new Map<string, Uint8Array>() : tcTextMap(funding, `${what} nextIterationFunding`);
+  if (allowedFunding.length === 0) {
+    if (fundingMap.size > 0) tcRefuse(what, "an empty allocation carries funding");
+  } else {
+    const amt = fundingMap.get(expect.instrument.id);
+    if (fundingMap.size !== 1 || amt === undefined) {
+      tcRefuse(what, `allocation funding is not exactly {${expect.instrument.id}}`);
+    }
+    const got = canonicalAmount(tcLeaf(amt, "numeric", `${what} allocation funding`));
+    if (!allowedFunding.some((f) => canonicalAmount(f) === got)) {
+      tcRefuse(what, `allocation funding is ${got}, not ${allowedFunding.join(" or ")}`);
+    }
+  }
+  if (!tcBool(tcField(spec, 5, "committed", what), `${what} committed`)) {
+    tcRefuse(what, "allocation is not committed");
+  }
+  const meta = tcTextMap(
+    tcField(recordEntries(tcField(spec, 6, "meta", what)), 0, "values", what),
+    `${what} allocation.meta`
+  );
+  const ammId = meta.get(TC_META_AMM_ID);
+  const instrumentId = meta.get(TC_META_INSTRUMENT_ID);
+  if (ammId === undefined || tcLeaf(ammId, "text", `${what} meta amm-id`) !== expect.ammId) {
+    tcRefuse(what, `allocation is not bound to pool ${JSON.stringify(expect.ammId)}`);
+  }
+  if (instrumentId === undefined || tcLeaf(instrumentId, "text", `${what} meta instrument-id`) !== expect.instrument.id) {
+    tcRefuse(what, `allocation is not bound to instrument ${JSON.stringify(expect.instrument.id)}`);
+  }
+}
+
+/** A holding created here (change or the locked funding) must be the agent's.
+ *  Amulet {dso, owner, amount}; LockedAmulet {amulet: Amulet, lock}; registry
+ *  Holding {operator, provider, registrar, owner, …}. */
+function tcAssertHoldingOwner(arg: Uint8Array, template: string, party: string, what: string): void {
+  let owner: string;
+  if (template === AMULET_TEMPLATE) {
+    owner = tcLeaf(tcField(recordEntries(arg), 1, "owner", what), "party", `${what} Amulet.owner`);
+  } else if (template === LOCKED_AMULET_TEMPLATE) {
+    const amulet = recordEntries(tcField(recordEntries(arg), 0, "amulet", what));
+    owner = tcLeaf(tcField(amulet, 1, "owner", what), "party", `${what} LockedAmulet.owner`);
+  } else {
+    owner = tcLeaf(tcField(recordEntries(arg), 3, "owner", what), "party", `${what} Holding.owner`);
+  }
+  if (owner !== party) tcRefuse(what, `it creates a ${template} owned by ${JSON.stringify(owner)}`);
+}
+
+// ── 2b. Top up a committed allocation ──────────────────────────────────────
+
+export interface TcFundAllocationExpectation extends TcCommon {
+  ammId: string;
+  instrument: { admin: string; id: string };
+  /** The agent's existing allocation being topped up. */
+  allocationCid: string;
+  /** Amount added from the wallet. */
+  additionalFunding: string;
+  /** The allocation's funding before the top-up, as the wallet read it. */
+  currentFunding: string;
+  dso: string;
+  trustedRegistryParties?: ReadonlySet<string>;
+}
+
+const REGISTRY_TRANSFER_RULE_TEMPLATE = "Utility.Registry.V0.Rule.Transfer:TransferRule";
+
+/** Consequences of `AMMRules_FundSettlementAllocation`, measured on MainNet
+ *  (Canton Coin and CBTC): the registry allocates the added amount into a
+ *  temporary allocation, then settles it and the existing allocation into one
+ *  successor through the instrument's settlement factory. Every interface
+ *  choice is pinned to the DSO / DA registry implementation. */
+const TC_FUND_CONSEQUENCES: readonly ConsequenceChoiceRule[] = [
+  ...TC_ALLOCATION_CONSEQUENCES,
+  {
+    choiceId: "SettlementFactory_SettleBatch",
+    templates: [EXTERNAL_PARTY_AMULET_RULES_TEMPLATE, REGISTRY_ALLOCATION_FACTORY_TEMPLATE],
+  },
+  { choiceId: "Allocation_Settle", templates: [AMULET_ALLOCATION_V2_TEMPLATE, REGISTRY_ALLOCATION_V2_TEMPLATE] },
+  {
+    choiceId: "Archive",
+    templates: [LOCKED_AMULET_TEMPLATE, AMULET_ALLOCATION_V2_TEMPLATE, REGISTRY_ALLOCATION_V2_TEMPLATE],
+  },
+  { choiceId: "TransferRule_SettleAllocationV2", templates: [REGISTRY_TRANSFER_RULE_TEMPLATE] },
+  { choiceId: "EventLog_HoldingsChange", templates: [REGISTRY_TRANSFER_RULE_TEMPLATE] },
+];
+
+/** Assert the relay-prepared transaction is EXACTLY a top-up of this agent's
+ *  `allocationCid` by `additionalFunding`. Every allocation it creates must be
+ *  the agent's, settled by the venue alone, bound to the pool, and carry either
+ *  the added amount (the temporary one) or current + added (the successor);
+ *  every holding it creates must be the agent's. Call BEFORE signing. */
+export function assertPreparedTcFundAllocation(
+  preparedTransactionB64: string,
+  expect: TcFundAllocationExpectation
+): void {
+  const what = "fund-allocation";
+  const { venue, vault } = expect.tradecraft;
+  const isAmulet = expect.instrument.admin === expect.dso && expect.instrument.id === "Amulet";
+  const decoded = decodePrepared(preparedTransactionB64);
+  const { exercise: root, rootNodeId } = assertSingleAllowedRootExercise(
+    decoded,
+    "AMMRules_FundSettlementAllocation",
+    "AMMRules_FundSettlementAllocation",
+    TC_FUND_CONSEQUENCES
+  );
+  tcAssertRootContract(decoded, root, TC_AMM_RULES_TEMPLATE, [venue, vault], what);
+
+  // Choice argument: actor, ammCid, authorizerAccount, allocationCid,
+  // instrument, additionalFunding, inputHoldingCids, allocationFactoryCid,
+  // allocationExtraArgs, settlementFactoryCid, settlementExtraArgs.
+  const a = recordEntries(root.chosenValue);
+  const actor = tcLeaf(tcField(a, 0, "actor", what), "party", `${what} actor`);
+  if (actor !== expect.party) tcRefuse(what, `actor is ${JSON.stringify(actor)}, not this wallet`);
+  const ammCid = tcContractId(tcField(a, 1, "ammCid", what), `${what} ammCid`);
+  const amm = decoded.inputContracts.filter((c) => c.contractId === ammCid);
+  if (
+    amm.length !== 1 ||
+    amm[0]?.templateQualifiedName !== TC_AMM_TEMPLATE ||
+    !sameParties(amm[0].signatories, [venue, vault])
+  ) {
+    tcRefuse(what, "ammCid is not a disclosed TC.V4:AMM signed by the venue and vault");
+  }
+  tcAssertOwnAccount(tcField(a, 2, "authorizerAccount", what), expect.party, what, "authorizerAccount");
+  const allocationCid = tcContractId(tcField(a, 3, "allocationCid", what), `${what} allocationCid`);
+  if (allocationCid !== expect.allocationCid) tcRefuse(what, "allocationCid is not the allocation being topped up");
+  tcAssertInstrument(tcField(a, 4, "instrument", what), expect.instrument, what, "instrument");
+  tcAssertAmount(tcField(a, 5, "additionalFunding", what), expect.additionalFunding, what, "additionalFunding");
+
+  const after = addDecimals(expect.currentFunding, expect.additionalFunding);
+  const allocationTemplate = isAmulet ? AMULET_ALLOCATION_V2_TEMPLATE : REGISTRY_ALLOCATION_V2_TEMPLATE;
+  const holdingTemplates = isAmulet ? [AMULET_TEMPLATE, LOCKED_AMULET_TEMPLATE] : [REGISTRY_HOLDING_TEMPLATE];
+  let allocations = 0;
+  let successors = 0;
+  for (const node of decoded.nodes) {
+    if (node.create === undefined) continue;
+    const tmpl = node.create.templateQualifiedName;
+    const arg = node.create.argument;
+    if (arg === undefined) tcRefuse(what, `a ${String(tmpl)} create could not be decoded`);
+    if (tmpl === allocationTemplate) {
+      allocations++;
+      tcAssertAllocationArgs(arg, isAmulet, expect, [expect.additionalFunding, after], what);
+      if (canonicalAmount(tcAllocationFunding(arg, isAmulet, expect.instrument.id)) === after) successors++;
+    } else if (tmpl !== undefined && holdingTemplates.includes(tmpl)) {
+      tcAssertHoldingOwner(arg, tmpl, expect.party, what);
+    } else {
+      tcRefuse(what, `it creates ${JSON.stringify(tmpl ?? null)}`);
+    }
+  }
+  if (allocations === 0 || allocations > 2) tcRefuse(what, `it creates ${allocations} allocations`);
+  // The successor must carry everything: current + added.
+  if (successors === 0) tcRefuse(what, `no successor allocation carries the topped-up funding ${after}`);
+
+  tcAssertEnvelope(decoded, expect);
+  const isState = (c: DecodedInputContract): boolean =>
+    isStateOf([venue, vault])(c) || isStateOf([expect.dso])(c);
+  const leaves = collectSplitPartyLeaves(
+    { ...decoded, inputContracts: decoded.inputContracts.filter((c) => !isState(c)) },
+    rootNodeId
+  );
+  assertNoForeignParties(
+    leaves,
+    new Set([expect.party, venue, vault]),
+    expect.instrument.admin,
+    1 /* instrument.admin in the root argument */,
+    true /* caller intent */,
+    undefined,
+    expect.trustedRegistryParties ?? new Set()
+  );
+}
+
+/** The funding an already-validated allocation create carries for `id`. */
+function tcAllocationFunding(arg: Uint8Array, isAmulet: boolean, id: string): string {
+  const spec = recordEntries(tcField(recordEntries(arg), isAmulet ? 2 : 4, "allocation", "allocation"));
+  const funding = tcOptional(tcField(spec, 4, "nextIterationFunding", "allocation"), "nextIterationFunding");
+  const amt = funding === null ? undefined : tcTextMap(funding, "nextIterationFunding").get(id);
+  return amt === undefined ? "0" : tcLeaf(amt, "numeric", "allocation funding");
+}
+
+/** Exact sum of two non-negative decimals (10 dp), canonical form. */
+function addDecimals(x: string, y: string): string {
+  const atoms = (d: string): bigint => {
+    const m = canonicalAmount(d).match(/^(\d+)\.(\d{10})$/);
+    if (!m) throw new PreparedTransferMismatchError(`tradecraft: invalid amount ${JSON.stringify(d)}`);
+    return BigInt(m[1]!) * 10n ** 10n + BigInt(m[2]!);
+  };
+  const s = (atoms(x) + atoms(y)).toString().padStart(11, "0");
+  return `${s.slice(0, -10)}.${s.slice(-10)}`;
+}
+
+// ── 3. Queued swap orders ──────────────────────────────────────────────────
+
+export interface TcCreateOrdersExpectation extends TcCommon {
+  ammId: string;
+  /** The instrument every order sells. */
+  sellInstrument: { admin: string; id: string };
+  /** Per-order input amount and minimum output (null ⇒ no minimum). */
+  orders: ReadonlyArray<{ amount: string; minOut: string | null }>;
+  /** The agent's batcher contract id, when the caller knows it. */
+  batcherCid?: string;
+}
+
+/** Assert the relay-prepared transaction is EXACTLY these queued orders on the
+ *  agent's own batcher: `SwapOrderBatcher_CreateOrdersV2` creating one
+ *  `SwapOrder` per intended order and NOTHING else — no archive, no holding, no
+ *  allocation, so no value can move under this signature. Call BEFORE signing. */
+export function assertPreparedTcCreateOrders(
+  preparedTransactionB64: string,
+  expect: TcCreateOrdersExpectation
+): void {
+  const what = "create-orders";
+  const { venue, vault } = expect.tradecraft;
+  if (expect.orders.length === 0) tcRefuse(what, "no orders were intended");
+  const decoded = decodePrepared(preparedTransactionB64);
+  const { exercise: root, rootNodeId } = assertSingleAllowedRootExercise(decoded, "SwapOrderBatcher_CreateOrdersV2");
+  const batcher = tcAssertRootContract(decoded, root, TC_BATCHER_TEMPLATE, [vault], what);
+  assertContractIdMatches(root, expect.batcherCid);
+  tcAssertBatcherArgs(batcher.argument, expect, what);
+
+  // Choice argument: ammId, instrument, orders [{amount, minOut}].
+  const a = recordEntries(root.chosenValue);
+  const ammId = tcLeaf(tcField(a, 0, "ammId", what), "text", `${what} ammId`);
+  if (ammId !== expect.ammId) tcRefuse(what, `ammId is ${JSON.stringify(ammId)}, not ${JSON.stringify(expect.ammId)}`);
+  tcAssertInstrument(tcField(a, 1, "instrument", what), expect.sellInstrument, what, "instrument");
+  const specs = tcList(tcField(a, 2, "orders", what), `${what} orders`);
+  if (specs.length !== expect.orders.length) {
+    tcRefuse(what, `it carries ${specs.length} orders, not ${expect.orders.length}`);
+  }
+  specs.forEach((s, i) => {
+    const e = recordEntries(s);
+    tcAssertOrderTerms(tcField(e, 0, "amount", what), tcField(e, 1, "minOut", what), expect.orders[i]!, what, i);
+  });
+
+  // Creates: exactly the orders, in order, each bound to the agent and pool.
+  const creates = decoded.nodes.filter((n) => n.kind === "create");
+  if (creates.length !== expect.orders.length) {
+    tcRefuse(what, `it creates ${creates.length} contracts for ${expect.orders.length} orders`);
+  }
+  const roots = new Map(decoded.nodes.map((n) => [n.nodeId, n] as const));
+  const ordered = (roots.get(rootNodeId)?.children ?? []).map((id) => roots.get(id));
+  if (ordered.length !== creates.length) tcRefuse(what, "an order is not a direct child of the batch");
+  ordered.forEach((node, i) => {
+    if (node?.create?.templateQualifiedName !== TC_SWAP_ORDER_TEMPLATE || node.create.argument === undefined) {
+      tcRefuse(what, `child ${i} is not a SwapOrder`);
+    }
+    tcAssertSwapOrderArgs(node.create.argument, expect, i, what);
+  });
+
+  tcAssertEnvelope(decoded, expect);
+  const leaves = collectSplitPartyLeaves(decoded, rootNodeId);
+  assertNoForeignParties(
+    leaves,
+    new Set([expect.party, venue, vault]),
+    expect.sellInstrument.admin,
+    1 /* instrument.admin in the root argument */,
+    true /* caller intent */
+  );
+}
+
+function tcAssertOrderTerms(
+  amountV: Uint8Array,
+  minOutV: Uint8Array,
+  want: { amount: string; minOut: string | null },
+  what: string,
+  i: number
+): void {
+  tcAssertAmount(amountV, want.amount, what, `order ${i} amount`);
+  const minOut = tcOptional(minOutV, `${what} order ${i} minOut`);
+  if (want.minOut === null) {
+    if (minOut !== null) tcRefuse(what, `order ${i} has a minOut that was not intended`);
+  } else {
+    if (minOut === null) tcRefuse(what, `order ${i} dropped its minOut`);
+    tcAssertAmount(minOut, want.minOut, what, `order ${i} minOut`);
+  }
+}
+
+/** SwapOrder {actor, venue, vault, ammId, what, minOut, createdAt, …}. */
+function tcAssertSwapOrderArgs(arg: Uint8Array, expect: TcCreateOrdersExpectation, i: number, what: string): void {
+  const e = recordEntries(arg);
+  const parties = [
+    tcLeaf(tcField(e, 0, "actor", what), "party", `${what} order.actor`),
+    tcLeaf(tcField(e, 1, "venue", what), "party", `${what} order.venue`),
+    tcLeaf(tcField(e, 2, "vault", what), "party", `${what} order.vault`),
+  ];
+  const want = [expect.party, expect.tradecraft.venue, expect.tradecraft.vault];
+  if (parties.some((p, k) => p !== want[k])) tcRefuse(what, `SwapOrder ${i} is ${JSON.stringify(parties)}`);
+  const ammId = tcLeaf(tcField(e, 3, "ammId", what), "text", `${what} order.ammId`);
+  if (ammId !== expect.ammId) tcRefuse(what, `SwapOrder ${i} is for pool ${JSON.stringify(ammId)}`);
+  // what = Short {instrument, amount}: sell exactly the intended amount.
+  const dir = tcVariant(tcField(e, 4, "what", what), `${what} order.what`);
+  if (dir.constructor !== "Short") tcRefuse(what, `SwapOrder ${i} is ${dir.constructor}, not Short`);
+  const d = recordEntries(dir.value);
+  tcAssertInstrument(tcField(d, 0, "instrument", what), expect.sellInstrument, what, `order ${i} instrument`);
+  tcAssertOrderTerms(tcField(d, 1, "amount", what), tcField(e, 5, "minOut", what), expect.orders[i]!, what, i);
+}
+
+// ── 3b. Cancel a queued order ──────────────────────────────────────────────
+
+export interface TcCancelOrderExpectation extends TcCommon {
+  /** The order being abandoned, when the caller knows it. */
+  orderCid?: string;
+  /** The pool's instrument admins: they sit inside the order's own argument. */
+  instrumentAdmins: readonly string[];
+}
+
+/** Assert the relay-prepared transaction is EXACTLY the agent abandoning one
+ *  of its own pending orders: `SwapOrder_WithdrawV3 {tradingBalanceCids = [],
+ *  settlementHelpers = None}` on a SwapOrder signed by the agent and the vault,
+ *  with no consequence at all (no funds have moved for a pending order, so
+ *  nothing is refunded). Call BEFORE signing. */
+export function assertPreparedTcCancelOrder(
+  preparedTransactionB64: string,
+  expect: TcCancelOrderExpectation
+): void {
+  const what = "cancel-order";
+  const { venue, vault } = expect.tradecraft;
+  const decoded = decodePrepared(preparedTransactionB64);
+  const { exercise: root, rootNodeId } = assertSingleAllowedRootExercise(decoded, "SwapOrder_WithdrawV3");
+  const order = tcAssertRootContract(decoded, root, TC_SWAP_ORDER_TEMPLATE, [expect.party, vault], what);
+  assertContractIdMatches(root, expect.orderCid);
+  if (order.argument === undefined) tcRefuse(what, "the order's argument could not be decoded");
+  const o = recordEntries(order.argument);
+  const parties = [
+    tcLeaf(tcField(o, 0, "actor", what), "party", `${what} order.actor`),
+    tcLeaf(tcField(o, 1, "venue", what), "party", `${what} order.venue`),
+    tcLeaf(tcField(o, 2, "vault", what), "party", `${what} order.vault`),
+  ];
+  if (parties[0] !== expect.party || parties[1] !== venue || parties[2] !== vault) {
+    tcRefuse(what, `the order is ${JSON.stringify(parties)}, not this wallet's on the pinned venue`);
+  }
+  // Choice argument: tradingBalanceCids, settlementHelpers.
+  const a = recordEntries(root.chosenValue);
+  if (tcList(tcField(a, 0, "tradingBalanceCids", what), `${what} tradingBalanceCids`).length > 0) {
+    tcRefuse(what, "it names trading balances (a queued order has none)");
+  }
+  // A trailing Optional that is None is dropped by the participant's value
+  // normalization (measured: the capture carries only tradingBalanceCids), so
+  // absent means None; present must be None; anything beyond is refused.
+  if (a.length > 2) tcRefuse(what, `its argument has ${a.length} fields (want at most 2)`);
+  if (a.length === 2 && tcOptional(tcField(a, 1, "settlementHelpers", what), `${what} settlementHelpers`) !== null) {
+    tcRefuse(what, "it passes settlement helpers (a queued order takes none)");
+  }
+  if (decoded.nodes.some((n) => n.kind === "create")) tcRefuse(what, "it creates a contract");
+
+  tcAssertEnvelope(decoded, expect);
+  const leaves = collectSplitPartyLeaves(decoded, rootNodeId);
+  assertNoForeignParties(leaves, new Set([expect.party, venue, vault, ...expect.instrumentAdmins]), undefined, 0, false);
+}
+
+// ── 4. Settlement withdrawal request ───────────────────────────────────────
+
+/** Tradecraft package ids that define `SettlementWithdrawalRequest` (added in
+ *  DAR 1.3.12). MEASURED on MainNet, 2026-10-17. A later Tradecraft release
+ *  must be added here (or passed by the caller) before its requests sign. */
+export const KNOWN_TRADECRAFT_PACKAGE_IDS: readonly string[] = [
+  "97571dd8610f5d98ec99ebd5bee9edb09d44a7a025b9d088517bde0bfb3bc2dc", // canton-swap-amm-vault 1.3.12
+];
+
+export interface TcWithdrawalRequestExpectation extends TcCommon {
+  ammId: string;
+  instrument: { admin: string; id: string };
+  /** Package ids the request template may come from — WALLET constants
+   *  (default KNOWN_TRADECRAFT_PACKAGE_IDS), never relay data. */
+  trustedPackageIds?: readonly string[];
+}
+
+/** Assert the relay-prepared transaction is EXACTLY one create of this agent's
+ *  `SettlementWithdrawalRequest` {actor, venue, ammId, instrument, createdAt}.
+ *  Call BEFORE signing. */
+export function assertPreparedTcWithdrawalRequest(
+  preparedTransactionB64: string,
+  expect: TcWithdrawalRequestExpectation
+): void {
+  const what = "withdrawal-request";
+  const decoded = decodePrepared(preparedTransactionB64);
+  if (decoded.exercises.length > 0) tcRefuse(what, "it exercises a choice (a request only creates)");
+  if (decoded.nodes.length !== 1 || decoded.roots.length !== 1) {
+    tcRefuse(what, `it has ${decoded.nodes.length} nodes / ${decoded.roots.length} roots (want one create)`);
+  }
+  const node = decoded.nodes[0] as DecodedNode;
+  if (
+    !node.recognizedVersion ||
+    node.kind !== "create" ||
+    node.nodeId !== decoded.roots[0] ||
+    node.create?.templateQualifiedName !== TC_WITHDRAWAL_REQUEST_TEMPLATE ||
+    node.create.argument === undefined
+  ) {
+    tcRefuse(what, "the root is not a SettlementWithdrawalRequest create");
+  }
+  // WHICH PACKAGE RUNS. This is the one Tradecraft shape the agent authorizes
+  // ALONE: a top-level create, not an exercise on a venue-signed input contract
+  // whose package the venue's participant vetted. A relay that controls the
+  // agent's participant could vet a look-alike package with the same
+  // module:entity whose template gives some party a choice running under the
+  // agent's authority. So the package is pinned to Tradecraft's, and the
+  // parties to {agent signs; venue observes}.
+  const trusted = expect.trustedPackageIds ?? KNOWN_TRADECRAFT_PACKAGE_IDS;
+  if (node.create.packageId === undefined || !trusted.includes(node.create.packageId)) {
+    tcRefuse(what, `the request template comes from package ${JSON.stringify(node.create.packageId ?? null)}, not Tradecraft's`);
+  }
+  if (!sameParties(node.create.signatories ?? [], [expect.party])) {
+    tcRefuse(what, `the request is signed by ${JSON.stringify(node.create.signatories ?? [])}, not this wallet alone`);
+  }
+  if (!sameParties(node.create.stakeholders ?? [], [expect.party, expect.tradecraft.venue])) {
+    tcRefuse(what, `the request's stakeholders are ${JSON.stringify(node.create.stakeholders ?? [])}`);
+  }
+  const e = recordEntries(node.create.argument);
+  const actor = tcLeaf(tcField(e, 0, "actor", what), "party", `${what} actor`);
+  const venue = tcLeaf(tcField(e, 1, "venue", what), "party", `${what} venue`);
+  if (actor !== expect.party) tcRefuse(what, `actor is ${JSON.stringify(actor)}, not this wallet`);
+  if (venue !== expect.tradecraft.venue) tcRefuse(what, `venue is ${JSON.stringify(venue)}`);
+  const ammId = tcLeaf(tcField(e, 2, "ammId", what), "text", `${what} ammId`);
+  if (ammId !== expect.ammId) tcRefuse(what, `ammId is ${JSON.stringify(ammId)}`);
+  tcAssertInstrument(tcField(e, 3, "instrument", what), expect.instrument, what, "instrument");
+
+  tcAssertEnvelope(decoded, expect);
+  const leaves = collectSplitPartyLeaves(decoded, node.nodeId);
+  assertNoForeignParties(
+    leaves,
+    new Set([expect.party, expect.tradecraft.venue]),
+    expect.instrument.admin,
+    0,
+    true /* caller intent */
   );
 }

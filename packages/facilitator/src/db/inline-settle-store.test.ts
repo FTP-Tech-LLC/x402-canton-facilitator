@@ -6,6 +6,12 @@ import {
 } from "./inline-settle-store.js";
 
 describe("inline settle store — in memory", () => {
+  it("keeps the participant a dispatched submission went to", async () => {
+    const s = createInMemoryInlineSettleStore();
+    await s.recordDispatched("bb", { submissionId: "sub", beginExclusive: 9, participant: "https://node1" });
+    expect(await s.getRecord("bb")).toEqual({ state: "dispatched", submissionId: "sub", beginExclusive: 9, participant: "https://node1" });
+  });
+
   it("records once and returns what it recorded", async () => {
     const s = createInMemoryInlineSettleStore();
     expect(await s.getRecord("aa")).toBeNull();
@@ -200,16 +206,24 @@ describe("the dispatch marker — Postgres SQL shape", () => {
     const s = createPostgresInlineSettleStore(exec);
     await s.recordDispatched("aa");
     const insert = sql.find((q) => q.startsWith("INSERT INTO inline_settles"))!;
-    expect(insert).toMatch(/VALUES \(\$1, NULL, \$2, \$3\)/);
+    expect(insert).toMatch(/VALUES \(\$1, NULL, \$2, \$3, \$4\)/);
     expect(insert).toMatch(/ON CONFLICT \(tx_hash\) DO NOTHING/);
-    expect(params.at(-1)).toEqual(["aa", null, null]);
+    expect(params.at(-1)).toEqual(["aa", null, null, null]);
   });
 
   it("stores the submissionId and offset a later resolve needs", async () => {
     const { params, exec } = spy();
     const s = createPostgresInlineSettleStore(exec);
     await s.recordDispatched("aa", { submissionId: "x402-inline-k", beginExclusive: 42 });
-    expect(params.at(-1)).toEqual(["aa", "x402-inline-k", 42]);
+    expect(params.at(-1)).toEqual(["aa", "x402-inline-k", 42, null]);
+  });
+
+  it("stores which participant the submission went to (its offset means nothing elsewhere)", async () => {
+    const { sql, params, exec } = spy();
+    const s = createPostgresInlineSettleStore(exec);
+    await s.recordDispatched("aa", { submissionId: "x402-inline-k", beginExclusive: 42, participant: "https://node1" });
+    expect(sql.some((q) => /ADD COLUMN IF NOT EXISTS participant text/.test(q))).toBe(true);
+    expect(params.at(-1)).toEqual(["aa", "x402-inline-k", 42, "https://node1"]);
   });
 
   it("reads them back, coercing the bigint pg hands over as a string", async () => {

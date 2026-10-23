@@ -42,6 +42,7 @@ import {
 } from "./readiness.js";
 import { createPayerProofVerifier } from "./canton/payer-proof.js";
 import { createTopologyReaderLookup } from "./canton/topology-reader-client.js";
+import { createParticipantRouter, participantId, type ParticipantRouter } from "./participant-router.js";
 
 export interface Services {
   client: CantonClient;
@@ -79,9 +80,21 @@ export interface Services {
   agentWalletApiKey: string | undefined;
   /** DAML choices the wallet relay's submit/prepare will build. */
   walletSubmitChoices: readonly string[];
+  walletSubmitCreateTemplates: readonly string[];
+  walletReadIds: readonly string[];
   submitRateMaxPerKey: number;
   /** Facilitator-wide ceiling on external-party allocations per minute. */
   onboardRateMaxGlobal: number;
+  /** Facilitator-wide ABSOLUTE ceiling on external-party allocations per 24h. */
+  onboardDailyMax: number;
+  /** Escalating-cooldown (penalty box) config for repeat abusers on agent-side
+   *  money routes. `abuseStrikesToBan <= 0` disables it. */
+  abuseStrikesToBan: number;
+  abuseStrikeWindowMs: number;
+  abuseBaseBanMs: number;
+  abuseBanMultiplier: number;
+  abuseMaxBanMs: number;
+  abuseStrikeSpacingMs: number;
   submitRateMaxPerIp: number;
   /** Agent CC faucet config + store. undefined when CANTON_X402_FAUCET_ENABLED
    *  is off → the faucet route 503s. Consumed by registerWalletRoutes. */
@@ -97,6 +110,8 @@ export interface Services {
         maxGlobalPerMin?: number | undefined;
         burstWindowMs?: number | undefined;
         ipExempt?: readonly string[] | undefined;
+        /** Pay each newly onboarded party one grant right after allocation. */
+        onOnboard?: boolean | undefined;
       }
     | undefined;
   /** transfer-factory ("V3") master switch (config.tfEnabled). Threaded to the
@@ -136,6 +151,8 @@ export interface Services {
       | "allowlist"
       | "provider-or-allowlist";
     merchantAllowlist?: readonly string[];
+    /** Previous facilitator party still accepted as feePayer (config.acceptedFeePayers). */
+    acceptedFeePayers?: readonly string[];
     fetchOwnedHoldingAmounts?: (
       party: string
     ) => Promise<Map<string, string> | undefined>;
@@ -180,6 +197,16 @@ export interface Services {
   /** Participant MEMBER id for the GS traffic-budget monitor; undefined → the
    *  monitor stays inert (logs once, skips). */
   facilitatorMemberId: string | undefined;
+  /** Which of our participants hosts a party (one participant unless
+   *  CANTON_SECONDARY_PARTICIPANT_URL is set); relay calls for a party go
+   *  through it. `client`/`userId` above are its primary. */
+  router: ParticipantRouter;
+  /** Co-host for new wallets (see config.onboardCoHostParticipantUid). */
+  onboardCoHost:
+    | { participantUid: string; client: CantonClient; userId: string; grantPartyRights: boolean }
+    | undefined;
+  /** Grant our user CanActAs on each onboarded wallet on the primary. */
+  grantPartyRights: boolean;
 }
 
 export function buildServices(config: FacilitatorConfig): Services {
@@ -234,6 +261,34 @@ export function buildServices(config: FacilitatorConfig): Services {
     // client-side x402 flow feel broken (the caller already has a
     // maxTimeoutSeconds budget from the PaymentRequirements).
     timeoutMs: 45_000,
+  });
+
+  // A second participant during party replication: same client shape, its own
+  // ledger user and credentials. Unset → one participant, the router always
+  // answers the primary.
+  const sp = config.secondaryParticipant;
+  const secondaryToken: string | TokenProvider | undefined = !sp
+    ? undefined
+    : config.jwtIssuer === "unsafe-hmac"
+      ? mintUnsafeHmacJwt({ secret: config.jwtSecret ?? "unsafe", sub: sp.userId })
+      : createOidcTokenProvider({
+          // config.ts validated these for JWT_ISSUER=oidc.
+          tokenEndpoint: sp.oidcTokenEndpoint!,
+          clientId: sp.oidcClientId!,
+          clientSecret: sp.oidcClientSecret!,
+          audience: sp.ledgerApiAudience!,
+          ...(sp.oidcScope ? { scope: sp.oidcScope } : {}),
+        });
+  const secondaryClient =
+    sp && secondaryToken !== undefined
+      ? new CantonClient({ participantUrl: sp.url, token: secondaryToken, packageName: "canton-x402", timeoutMs: 45_000 })
+      : undefined;
+  const router = createParticipantRouter({
+    primary: { name: "primary", id: participantId(config.participantUrl), client, userId },
+    secondary:
+      secondaryClient && sp
+        ? { name: "secondary", id: participantId(sp.url), client: secondaryClient, userId: sp.userId }
+        : undefined,
   });
 
   // Scan API authentication:
@@ -323,6 +378,17 @@ export function buildServices(config: FacilitatorConfig): Services {
       await client.getLedgerEnd();
       return { ok: true };
     },
+    // Only with a second participant: the parties not moved yet live there, so
+    // it being unreachable is a real outage for them. (/health, which the
+    // container healthcheck uses, does not depend on it.)
+    ...(secondaryClient
+      ? {
+          secondary_participant: async (): Promise<ReadinessCheckResult> => {
+            await secondaryClient.getLedgerEnd();
+            return { ok: true };
+          },
+        }
+      : {}),
     scan: async (): Promise<ReadinessCheckResult> => {
       // Cache-bypass: a readiness probe must hit Scan live, not read a stale
       // "ok" off the ScanClient AmuletRules TTL cache.
@@ -340,6 +406,8 @@ export function buildServices(config: FacilitatorConfig): Services {
         scan,
         facilitatorParty: config.facilitatorParty,
         userId,
+        // Execute, completion and confirm on the participant hosting the payer.
+        router,
         tokenRegistries: config.tokenRegistries,
       })
     : undefined;
@@ -348,6 +416,18 @@ export function buildServices(config: FacilitatorConfig): Services {
     metrics,
     readiness,
     facilitatorMemberId: config.facilitatorMemberId,
+    router,
+    // New wallets also on the secondary participant (config.onboardCoHostParticipantUid).
+    onboardCoHost:
+      config.onboardCoHostParticipantUid && router.secondary
+        ? {
+            participantUid: config.onboardCoHostParticipantUid,
+            client: router.secondary.client,
+            userId: router.secondary.userId,
+            grantPartyRights: config.secondaryParticipant?.grantPartyRights ?? true,
+          }
+        : undefined,
+    grantPartyRights: config.grantPartyRights,
     client,
     scan,
     merchantContract: new MerchantContractService(client, config.facilitatorParty),
@@ -370,12 +450,14 @@ export function buildServices(config: FacilitatorConfig): Services {
     // Same PreapprovalService capability, consumed by registerWalletRoutes as
     // the SELF-PROVIDER preapproval service (merchant provisions its own,
     // single-controller — no facilitator CanActAs). Stateless, so a second
-    // instance is fine.
+    // instance is fine. Its reads, prepare and execute go to the participant
+    // hosting the merchant.
     selfPreapproval: new PreapprovalService({
       client,
       scan,
       facilitatorParty: config.facilitatorParty,
       userId,
+      router,
     }),
     enablePreapprovalProvider: config.enablePreapprovalProvider,
     scanUrl: config.scanUrl,
@@ -383,8 +465,17 @@ export function buildServices(config: FacilitatorConfig): Services {
     tokenRegistries: config.tokenRegistries,
     enableAgentWallet: config.enableAgentWallet,
     walletSubmitChoices: config.walletSubmitChoiceAllowlist,
+    walletSubmitCreateTemplates: config.walletSubmitCreateTemplates,
+    walletReadIds: config.walletReadIds,
     submitRateMaxPerKey: config.walletSubmitRateMaxPerKey,
     onboardRateMaxGlobal: config.walletOnboardRateMaxGlobal,
+    onboardDailyMax: config.walletOnboardDailyMax,
+    abuseStrikesToBan: config.abuseStrikesToBan,
+    abuseStrikeWindowMs: config.abuseStrikeWindowMs,
+    abuseBaseBanMs: config.abuseBaseBanMs,
+    abuseBanMultiplier: config.abuseBanMultiplier,
+    abuseMaxBanMs: config.abuseMaxBanMs,
+    abuseStrikeSpacingMs: config.abuseStrikeSpacingMs,
     submitRateMaxPerIp: config.walletSubmitRateMaxPerIp,
     agentWalletApiKey: config.agentWalletApiKey,
     faucet: config.faucetEnabled
@@ -404,6 +495,7 @@ export function buildServices(config: FacilitatorConfig): Services {
           maxGlobalPerMin: config.faucetMaxGlobalPerMin,
           burstWindowMs: config.faucetBurstWindowMs,
           ipExempt: config.faucetIpExempt,
+          onOnboard: config.faucetOnOnboard,
         }
       : undefined,
     tfEnabled: config.tfEnabled,
@@ -451,6 +543,7 @@ export function buildServices(config: FacilitatorConfig): Services {
       },
       merchantPolicy: config.inlineMerchantPolicy,
       merchantAllowlist: config.inlineMerchantAllowlist,
+      acceptedFeePayers: config.acceptedFeePayers,
       // Registry-utility (non-Amulet) Rule 7 on the inline arm: reuse the settle
       // gate's registry-aware probe so a USDCx/cBTC merchant's preapproval is
       // detected the same way on /verify and /settle.
@@ -476,7 +569,9 @@ export function buildServices(config: FacilitatorConfig): Services {
       // for our own agent wallets and stays honestly unanswered for the rest,
       // rather than being answered wrongly for everyone.
       fetchOwnedHoldingAmounts: async (party: string) => {
-        const events = await client.queryActiveContracts({
+        // Asked of the participant hosting the payer; with one participant,
+        // that is `client`.
+        const events = await (await router.forParty(party)).client.queryActiveContracts({
           filtersByParty: {
             [party]: {
               cumulative: [

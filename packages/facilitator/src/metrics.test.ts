@@ -69,6 +69,20 @@ describe("createMetrics", () => {
     expect(s).toMatch(/scope="settle"\} 2/);
   });
 
+  it("labels relay_error_total by route and kind (the pay/prepare blind spot)", async () => {
+    const m = createMetrics({ collectDefault: false });
+    m.recordRelayError("pay/prepare", "server");
+    m.recordRelayError("pay/prepare", "server");
+    m.recordRelayError("preapproval/self/prepare", "server");
+    m.recordRelayError("pay/prepare", "client");
+    const s = await m.registry.getSingleMetricAsString(
+      "x402_facilitator_relay_error_total"
+    );
+    expect(s).toMatch(/route="pay\/prepare",kind="server"\} 2/);
+    expect(s).toMatch(/route="preapproval\/self\/prepare",kind="server"\} 1/);
+    expect(s).toMatch(/route="pay\/prepare",kind="client"\} 1/);
+  });
+
   it("two instances have independent registries (test isolation)", async () => {
     const a = createMetrics({ collectDefault: false });
     const b = createMetrics({ collectDefault: false });

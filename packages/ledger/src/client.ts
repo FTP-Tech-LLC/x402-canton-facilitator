@@ -67,6 +67,14 @@ export interface DisclosedContract {
   synchronizerId: string;
 }
 
+/** `Commands.deduplication_period` in the JSON Ledger API v2 encoding. Absent
+ *  means `Empty`, which the participant resolves to its configured maximum
+ *  deduplication DURATION; an offset is the only form whose window does not
+ *  depend on participant configuration or clocks. */
+export type JsDeduplicationPeriod =
+  | { DeduplicationOffset: { value: number } }
+  | { DeduplicationDuration: { value: { seconds: number; nanos: number } } };
+
 export interface JsCommandsBody {
   commandId: string;
   userId: string;
@@ -74,6 +82,10 @@ export interface JsCommandsBody {
   readAs?: string[];
   synchronizerId?: string;
   disclosedContracts?: DisclosedContract[];
+  /** Identifies this attempt on its completion. Fresh per attempt; the
+   *  commandId is what stays the same across retries. */
+  submissionId?: string;
+  deduplicationPeriod?: JsDeduplicationPeriod;
   commands: JsCommand[];
 }
 
@@ -190,6 +202,79 @@ export interface ActiveContractsFilter {
   >;
 }
 
+/**
+ * The Canton error id (`DUPLICATE_COMMAND`, `SUBMISSION_ALREADY_IN_FLIGHT`, …)
+ * carried by a failed JSON Ledger API call, or undefined.
+ *
+ * The HTTP status alone cannot tell these apart: the JSON API maps both gRPC
+ * ABORTED and ALREADY_EXISTS to 409 (canton `GrpcHttpErrorCodes`), so "already
+ * committed", "still in flight" and "rejected by the mediator" all arrive as
+ * 409. The id in the body is the only discriminator.
+ */
+export function cantonErrorId(err: unknown): string | undefined {
+  const body = (err as { responseBody?: unknown })?.responseBody;
+  if (typeof body !== "string" || body === "") return undefined;
+  try {
+    const code = (JSON.parse(body) as { code?: unknown }).code;
+    if (typeof code === "string" && /^[A-Z][A-Z0-9_]+$/.test(code)) return code;
+  } catch {
+    // not JSON — fall through to the textual form
+  }
+  // A JSON body cut short by our own 1 KiB cap: `code` is its first field, so
+  // it survives the cut even when the whole body no longer parses.
+  const cut = /"code"\s*:\s*"([A-Z][A-Z0-9_]+)"/.exec(body)?.[1];
+  if (cut) return cut;
+  // gRPC-style text: "DUPLICATE_COMMAND(10,abc123): ..."
+  return /\b([A-Z][A-Z0-9_]{3,})\(\d+,/.exec(body)?.[1];
+}
+
+/** One completion for a commandId (see findCommandCompletions). */
+export interface CommandCompletion {
+  submissionId?: string;
+  updateId?: string;
+  offset?: number;
+  /** Absent when the submission was accepted. */
+  rejection?: string;
+}
+
+/**
+ * The top-level elements of a JSON array that arrived WHOLE, as raw strings.
+ * A stream cut mid-element (or mid-string) simply ends the list there.
+ */
+export function completeArrayElements(text: string): string[] {
+  const out: string[] = [];
+  let i = text.indexOf("[");
+  if (i < 0) return out;
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (i = i + 1; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      if (depth === 0 && start < 0) start = i;
+    } else if (ch === "{" || ch === "[") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === "}" || ch === "]") {
+      if (depth === 0) break; // the array's own closing bracket
+      depth--;
+      if (depth === 0 && start >= 0) {
+        out.push(text.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  return out;
+}
+
 export class CantonError extends Error {
   constructor(
     message: string,
@@ -204,9 +289,22 @@ export class CantonError extends Error {
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 
+/** The participant's list cap, read from its refusal: "The number of matching
+ *  elements (201) is greater than the node limit (200)." Undefined when the
+ *  body does not say. */
+function nodeListLimit(responseBody: string | undefined): number | undefined {
+  const m = /node limit \((\d+)\)/.exec(responseBody ?? "");
+  const n = m ? Number(m[1]) : NaN;
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
 export class CantonClient {
   private readonly fetchFn: typeof globalThis.fetch;
   private readonly timeoutMs: number;
+  /** The participant's list cap, once a refusal has named it (see
+   *  queryActiveContractsSlice). Later slices start at it instead of being
+   *  refused again. */
+  private nodeListCap: number | undefined;
 
   constructor(private readonly opts: CantonClientOptions) {
     this.fetchFn = opts.fetch ?? globalThis.fetch;
@@ -423,18 +521,25 @@ export class CantonClient {
   }
 
   /**
-   * POST /v2/updates/transaction-by-id
+   * POST /v2/updates/update-by-id
    *
-   * Look up a transaction by its `updateId`, scoped to one
-   * requesting party. Returns the `events[]` array (LEDGER_EFFECTS
-   * shape — top-level created/archived/exercised events only;
-   * children of an Exercised event are not flattened).
+   * Look up a transaction by its `updateId`, scoped to the requesting parties.
+   * Returns the `events[]` array: by default the narrow projection (each
+   * party's own creates and archives, no exercises — TRANSACTION_SHAPE_ACS_DELTA),
+   * or with `fullEffects` the whole ledger-effects tree.
    *
    * Used by the CIP-56 client signer to correlate the exact
    * `TransferInstruction` cid created by a freshly-executed
    * `TransferFactory_Transfer` — ACS-scanning is unsafe because
    * the same sender may have unrelated TransferInstructions
    * outstanding from prior transfers.
+   *
+   * The narrow projection used to come from `POST /v2/updates/transaction-by-id`
+   * with `requestingParties`. Canton 3.6 disables that endpoint
+   * (DEPRECATED_API_DISABLED; 3.7 removes it). What it returned — measured on a
+   * live MainNet USDCx settle: 2 events, both Created/Archived of the payer's
+   * own Holding, no exercises — is the ACS-delta shape, so the same request
+   * now goes to update-by-id with that shape.
    */
   async getTransactionById(args: {
     /** Ask for the full ledger-effects tree (exercises included) instead of the
@@ -472,65 +577,58 @@ export class CantonClient {
           ArchivedEvent?: { contractId: string; templateId: string };
         }>;
       };
-    }>(
-      args.fullEffects ? "/v2/updates/update-by-id" : "/v2/updates/transaction-by-id",
-      args.fullEffects
-        ? {
-            // THE SAME PARTY ON THE SAME TRANSACTION SEES DIFFERENT EVENTS
-            // DEPENDING ON WHICH REQUEST SHAPE ASKS. Measured on a live MainNet
-            // USDCx settle, payer as the requesting party:
-            //   transaction-by-id + requestingParties -> 2 events, both
-            //     Created/Archived of the payer's own Holding, NO exercises
-            //   update-by-id + updateFormat.filtersByParty(wildcard) -> the
-            //     full ledger-effects tree, including TransferFactory_Transfer
-            //     WITH its exerciseResult
-            // The registry funds-moved proof lives in that exerciseResult, so
-            // it needs this shape. Amulet keeps the original request byte for
-            // byte: its positive signal is an archived Amulet, which the
-            // narrow shape already carries, and widening the event set there
-            // could only add events its heuristics might trip over — not a
-            // trade worth making on the path six merchants are paid through.
-            updateId: args.updateId,
-            updateFormat: {
-              includeTransactions: {
-                eventFormat: {
-                  filtersByParty: Object.fromEntries(
-                    args.requestingParties.map((p) => [
-                      p,
-                      {
-                        cumulative: [
-                          {
-                            identifierFilter: {
-                              WildcardFilter: {
-                                value: { includeCreatedEventBlob: false },
-                              },
-                            },
-                          },
-                        ],
+    }>("/v2/updates/update-by-id", {
+      // THE SAME PARTY ON THE SAME TRANSACTION SEES DIFFERENT EVENTS
+      // DEPENDING ON THE SHAPE. Measured on a live MainNet USDCx settle, payer
+      // as the requesting party:
+      //   narrow (formerly transaction-by-id + requestingParties) -> 2 events,
+      //     both Created/Archived of the payer's own Holding, NO exercises
+      //   LEDGER_EFFECTS -> the full tree, including TransferFactory_Transfer
+      //     WITH its exerciseResult
+      // The registry funds-moved proof lives in that exerciseResult, so it asks
+      // for fullEffects. Amulet keeps the narrow event set: its positive signal
+      // is an archived Amulet, which the narrow shape already carries, and
+      // widening the event set there could only add events its heuristics might
+      // trip over — not a trade worth making on the path six merchants are paid
+      // through.
+      updateId: args.updateId,
+      updateFormat: {
+        includeTransactions: {
+          eventFormat: {
+            filtersByParty: Object.fromEntries(
+              args.requestingParties.map((p) => [
+                p,
+                {
+                  cumulative: [
+                    {
+                      identifierFilter: {
+                        WildcardFilter: {
+                          value: { includeCreatedEventBlob: false },
+                        },
                       },
-                    ])
-                  ),
-                  verbose: false,
+                    },
+                  ],
                 },
-                transactionShape: "TRANSACTION_SHAPE_LEDGER_EFFECTS",
-              },
-            },
-          }
-        : {
-            updateId: args.updateId,
-            requestingParties: args.requestingParties,
-            transactionShape: "TRANSACTION_SHAPE_LEDGER_EFFECTS",
-          }
-    );
-    // The two endpoints wrap the transaction differently. MEASURED, not assumed:
-    //   transaction-by-id -> { transaction: { events } }
-    //   update-by-id      -> { update: { Transaction: { value: { events } } } }
+              ])
+            ),
+            verbose: false,
+          },
+          transactionShape: args.fullEffects
+            ? "TRANSACTION_SHAPE_LEDGER_EFFECTS"
+            : "TRANSACTION_SHAPE_ACS_DELTA",
+        },
+      },
+    });
+    // update-by-id wraps the transaction as { update: { Transaction: { value } } }
+    // (MEASURED). The flat { transaction } wrapper of the old transaction-by-id
+    // is still read, so a test double or a participant answering in that shape
+    // parses the same.
     const wrapped = (
       response as unknown as {
         update?: { Transaction?: { value?: { updateId?: string; offset?: number; events?: unknown[] } } };
       }
     ).update?.Transaction?.value;
-    const tx = (args.fullEffects ? wrapped : response.transaction) ?? {};
+    const tx = wrapped ?? response.transaction ?? {};
     return {
       updateId: tx.updateId ?? args.updateId,
       offset: tx.offset ?? 0,
@@ -557,24 +655,35 @@ export class CantonClient {
    * MISSING_FIELD. Returns `created: null` when the contract is invisible
    * to the requesting parties or does not exist; `archived: true` when it
    * existed but was archived (e.g. a TransferCommand consumed by its Send).
+   *
+   * `interfaceViews` asks for the contract through those interfaces instead
+   * of the wildcard, so the create carries their views (`interfaceViews`):
+   * the way to read one holding's token-standard view (HoldingV1) when the
+   * holding is known by id but its template's own fields are not.
    */
   async getEventsByContractId(args: {
     contractId: string;
     requestingParties: string[];
+    interfaceViews?: readonly string[];
   }): Promise<{ created: CreatedEvent | null; archived: boolean }> {
-    const filtersByParty = Object.fromEntries(
-      args.requestingParties.map((p) => [
-        p,
-        {
-          cumulative: [
+    const cumulative =
+      args.interfaceViews && args.interfaceViews.length > 0
+        ? args.interfaceViews.map((interfaceId) => ({
+            identifierFilter: {
+              InterfaceFilter: {
+                value: { interfaceId, includeInterfaceView: true, includeCreatedEventBlob: false },
+              },
+            },
+          }))
+        : [
             {
               identifierFilter: {
                 WildcardFilter: { value: { includeCreatedEventBlob: false } },
               },
             },
-          ],
-        },
-      ])
+          ];
+    const filtersByParty = Object.fromEntries(
+      args.requestingParties.map((p) => [p, { cumulative }])
     );
     const response = await this.post<{
       created?: { createdEvent?: CreatedEvent } | CreatedEvent;
@@ -630,6 +739,76 @@ export class CantonClient {
     filter: ActiveContractsFilter
   ): Promise<CreatedEvent[]> {
     const end = await this.getLedgerEnd();
+    return this.activeContractsAt(filter, end.offset);
+  }
+
+  /**
+   * POST /v2/state/active-contracts?limit=N — at most N contracts instead of
+   * the participant's 413.
+   *
+   * The participant refuses an unbounded list longer than its element cap
+   * (`http-list-max-elements-limit`, 200 by default), and the ACS has no
+   * cursor. What it does accept is `limit`: it then returns the first N
+   * matches, which the participant serves oldest-first. A party with more
+   * contracts than the cap can therefore still be worked through — read a
+   * slice, consume part of it (a merge), read again — which is how `merge`
+   * converges on a wallet that a plain read cannot list at all.
+   *
+   * `complete` is true only when fewer than the limit came back: a slice of
+   * exactly `limit` may or may not be everything, so it is reported as
+   * incomplete. Callers must treat an incomplete slice as a PREFIX, never as
+   * the whole set.
+   *
+   * A `limit` above the node's cap is itself refused with the cap in the
+   * error ("node limit (K)"); the query is then repeated once at K, so the
+   * caller does not have to know each participant's setting. This client then
+   * remembers K and starts every later slice at it, so a node configured
+   * below the default is refused once per client, not once per read.
+   */
+  async queryActiveContractsSlice(
+    filter: ActiveContractsFilter,
+    limit: number
+  ): Promise<{ events: CreatedEvent[]; complete: boolean; limit: number }> {
+    if (!Number.isInteger(limit) || limit < 1) {
+      throw new CantonError(
+        `queryActiveContractsSlice: limit must be a positive integer (got ${limit})`,
+        "INVALID_ARGUMENT"
+      );
+    }
+    const end = await this.getLedgerEnd();
+    let used = this.nodeListCap === undefined ? limit : Math.min(limit, this.nodeListCap);
+    let page: { events: CreatedEvent[]; rows: number };
+    try {
+      page = await this.activeContractsPage(filter, end.offset, used);
+    } catch (err) {
+      const cap =
+        err instanceof CantonError && err.code === "ACS_LIMIT_EXCEEDED"
+          ? nodeListLimit(err.responseBody)
+          : undefined;
+      if (cap === undefined || cap >= used) throw err;
+      this.nodeListCap = cap;
+      used = cap;
+      page = await this.activeContractsPage(filter, end.offset, used);
+    }
+    // Completeness is decided on the ROWS the participant returned, not on the
+    // events we kept: an entry without a created event (e.g. an in-flight
+    // reassignment) still counts against the limit, and dropping it must not
+    // turn a full — possibly partial — slice into a "complete" one.
+    return { events: page.events, complete: page.rows < used, limit: used };
+  }
+
+  private async activeContractsAt(
+    filter: ActiveContractsFilter,
+    offset: number
+  ): Promise<CreatedEvent[]> {
+    return (await this.activeContractsPage(filter, offset)).events;
+  }
+
+  private async activeContractsPage(
+    filter: ActiveContractsFilter,
+    offset: number,
+    limit?: number
+  ): Promise<{ events: CreatedEvent[]; rows: number }> {
     type AcsEntry = {
       contractEntry?: {
         JsActiveContract?: { createdEvent?: CreatedEvent };
@@ -639,10 +818,17 @@ export class CantonClient {
     type AcsResponse = AcsEntry[] | { contractEntries?: AcsEntry[] };
     let response: AcsResponse;
     try {
-      response = await this.post<AcsResponse>("/v2/state/active-contracts", {
-        filter,
-        verbose: false,
-        activeAtOffset: end.offset,
+      const path =
+        limit === undefined
+          ? "/v2/state/active-contracts"
+          : `/v2/state/active-contracts?limit=${limit}`;
+      // `eventFormat`, not the top-level `filter` + `verbose`: Canton 3.6
+      // rejects those deprecated fields with 400 unless the participant sets
+      // features.deprecated.enable-deprecated-parameters-34, and 3.7 removes
+      // them. eventFormat is accepted since 3.3, so older nodes read it too.
+      response = await this.post<AcsResponse>(path, {
+        eventFormat: { ...filter, verbose: false },
+        activeAtOffset: offset,
       });
     } catch (err) {
       // A 413 (or the JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED marker the
@@ -686,7 +872,7 @@ export class CantonClient {
         entry.createdEvent;
       if (created) events.push(created);
     }
-    return events;
+    return { events, rows: entries.length };
   }
 
   private async post<T>(path: string, body: unknown): Promise<T> {
@@ -801,11 +987,27 @@ export class CantonClient {
   }
 
   /**
-   * Grant a participant user CanActAs + CanReadAs on a party. Lets the relay's
-   * ledger user PREPARE interactive submissions for a freshly onboarded
-   * external (agent) party. NOT custody: the external party's namespace is its
-   * own key, so execution still requires the party's own signature — the user
-   * can build unsigned transactions but never sign them.
+   * GET /v2/parties/{party}: this participant's record of a party, or
+   * undefined when it has none. `isLocal` is true when this participant hosts
+   * the party. A read refused for a party it does not host is the caller's
+   * question answered, never a sign that our own read rights broke.
+   */
+  async getPartyDetails(party: string): Promise<{ party: string; isLocal: boolean } | undefined> {
+    const r = await this.request<{ partyDetails?: Array<{ party?: string; isLocal?: boolean }> }>(
+      "GET",
+      `/v2/parties/${encodeURIComponent(party)}`
+    );
+    const d = r.partyDetails?.find((x) => x.party === party);
+    return d ? { party, isLocal: d.isLocal === true } : undefined;
+  }
+
+  /**
+   * Grant a participant user CanActAs on a party. Lets the relay's ledger user
+   * read the party's ACS, PREPARE interactive submissions for it and EXECUTE
+   * them for a freshly onboarded external (agent) party. NOT custody: the
+   * external party's namespace is its own key, so execution still requires the
+   * party's own signature — the user can build unsigned transactions but never
+   * sign them.
    */
   async grantUserRights(userId: string, party: string): Promise<void> {
     await this.request<unknown>(
@@ -814,15 +1016,14 @@ export class CantonClient {
       {
         userId,
         rights: [
-          // BOTH are required. CanReadAs: read the party ACS (balance/pending,
-          // input selection). CanActAs: the relay user EXECUTES the agent's
-          // interactive submissions on its behalf (claim/pay) — without it
-          // /v2/interactive-submission/execute returns HTTP 403. (A prior
-          // CanReadAs-only attempt broke claim/pay; the earlier HTTP 400 was
-          // TOO_MANY_USER_RIGHTS, a participant count cap since raised, NOT a
-          // rejection of CanActAs on external parties.)
+          // One right is enough. CanActAs also authorizes reads: Canton's
+          // canReadAs accepts an act-as claim (Claims.scala), so the ACS reads
+          // behind balance/pending/input selection keep working. Without
+          // CanActAs, /v2/interactive-submission/execute returns HTTP 403 (a
+          // CanReadAs-only attempt once broke claim/pay). A second CanReadAs
+          // per party only halved how many parties fit under a participant's
+          // max-rights-per-user, which is the default 1000 on most nodes.
           { kind: { CanActAs: { value: { party } } } },
-          { kind: { CanReadAs: { value: { party } } } },
         ],
       }
     );
@@ -896,14 +1097,132 @@ export class CantonClient {
     );
   }
 
+  /**
+   * ONE PASS over the completion stream: every completion for `commandId`
+   * after `beginExclusive`, accepted and rejected, in ledger order.
+   *
+   * This is how a submitter learns what an attempt with a lost answer did.
+   * Unlike readCompletions it THROWS when the stream could not be read (token,
+   * non-2xx, no body), so "the read failed" is never confused with "no
+   * completion yet". An empty result means only that nothing for this command
+   * has been published so far.
+   */
+  async findCommandCompletions(
+    userId: string,
+    party: string,
+    commandId: string,
+    beginExclusive: number
+  ): Promise<CommandCompletion[]> {
+    const out: CommandCompletion[] = [];
+    for (const v of await this.readCompletionsStrict(userId, party, beginExclusive)) {
+      if (v.commandId !== commandId) continue;
+      const c: CommandCompletion = {};
+      if (v.submissionId !== undefined) c.submissionId = v.submissionId;
+      if (v.updateId) c.updateId = v.updateId;
+      if (typeof v.offset === "number") c.offset = v.offset;
+      if (v.status && v.status.code !== undefined && v.status.code !== 0) {
+        c.rejection = v.status.message || `status ${v.status.code}`;
+      }
+      out.push(c);
+    }
+    return out;
+  }
+
+  /**
+   * The completion stream from `beginExclusive`, failing loudly.
+   *
+   * The endpoint is a live stream: it does not close at the ledger end, so the
+   * read always ends on our own deadline or size cap, usually in the middle of
+   * an element. Only the elements that arrived whole are returned — the cut one
+   * is dropped rather than letting it spoil the parse of everything before it.
+   */
+  private async readCompletionsStrict(
+    userId: string,
+    party: string,
+    beginExclusive: number
+  ): Promise<
+    Array<{
+      commandId?: string;
+      submissionId?: string;
+      updateId?: string;
+      offset?: number;
+      status?: { code?: number; message?: string };
+    }>
+  > {
+    const tok =
+      typeof this.opts.token === "string" ? this.opts.token : await this.opts.token();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2000);
+    let buf = "";
+    try {
+      let res: Response;
+      try {
+        res = await this.fetchFn(`${this.opts.participantUrl}/v2/commands/completions`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ userId, parties: [party], beginExclusive }),
+          signal: controller.signal,
+        });
+      } catch (err) {
+        throw new CantonError(
+          `POST /v2/commands/completions failed: ${err instanceof Error ? err.message : String(err)}`,
+          "TRANSPORT_ERROR"
+        );
+      }
+      if (!res.ok || !res.body) {
+        const text = await res.text().catch(() => "");
+        throw new CantonError(
+          `POST /v2/commands/completions returned HTTP ${res.status}`,
+          "HTTP_ERROR",
+          res.status,
+          text.slice(0, 1024)
+        );
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          if (buf.length > 500_000) break;
+        }
+      } catch {
+        /* our deadline — the normal end of a live stream */
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    return completeArrayElements(buf)
+      .map((raw) => {
+        try {
+          return (JSON.parse(raw) as { completionResponse?: { Completion?: { value?: unknown } } })
+            .completionResponse?.Completion?.value;
+        } catch {
+          return undefined;
+        }
+      })
+      .filter(
+        (v): v is {
+          commandId?: string;
+          submissionId?: string;
+          updateId?: string;
+          offset?: number;
+          status?: { code?: number; message?: string };
+        } => !!v && typeof v === "object"
+      );
+  }
+
   private async readCompletions(
     userId: string,
     party: string,
     beginExclusive: number
   ): Promise<
     Array<{
+      commandId?: string;
       submissionId?: string;
       updateId?: string;
+      offset?: number;
       status?: { code?: number; message?: string };
     }>
   > {
@@ -947,8 +1266,10 @@ export class CantonClient {
         .map((c) => c.completionResponse?.Completion?.value)
         .filter(
           (v): v is {
+            commandId?: string;
             submissionId?: string;
             updateId?: string;
+            offset?: number;
             status?: { code?: number; message?: string };
           } => !!v
         );

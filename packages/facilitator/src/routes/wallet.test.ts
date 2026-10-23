@@ -215,6 +215,27 @@ describe("wallet relay routes", () => {
     expect(r.json().detail).toContain("TOO_MANY_USER_RIGHTS");
     await a.close();
   });
+
+  it("a DAML_FAILURE from the ledger is the caller's problem → 409 ledger_refused, not 502", async () => {
+    // 2026-09-07: a merchant's TransferPreapproval lapsed and every pay/prepare
+    // to it came back as our 502 + level:50, so clients retried the unretryable
+    // and our own error metric lit for someone else's expiry.
+    const refused = Object.assign(new Error("POST /v2/interactive-submission/prepare returned HTTP 400"), {
+      code: "HTTP_ERROR",
+      status: 400,
+      responseBody: JSON.stringify({
+        code: "DAML_FAILURE",
+        cause: "Interpretation error: Error: User failure: stdlib.daml.com/deadline-exceeded (error category 9): Ledger time is at or past deadline 'TransferPreapproval.expiresAt'",
+      }),
+    });
+    const s = svc({ client: mockClient({ allocateExternalParty: vi.fn().mockRejectedValue(refused) }) as never });
+    const a = await build(s);
+    const r = await a.inject({ method: "POST", url: "/v1/wallet/onboard/finalize", payload: { onboardingTransactions: ["tx1"], multiHashSignatures: [{ format: "F", signature: "S", signingAlgorithmSpec: "A", signedBy: "fp1" }] } });
+    expect(r.statusCode).toBe(409);
+    expect(r.json().error).toBe("ledger_refused");
+    expect(r.json().detail).toContain("deadline-exceeded");
+    await a.close();
+  });
 });
 
 describe("resolve/transfer-factory instrument routing", () => {
@@ -371,7 +392,9 @@ describe("pay/prepare venueMeta validation (bounded, /venue-suffixed, no memo cl
     expect(r.json().error).toMatch(/object/i);
   });
 
-  it("does NOT reject a valid venueMeta on venue grounds (proceeds past validation)", async () => {
+  // Past validation it walks into the real Scan retry backoff (~3 s against an
+  // unreachable host), which timed out at the 5 s default on a busy CI runner.
+  it("does NOT reject a valid venueMeta on venue grounds (proceeds past validation)", { timeout: 20_000 }, async () => {
     // With no registry configured it fails later on the CC prepare path, but the
     // failure must NOT be about venueMeta — validation let it through.
     const r = await post({ "ftp/venue": "ftp/agentic-wallet" });
@@ -894,6 +917,189 @@ describe("wallet relay faucet route (POST /v1/wallet/faucet/claim)", () => {
     expect(no.statusCode).toBe(401);
     await a.close();
   });
+
+  describe("starter grant at onboarding (faucet.onOnboard)", () => {
+    const NEW_PARTY = "agent::1220abcd5678";
+    const grantClient = (submit: ReturnType<typeof vi.fn>) =>
+      mockClient({
+        submitAndWaitForTransaction: submit,
+        allocateExternalParty: vi.fn().mockResolvedValue({ partyId: NEW_PARTY }),
+      }) as never;
+    const finalize = (a: Awaited<ReturnType<typeof build>>) =>
+      a.inject({
+        method: "POST",
+        url: "/v1/wallet/onboard/finalize",
+        payload: {
+          onboardingTransactions: ["tx1"],
+          multiHashSignatures: [{ format: "F", signature: "S", signingAlgorithmSpec: "A", signedBy: "fp1" }],
+        },
+      });
+    const receiverOf = (submit: ReturnType<typeof vi.fn>, call = 0) =>
+      (submit.mock.calls[call]![0] as {
+        commands: Array<{ ExerciseCommand: { choiceArgument: { transfer: { receiver: string; amount: string } } } }>;
+      }).commands[0]!.ExerciseCommand.choiceArgument.transfer;
+    const unknownInformees = () =>
+      Object.assign(
+        new Error("HTTP 400: UNKNOWN_INFORMEES(11,abc): The participant is not connected to informees"),
+        { code: "HTTP_ERROR", status: 400 }
+      );
+
+    it("pays the new party one grant in the background and says so in the answer", async () => {
+      stubScanFetch();
+      const store = createInMemoryFaucetStore();
+      const submit = vi.fn().mockResolvedValue({ updateId: "u-grant", offset: 1, events: [] });
+      const a = await build(
+        faucetSvc({
+          client: grantClient(submit),
+          faucet: faucetConf({ store, amountCc: "1", dailyBudgetCc: "10", onOnboard: true }),
+        })
+      );
+      const r = await finalize(a);
+      expect(r.statusCode).toBe(200);
+      expect(r.json()).toEqual({ party: NEW_PARTY, starterGrant: { status: "scheduled", amountCc: "1" } });
+      await vi.waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+      expect(receiverOf(submit)).toMatchObject({ receiver: NEW_PARTY, amount: "1" });
+      // It is the party's one faucet claim: the faucet route now refuses it.
+      await vi.waitFor(async () => expect(await store.hasClaimed(NEW_PARTY)).toBe(true));
+      const again = await a.inject({ method: "POST", url: "/v1/wallet/faucet/claim", payload: { party: NEW_PARTY } });
+      expect(again.statusCode).toBe(429);
+      expect(submit).toHaveBeenCalledTimes(1);
+      await a.close();
+    });
+
+    it("is off unless asked for: the answer and the ledger are untouched", async () => {
+      stubScanFetch();
+      const submit = vi.fn().mockResolvedValue({ updateId: "u-grant", offset: 1, events: [] });
+      const a = await build(
+        faucetSvc({ client: grantClient(submit) })
+      );
+      const r = await finalize(a);
+      expect(r.json()).toEqual({ party: NEW_PARTY });
+      await new Promise((res) => setTimeout(res, 20));
+      expect(submit).not.toHaveBeenCalled();
+      await a.close();
+    });
+
+    it("waits out UNKNOWN_INFORMEES while the new party reaches the synchronizer", async () => {
+      stubScanFetch();
+      const store = createInMemoryFaucetStore();
+      const submit = vi
+        .fn()
+        .mockRejectedValueOnce(unknownInformees())
+        .mockRejectedValueOnce(unknownInformees())
+        .mockResolvedValue({ updateId: "u-grant", offset: 1, events: [] });
+      const a = await build(
+        faucetSvc({
+          client: grantClient(submit),
+          faucet: faucetConf({ store, amountCc: "1", dailyBudgetCc: "10", onOnboard: true, propagationRetryMs: 1 }),
+        })
+      );
+      await finalize(a);
+      await vi.waitFor(() => expect(submit).toHaveBeenCalledTimes(3));
+      await vi.waitFor(async () => expect(await store.hasClaimed(NEW_PARTY)).toBe(true));
+      await a.close();
+    });
+
+    it("gives up after the retries and hands the reservation back (nothing moved)", async () => {
+      stubScanFetch();
+      const store = createInMemoryFaucetStore();
+      const submit = vi.fn().mockRejectedValue(unknownInformees());
+      const a = await build(
+        faucetSvc({
+          client: grantClient(submit),
+          faucet: faucetConf({ store, amountCc: "1", dailyBudgetCc: "10", onOnboard: true, propagationRetryMs: 1 }),
+        })
+      );
+      await finalize(a);
+      await vi.waitFor(() => expect(submit).toHaveBeenCalledTimes(9)); // 1 + 8 retries
+      await vi.waitFor(async () => expect(await store.hasClaimed(NEW_PARTY)).toBe(false));
+      await new Promise((res) => setTimeout(res, 20));
+      expect(submit).toHaveBeenCalledTimes(9); // and then it stops
+      await a.close();
+    });
+
+    it("the faucet route itself does not wait on UNKNOWN_INFORMEES", async () => {
+      stubScanFetch();
+      const store = createInMemoryFaucetStore();
+      const submit = vi.fn().mockRejectedValue(unknownInformees());
+      const a = await build(
+        faucetSvc({
+          client: grantClient(submit),
+          faucet: faucetConf({ store, propagationRetryMs: 1 }),
+        })
+      );
+      const r = await a.inject({ method: "POST", url: "/v1/wallet/faucet/claim", payload: { party: "agent::1220cafe1234" } });
+      expect(r.statusCode).toBe(502);
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(await store.hasClaimed("agent::1220cafe1234")).toBe(false);
+      await a.close();
+    });
+
+    it("a budget refusal never fails the onboarding, and no grant is promised", async () => {
+      stubScanFetch();
+      const submit = vi.fn().mockResolvedValue({ updateId: "u-grant", offset: 1, events: [] });
+      const a = await build(
+        faucetSvc({
+          client: grantClient(submit),
+          faucet: faucetConf({ amountCc: "1", dailyBudgetCc: "0.5", onOnboard: true }),
+        })
+      );
+      const r = await finalize(a);
+      expect(r.statusCode).toBe(200);
+      // Reserved before the answer: a client told "scheduled" would wait for a
+      // grant the budget already refused.
+      expect(r.json()).toEqual({ party: NEW_PARTY });
+      await new Promise((res) => setTimeout(res, 20));
+      expect(submit).not.toHaveBeenCalled();
+      await a.close();
+    });
+
+    it("a party that already had its grant is not promised another", async () => {
+      stubScanFetch();
+      const store = createInMemoryFaucetStore();
+      await store.tryClaim({
+        party: NEW_PARTY, ip: "1.2.3.4", amountCc: "1", nowMs: Date.now(),
+        windowMs: 86_400_000, dailyBudgetCc: "10", lifetimeCapCc: "25",
+      });
+      const submit = vi.fn().mockResolvedValue({ updateId: "u-grant", offset: 1, events: [] });
+      const a = await build(
+        faucetSvc({
+          client: grantClient(submit),
+          faucet: faucetConf({ store, amountCc: "1", dailyBudgetCc: "10", onOnboard: true }),
+        })
+      );
+      const r = await finalize(a);
+      expect(r.json()).toEqual({ party: NEW_PARTY });
+      await new Promise((res) => setTimeout(res, 20));
+      expect(submit).not.toHaveBeenCalled();
+      await a.close();
+    });
+
+    it("a store error never fails the onboarding either", async () => {
+      stubScanFetch();
+      const store: FaucetClaimStore = {
+        hasClaimed: vi.fn().mockResolvedValue(false),
+        tryClaim: vi.fn().mockRejectedValue(new Error("db down")),
+        tryReserve: vi.fn(),
+        markPaid: vi.fn(),
+        release: vi.fn(),
+        sumSince: vi.fn(),
+      };
+      const submit = vi.fn();
+      const a = await build(
+        faucetSvc({
+          client: grantClient(submit),
+          faucet: faucetConf({ store, amountCc: "1", onOnboard: true }),
+        })
+      );
+      const r = await finalize(a);
+      expect(r.statusCode).toBe(200);
+      expect(r.json()).toEqual({ party: NEW_PARTY });
+      expect(store.tryClaim).toHaveBeenCalled();
+      expect(submit).not.toHaveBeenCalled();
+      await a.close();
+    });
+  });
 });
 
 describe("submit/prepare — the relay builds only what it agreed to build", () => {
@@ -931,7 +1137,7 @@ describe("submit/prepare — the relay builds only what it agreed to build", () 
     // anything with no `choice` field at all — which is the standard way this
     // check gets walked past.
     expect(deniedChoice([{ CreateCommand: { templateId: "#p:M:T", createArguments: {} } }], ALLOWED))
-      .toBe("CreateCommand");
+      .toBe("CreateCommand M:T");
     expect(
       deniedChoice([{ ExerciseByKeyCommand: { choice: "TransferFactory_Transfer" } }], ALLOWED)
     ).toBe("ExerciseByKeyCommand");
@@ -1031,14 +1237,23 @@ describe("a read the participant refuses is the caller's answer, not our outage"
       }),
     });
 
-  async function app() {
-    return build(
+  /** `hosted`: what the participant says when asked whether it hosts the
+   *  party (GET /v2/parties/{party}); "unknown" = that lookup fails. */
+  async function app(hosted: boolean | "unknown" = true) {
+    const getPartyDetails = vi.fn(async (party: string) => {
+      if (hosted === "unknown") throw Object.assign(new Error("HTTP 503"), { code: "HTTP_ERROR", status: 503 });
+      return hosted ? { party, isLocal: true } : undefined;
+    });
+    const a = await build(
       svc({
         client: mockClient({
           queryActiveContracts: vi.fn().mockRejectedValue(refuse()),
+          getTransactionById: vi.fn().mockRejectedValue(refuse()),
+          getPartyDetails,
         }) as never,
       })
     );
+    return Object.assign(a, { getPartyDetails });
   }
   const bal = (a: Awaited<ReturnType<typeof app>>, party: string) =>
     a.inject({ method: "GET", url: `/v1/wallet/${encodeURIComponent(party)}/balance` });
@@ -1056,12 +1271,52 @@ describe("a read the participant refuses is the caller's answer, not our outage"
     await a.close();
   });
 
+  it("a party this participant does not host is never our outage, however many a caller asks about", async () => {
+    // A caller sweeping parties that live elsewhere used to fill the distinct-
+    // party count and flip every refusal to 502 + "read rights broken". The
+    // participant says whether it hosts a party; one it does not host cannot
+    // be ours to read.
+    const a = await app(false);
+    for (let i = 0; i < 12; i++) {
+      const r = await bal(a, `agent::1220stranger${i}`);
+      expect(r.statusCode).toBe(404);
+      expect((r.json() as { error: string }).error).toMatch(/not readable/);
+    }
+    await a.close();
+  });
+
+  it.each([
+    ["pending", "/pending"],
+    ["tx-amulets", "/tx-amulets?updateId=1220abc"],
+  ])("/%s attributes a refusal to its party too (it answered 502 + an error line before)", async (_name, suffix) => {
+    const a = await app(false);
+    const r = await a.inject({ method: "GET", url: `/v1/wallet/${encodeURIComponent("agent::1220elsewhere")}${suffix}` });
+    expect(r.statusCode).toBe(404);
+    await a.close();
+  });
+
+  it("asks the participant once per party, not once per request", async () => {
+    const a = await app(false);
+    for (let i = 0; i < 5; i++) await bal(a, "agent::1220sweptagain");
+    expect(a.getPartyDetails).toHaveBeenCalledTimes(1);
+    await a.close();
+  });
+
+  it("when the participant cannot say whether it hosts the party, the refusal still counts", async () => {
+    // "Could not tell" is not proof the party is a stranger: a broken lookup
+    // must not hide a broken read right.
+    const a = await app("unknown");
+    const codes: number[] = [];
+    for (let i = 0; i < 4; i++) codes.push((await bal(a, `agent::1220unsure${i}`)).statusCode);
+    expect(codes).toEqual([404, 404, 404, 502]);
+    await a.close();
+  });
+
   it("escalates to 502 once MANY DISTINCT parties are refused — that is our outage", async () => {
     // The escalation is what stops this trading one blind spot for another. If
-    // our own read rights broke, refusals would not stay confined to one
-    // party. Distinct-party count is the discriminator, and it costs no extra
-    // request.
-    const a = await app();
+    // our own read rights broke, refusals would not stay confined to one party
+    // we HOST. Among those, the distinct-party count is the discriminator.
+    const a = await app(true);
     const codes: number[] = [];
     for (let i = 0; i < 5; i++) {
       codes.push((await bal(a, `agent::1220party${i}`)).statusCode);
@@ -1077,6 +1332,47 @@ describe("a read the participant refuses is the caller's answer, not our outage"
     for (let i = 0; i < 6; i++) {
       expect((await bal(a, "agent::1220sameone")).statusCode).toBe(404);
     }
+    await a.close();
+  });
+});
+
+describe("a party whose holdings exceed the participant's element limit is its state, not our outage", () => {
+  const tooMany = () =>
+    Object.assign(new Error("active-contracts query exceeded the participant's element limit (JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED)"), {
+      code: "ACS_LIMIT_EXCEEDED",
+    });
+  it("our OWN party hitting the cap is our outage: the faucet answers 502, not a 413 blaming the claimant", async () => {
+    // The faucet selects inputs from the facilitator's own holdings. If those
+    // outgrow the participant's element cap, telling the claimant to merge
+    // holdings they do not own would hide a problem that is ours.
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ dso_party_id: "DSO::1220cafe" }), { status: 200 })));
+    const a = await build(
+      svc({
+        client: mockClient({ queryActiveContracts: vi.fn().mockRejectedValue(tooMany()) }) as never,
+        faucet: {
+          store: createInMemoryFaucetStore(),
+          amountCc: "0.2",
+          maxPerIp: 5,
+          dailyBudgetCc: "10",
+          lifetimeCapCc: "0",
+          windowMs: 86_400_000,
+        },
+      })
+    );
+    const r = await a.inject({ method: "POST", url: "/v1/wallet/faucet/claim", payload: { party: "agent::1220cafe1234" } });
+    expect(r.statusCode).toBe(502);
+    await a.close();
+    vi.unstubAllGlobals();
+  });
+
+  it.each(["balance", "holdings", "pending"])("/%s answers 413 holdings_exceed_node_limit, like /balance always did", async (route) => {
+    const a = await build(svc({ client: mockClient({ queryActiveContracts: vi.fn().mockRejectedValue(tooMany()) }) as never }));
+    const r = await a.inject({ method: "GET", url: `/v1/wallet/${encodeURIComponent("agent::1220whale")}/${route}` });
+    expect(r.statusCode).toBe(413);
+    const body = r.json() as { code: string; party: string; detail: string };
+    expect(body.code).toBe("holdings_exceed_node_limit");
+    expect(body.party).toBe("agent::1220whale");
+    expect(body.detail).toMatch(/merge|consolidate/);
     await a.close();
   });
 });
@@ -1415,6 +1711,84 @@ describe("onboard/finalize — facilitator-wide allocation budget", () => {
     expect((third.json() as { error: string }).error).toContain("onboarding");
     // A different caller is unaffected — the refusal was that IP's own cap.
     expect((await finalize(a, "203.0.113.10")).statusCode).toBe(200);
+    await a.close();
+  });
+});
+
+/**
+ * The per-minute global bounds the burst; the DAILY cap bounds the total. A
+ * script pacing just under the minute cap has no daily ceiling and could
+ * exhaust the participant's user-rights slots over ~12h, locking onboarding for
+ * everyone. This is the absolute stop.
+ */
+describe("onboard/finalize — daily allocation ceiling", () => {
+  const finalize = (a: ReturnType<typeof Fastify>, remoteAddress: string) =>
+    a.inject({
+      method: "POST",
+      url: "/v1/wallet/onboard/finalize",
+      remoteAddress,
+      payload: {
+        onboardingTransactions: ["tx1"],
+        multiHashSignatures: [
+          { format: "F", signature: "S", signingAlgorithmSpec: "A", signedBy: "fp1" },
+        ],
+      },
+    });
+
+  it("refuses past the daily cap even while the per-minute and per-IP arms have room", async () => {
+    const alloc = vi.fn().mockResolvedValue({ partyId: "agent::1220new" });
+    const s = svc({
+      client: mockClient({ allocateExternalParty: alloc }) as never,
+      // Minute + per-IP caps far out of the way: this asserts the DAILY arm.
+      submitRateMaxPerKey: 100,
+      onboardRateMaxGlobal: 100,
+      onboardDailyMax: 2,
+    });
+    const a = await build(s);
+    expect((await finalize(a, "203.0.113.1")).statusCode).toBe(200);
+    expect((await finalize(a, "203.0.113.2")).statusCode).toBe(200);
+    const third = await finalize(a, "203.0.113.3");
+    expect(third.statusCode).toBe(429);
+    expect(third.headers["retry-after"]).toBe("3600");
+    expect((third.json() as { error: string }).error).toBe("onboarding daily limit reached");
+    // Refused before the spend — nothing allocated past the cap.
+    expect(alloc).toHaveBeenCalledTimes(2);
+    await a.close();
+  });
+
+  it("a daily cap of 0 disables the daily arm", async () => {
+    const alloc = vi.fn().mockResolvedValue({ partyId: "agent::1220new" });
+    const s = svc({
+      client: mockClient({ allocateExternalParty: alloc }) as never,
+      submitRateMaxPerKey: 100,
+      onboardRateMaxGlobal: 100,
+      onboardDailyMax: 0,
+    });
+    const a = await build(s);
+    for (let i = 0; i < 5; i++) {
+      expect((await finalize(a, `192.0.2.${i}`)).statusCode).toBe(200);
+    }
+    expect(alloc).toHaveBeenCalledTimes(5);
+    await a.close();
+  });
+
+  it("the per-minute arm refuses first, leaving the daily budget unspent", async () => {
+    // Order matters: charging the 24h budget before the 60s one would burn a
+    // day-long slot every time the minute cap refuses.
+    const alloc = vi.fn().mockResolvedValue({ partyId: "agent::1220new" });
+    const s = svc({
+      client: mockClient({ allocateExternalParty: alloc }) as never,
+      submitRateMaxPerKey: 100,
+      onboardRateMaxGlobal: 1,
+      onboardDailyMax: 5,
+    });
+    const a = await build(s);
+    expect((await finalize(a, "203.0.113.1")).statusCode).toBe(200);
+    // Second call trips the per-MINUTE global (cap 1), with retry-after 60.
+    const second = await finalize(a, "203.0.113.2");
+    expect(second.statusCode).toBe(429);
+    expect(second.headers["retry-after"]).toBe("60");
+    expect(alloc).toHaveBeenCalledTimes(1);
     await a.close();
   });
 });
@@ -1841,5 +2215,1179 @@ describe("/pending lists registry-token rows only when asked (?registry=1)", () 
     const r = await a.inject({ method: "GET", url: "/v1/wallet/agent::12201/pending?registry=1" });
     expect(r.statusCode).toBe(200);
     expect(r.json().pending.map((p: { cid: string }) => p.cid)).toEqual(["cc-1", "cc-noview"]);
+  });
+});
+
+/**
+ * Escalating cooldown: an IP that keeps getting refused on agent-side money
+ * routes accrues strikes and is temporarily banned for a growing period. Fed by
+ * the routes' own per-IP refusals; NOT applied to /settle (merchant IP).
+ */
+describe("escalating cooldown for repeat abusers", () => {
+  const abuseSvc = () =>
+    svc({
+      // Per-IP onboarding cap of 1: the 2nd call in a window is refused and
+      // counts as a strike. 2 strikes -> ban.
+      submitRateMaxPerKey: 1,
+      abuseStrikesToBan: 2,
+      abuseStrikeWindowMs: 600_000,
+      abuseBaseBanMs: 3_600_000,
+      abuseBanMultiplier: 2,
+      abuseMaxBanMs: 86_400_000,
+      // Back-to-back refusals below must each count: spacing is tested separately.
+      abuseStrikeSpacingMs: 0,
+      client: {
+        allocateExternalParty: async () => ({ partyId: "agent::1220new" }),
+        grantUserRights: async () => undefined,
+      },
+    } as never);
+  const finalize = (a: ReturnType<typeof Fastify>) =>
+    a.inject({
+      method: "POST",
+      url: "/v1/wallet/onboard/finalize",
+      payload: {
+        onboardingTransactions: ["tx1"],
+        multiHashSignatures: [
+          { format: "F", signature: "S", signingAlgorithmSpec: "A", signedBy: "fp1" },
+        ],
+      },
+    });
+
+  it("bans an IP after repeated refusals, with a long Retry-After", async () => {
+    const a = await build(abuseSvc());
+    expect((await finalize(a)).statusCode).toBe(200); // 1st ok
+    expect((await finalize(a)).statusCode).toBe(429); // 2nd refused -> strike 1
+    expect((await finalize(a)).statusCode).toBe(429); // 3rd refused -> strike 2 -> ban
+    const banned = await finalize(a); // 4th: now under the ban itself
+    expect(banned.statusCode).toBe(429);
+    // The abuse ban Retry-After is hours (baseBanMs), not the 60s soft limit.
+    expect(Number(banned.headers["retry-after"])).toBeGreaterThan(600);
+    expect((banned.json() as { error: string }).error).toContain("suspended");
+    await a.close();
+  });
+
+  it("the ban is shared across agent-side routes but spares /settle", async () => {
+    const a = await build(abuseSvc());
+    // Earn a ban via onboarding.
+    await finalize(a);
+    await finalize(a);
+    await finalize(a);
+    // pay/prepare from the same IP is now refused by the cooldown...
+    const pay = await a.inject({
+      method: "POST",
+      url: "/v1/wallet/pay/prepare",
+      payload: { receiver: "m::1220", amount: "1" },
+    });
+    expect(pay.statusCode).toBe(429);
+    expect((pay.json() as { error: string }).error).toContain("suspended");
+    await a.close();
+  });
+
+  it("a different IP is unaffected by another IP's ban", async () => {
+    const a = await build(abuseSvc());
+    await finalize(a); // strikes/ban accrue on the default remote address
+    await finalize(a);
+    await finalize(a);
+    const other = await a.inject({
+      method: "POST",
+      url: "/v1/wallet/onboard/finalize",
+      remoteAddress: "203.0.113.77",
+      payload: {
+        onboardingTransactions: ["tx1"],
+        multiHashSignatures: [
+          { format: "F", signature: "S", signingAlgorithmSpec: "A", signedBy: "fp1" },
+        ],
+      },
+    });
+    expect(other.statusCode).toBe(200);
+    await a.close();
+  });
+
+  it("abuseStrikesToBan=0 disables the cooldown (only soft limits apply)", async () => {
+    const a = await build(
+      svc({
+        submitRateMaxPerKey: 1,
+        abuseStrikesToBan: 0,
+        abuseStrikeSpacingMs: 0,
+        client: {
+          allocateExternalParty: async () => ({ partyId: "agent::1220new" }),
+          grantUserRights: async () => undefined,
+        },
+      } as never)
+    );
+    expect((await finalize(a)).statusCode).toBe(200);
+    // Refused by the soft 60s limit, but never escalates to a ban.
+    const soft = await finalize(a);
+    expect(soft.statusCode).toBe(429);
+    expect(soft.headers["retry-after"]).toBe("60");
+    await a.close();
+  });
+});
+
+/**
+ * A client that retries a soft 429 without backoff produces a burst of refusals
+ * in one second. With the default 60s strike spacing that burst is ONE strike,
+ * so the burst can never escalate into an hours-long suspension on its own.
+ */
+describe("escalating cooldown — a retry storm is one strike, not a ban", () => {
+  it("with the default spacing, back-to-back refusals stay on the soft 60s limit", async () => {
+    const a = await build(
+      svc({
+        submitRateMaxPerKey: 1,
+        abuseStrikesToBan: 2,
+        abuseStrikeWindowMs: 600_000,
+        abuseBaseBanMs: 3_600_000,
+        abuseBanMultiplier: 2,
+        abuseMaxBanMs: 86_400_000,
+        // abuseStrikeSpacingMs deliberately omitted: the route default (60s) applies.
+        client: {
+          allocateExternalParty: async () => ({ partyId: "agent::1220new" }),
+          grantUserRights: async () => undefined,
+        },
+      } as never)
+    );
+    const finalize = () =>
+      a.inject({
+        method: "POST",
+        url: "/v1/wallet/onboard/finalize",
+        payload: {
+          onboardingTransactions: ["tx1"],
+          multiHashSignatures: [
+            { format: "F", signature: "S", signingAlgorithmSpec: "A", signedBy: "fp1" },
+          ],
+        },
+      });
+    expect((await finalize()).statusCode).toBe(200);
+    for (let i = 0; i < 5; i++) {
+      const r = await finalize();
+      expect(r.statusCode).toBe(429);
+      // Still the soft limit, never the suspension.
+      expect(r.headers["retry-after"]).toBe("60");
+    }
+    await a.close();
+  });
+});
+
+/**
+ * The submit limiter refuses on EITHER arm, per-party or per-IP. Only the
+ * per-IP arm may feed a strike: one wallet exhausting its own budget behind a
+ * shared NAT is that wallet's overage, not the host's abuse, and must not
+ * suspend every other agent on the address.
+ */
+describe("escalating cooldown — a per-party refusal is not host abuse", () => {
+  const commitSvc = (over: Record<string, unknown> = {}) =>
+    svc({
+      submitRateMaxPerKey: 1,
+      submitRateMaxPerIp: 60,
+      abuseStrikesToBan: 1,
+      abuseStrikeSpacingMs: 0,
+      abuseStrikeWindowMs: 600_000,
+      abuseBaseBanMs: 3_600_000,
+      abuseBanMultiplier: 2,
+      abuseMaxBanMs: 86_400_000,
+      selfPreapproval: {
+        executeSelfPreapproval: vi.fn().mockResolvedValue({ updateId: "u1" }),
+      },
+      ...over,
+    } as never);
+  const commit = (a: ReturnType<typeof Fastify>, party: string, remoteAddress: string) =>
+    a.inject({
+      method: "POST",
+      url: "/v1/wallet/preapproval/self/commit",
+      remoteAddress,
+      payload: {
+        party,
+        preparedTransaction: "cHJlcA==",
+        partySignatures: { signatures: [{ party, signatures: [{}] }] },
+      },
+    });
+
+  it("one wallet exhausting its own per-party cap never strikes the shared IP", async () => {
+    const a = await build(commitSvc());
+    const nat = "203.0.113.50";
+    const A = "agent::1220aaaaaaaaaaaaaaaa";
+    const B = "agent::1220bbbbbbbbbbbbbbbb";
+    expect((await commit(a, A, nat)).statusCode).not.toBe(429);
+    const refused = await commit(a, A, nat); // A over its own cap, the IP has room
+    expect(refused.statusCode).toBe(429);
+    expect(refused.headers["retry-after"]).toBe("60"); // the soft limit, not a ban
+    // strikesToBan is 1: had that refusal counted, the NAT would be suspended now.
+    expect((await commit(a, B, nat)).statusCode).not.toBe(429);
+    await a.close();
+  });
+
+  it("exhausting the per-IP arm itself does strike, and the next call is suspended", async () => {
+    const a = await build(commitSvc({ submitRateMaxPerKey: 60, submitRateMaxPerIp: 1 }));
+    const nat = "203.0.113.51";
+    expect((await commit(a, "agent::1220aaaaaaaaaaaaaaaa", nat)).statusCode).not.toBe(429);
+    expect((await commit(a, "agent::1220bbbbbbbbbbbbbbbb", nat)).statusCode).toBe(429);
+    const banned = await commit(a, "agent::1220cccccccccccccccc", nat);
+    expect(banned.statusCode).toBe(429);
+    expect((banned.json() as { error: string }).error).toContain("suspended");
+    await a.close();
+  });
+});
+
+
+describe("wallet relay across two participants (party replication)", () => {
+  // `moved::` parties live on the primary (node 2), `old::` ones still only on
+  // the secondary (node 1). Each call must reach the participant hosting the
+  // party, as our ledger user THERE.
+  const OLD = "old::1220abcdef01";
+  const MOVED = "moved::1220abcdef02";
+  function twoNodes() {
+    const primary = mockClient({ queryActiveContracts: vi.fn().mockResolvedValue([]) });
+    const secondary = mockClient();
+    const router = {
+      forParty: vi.fn(async (p: string) =>
+        p === OLD ? { client: secondary, userId: "node1-user" } : { client: primary, userId: "node2-user" }
+      ),
+      hosts: vi.fn(async (p: string) => p === OLD || p === MOVED),
+    };
+    const s = svc({ client: primary as never, userId: "node2-user", router: router as never });
+    return { primary, secondary, router, s };
+  }
+  const exercise = [
+    {
+      ExerciseCommand: {
+        templateId: "#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferFactory",
+        contractId: "00ab",
+        choice: "TransferFactory_Transfer",
+        choiceArgument: {},
+      },
+    },
+  ];
+
+  it("reads a not-yet-moved party's balance on the secondary", async () => {
+    const { primary, secondary, s } = twoNodes();
+    const a = await build(s);
+    const r = await a.inject({ method: "GET", url: `/v1/wallet/${OLD}/balance` });
+    expect(r.statusCode).toBe(200);
+    expect(r.json().cc).toBe("7.5000000000");
+    expect(secondary.queryActiveContracts).toHaveBeenCalled();
+    expect(primary.queryActiveContracts).not.toHaveBeenCalled();
+    await a.close();
+  });
+
+  it("prepares on the participant hosting the acting party, as our user there", async () => {
+    const { primary, secondary, s } = twoNodes();
+    const a = await build(s);
+    const r = await a.inject({
+      method: "POST",
+      url: "/v1/wallet/submit/prepare",
+      payload: { commandId: "c", actAs: [OLD], synchronizerId: "", commands: exercise },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(secondary.interactiveSubmissionPrepare).toHaveBeenCalledWith(expect.objectContaining({ userId: "node1-user" }));
+    expect(primary.interactiveSubmissionPrepare).not.toHaveBeenCalled();
+    await a.close();
+  });
+
+  it("executes, and takes the offset, on the signing party's participant", async () => {
+    const { primary, secondary, s } = twoNodes();
+    const a = await build(s);
+    const r = await a.inject({
+      method: "POST",
+      url: "/v1/wallet/submit/execute",
+      payload: { preparedTransaction: "pt", partySignatures: { signatures: [{ party: OLD, signatures: [] }] } },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(secondary.getLedgerEnd).toHaveBeenCalled();
+    expect(secondary.interactiveSubmissionExecute).toHaveBeenCalled();
+    expect(primary.interactiveSubmissionExecute).not.toHaveBeenCalled();
+    await a.close();
+  });
+
+  it("a moved party goes to the primary", async () => {
+    const { primary, secondary, s } = twoNodes();
+    const a = await build(s);
+    await a.inject({ method: "GET", url: `/v1/wallet/${MOVED}/balance` });
+    expect(primary.queryActiveContracts).toHaveBeenCalled();
+    expect(secondary.queryActiveContracts).not.toHaveBeenCalled();
+    await a.close();
+  });
+
+  it("new wallets are onboarded on the primary", async () => {
+    const { primary, secondary, s } = twoNodes();
+    const a = await build(s);
+    const r = await a.inject({ method: "POST", url: "/v1/wallet/onboard/prepare", payload: pk });
+    expect(r.statusCode).toBe(200);
+    expect(primary.generateExternalPartyTopology).toHaveBeenCalled();
+    expect(secondary.generateExternalPartyTopology).not.toHaveBeenCalled();
+    await a.close();
+  });
+
+  it("a party hosted on neither participant still gets a 404 for a refused read", async () => {
+    const { primary, s } = twoNodes();
+    primary.queryActiveContracts = vi.fn().mockRejectedValue(Object.assign(new Error("403"), { code: "HTTP_ERROR", status: 403 }));
+    const a = await build(s);
+    const r = await a.inject({ method: "GET", url: "/v1/wallet/stranger::1220abcdef03/balance" });
+    expect(r.statusCode).toBe(404);
+    await a.close();
+  });
+});
+
+describe("onboarding co-hosted on a second participant", () => {
+  const CO_UID = "FTP-validator-2::1220da86";
+  const finalize = {
+    onboardingTransactions: ["tx1"],
+    multiHashSignatures: [{ format: "F", signature: "S", signingAlgorithmSpec: "A", signedBy: "fp1" }],
+  };
+  function coHosted() {
+    const coClient = {
+      allocateExternalParty: vi.fn().mockResolvedValue({ partyId: "agent::12201" }),
+      grantUserRights: vi.fn().mockResolvedValue(undefined),
+    };
+    const s = svc({
+      onboardCoHost: { participantUid: CO_UID, client: coClient as never, userId: "node2-user", grantRetryMs: 1 },
+    });
+    return { s, coClient };
+  }
+
+  it("prepare asks for both participants confirming, threshold 1 (what the wallet will sign)", async () => {
+    const { s } = coHosted();
+    const a = await build(s);
+    const r = await a.inject({ method: "POST", url: "/v1/wallet/onboard/prepare", payload: pk });
+    expect(r.statusCode).toBe(200);
+    expect(s.client.generateExternalPartyTopology).toHaveBeenCalledWith(
+      expect.objectContaining({ otherConfirmingParticipantUids: [CO_UID], confirmationThreshold: 1 })
+    );
+    await a.close();
+  });
+
+  it("finalize allocates on both participants and grants our user on each", async () => {
+    const { s, coClient } = coHosted();
+    const a = await build(s);
+    const r = await a.inject({ method: "POST", url: "/v1/wallet/onboard/finalize", payload: finalize });
+    expect(r.statusCode).toBe(200);
+    expect(coClient.allocateExternalParty).toHaveBeenCalledWith(
+      expect.objectContaining({ onboardingTransactions: [{ transaction: "tx1" }] })
+    );
+    expect(s.client.allocateExternalParty).toHaveBeenCalled();
+    expect(coClient.grantUserRights).toHaveBeenCalledWith("node2-user", "agent::12201");
+    expect(s.client.grantUserRights).toHaveBeenCalledWith("facilitator@clients", "agent::12201");
+    await a.close();
+  });
+
+  it("a rights grant the co-host refuses at first (party not there yet) is retried", async () => {
+    const { s, coClient } = coHosted();
+    coClient.grantUserRights.mockRejectedValueOnce(new Error("unknown party")).mockResolvedValue(undefined);
+    const a = await build(s);
+    const r = await a.inject({ method: "POST", url: "/v1/wallet/onboard/finalize", payload: finalize });
+    expect(r.statusCode).toBe(200);
+    expect(coClient.grantUserRights).toHaveBeenCalledTimes(2);
+    await a.close();
+  });
+
+  it("a co-host grant that never succeeds does not fail the onboarding, but is counted", async () => {
+    const { s, coClient } = coHosted();
+    coClient.grantUserRights.mockRejectedValue(new Error("rights cap"));
+    const recordRelayError = vi.fn();
+    const a = await build({ ...s, metrics: { recordRelayError } as never });
+    const r = await a.inject({ method: "POST", url: "/v1/wallet/onboard/finalize", payload: finalize });
+    expect(r.statusCode).toBe(200);
+    expect(coClient.grantUserRights).toHaveBeenCalledTimes(3);
+    expect(recordRelayError).toHaveBeenCalledWith("onboard/finalize:co-host-rights", "server");
+    await a.close();
+  });
+
+  it("with any-party rights, onboarding grants nothing per party on either participant", async () => {
+    const { s, coClient } = coHosted();
+    const a = await build({
+      ...s,
+      grantPartyRights: false,
+      onboardCoHost: { ...s.onboardCoHost!, grantPartyRights: false },
+    });
+    const r = await a.inject({ method: "POST", url: "/v1/wallet/onboard/finalize", payload: finalize });
+    expect(r.statusCode).toBe(200);
+    expect(coClient.allocateExternalParty).toHaveBeenCalled();
+    expect(coClient.grantUserRights).not.toHaveBeenCalled();
+    expect(s.client.grantUserRights).not.toHaveBeenCalled();
+    await a.close();
+  });
+
+  it("a co-host that refuses stops the onboarding before the primary does anything", async () => {
+    const { s, coClient } = coHosted();
+    coClient.allocateExternalParty.mockRejectedValue(new Error("node 2 down"));
+    const a = await build(s);
+    const r = await a.inject({ method: "POST", url: "/v1/wallet/onboard/finalize", payload: finalize });
+    expect(r.statusCode).toBe(502);
+    expect(s.client.allocateExternalParty).not.toHaveBeenCalled();
+    await a.close();
+  });
+
+  it("without a co-host, onboarding is exactly as before", async () => {
+    const s = svc();
+    const a = await build(s);
+    await a.inject({ method: "POST", url: "/v1/wallet/onboard/prepare", payload: pk });
+    expect(s.client.generateExternalPartyTopology).toHaveBeenCalledWith(
+      expect.not.objectContaining({ otherConfirmingParticipantUids: expect.anything() })
+    );
+    await a.close();
+  });
+});
+
+describe("a wallet with more holdings than one participant read lists", () => {
+  // The participant refuses an unbounded list past its element cap (413) but
+  // serves `?limit=N`. The relay must make such a wallet WORKABLE (a bounded
+  // slice, flagged incomplete) without ever passing a prefix off as a balance.
+  const P = "agent::1220" + "ab".repeat(32);
+  const USDCX = "decentralized-usdc-interchain-rep::12208115" + "ef".repeat(30);
+  const REG = { [USDCX]: "https://api.utilities.digitalasset.com" };
+  const iv = (amount: string) => ({
+    interfaceId: "#pkg:Splice.Api.Token.HoldingV1:Holding",
+    viewValue: { owner: P, instrumentId: { admin: USDCX, id: "USDCx" }, amount, lock: null },
+  });
+  const rows = (n: number, amount: string) =>
+    Array.from({ length: n }, (_, i) => ({ contractId: `us-${i}`, interfaceViews: [iv(amount)] }));
+  const capped = () =>
+    Object.assign(new Error("active-contracts query exceeded the participant's element limit"), {
+      code: "ACS_LIMIT_EXCEEDED",
+    });
+  function appWith(o: {
+    plain: () => Promise<unknown[]>;
+    slice?: (f: unknown, limit: number) => Promise<{ events: unknown[]; complete: boolean; limit: number }>;
+    tokenRegistries?: Record<string, string>;
+  }) {
+    const s = svc({
+      ...(o.tokenRegistries ? { tokenRegistries: o.tokenRegistries } : {}),
+      tfPay: { defaultExecuteBeforeSeconds: 120, maxExecuteBeforeSeconds: 300 },
+    } as Partial<WalletRelayServices>);
+    const c = s.client as Record<string, unknown>;
+    c.queryActiveContracts = vi.fn(o.plain);
+    if (o.slice) c.queryActiveContractsSlice = vi.fn(o.slice);
+    return { app: build(s), client: c };
+  }
+  const prepare = (amount: string) => ({
+    method: "POST" as const,
+    url: "/v1/wallet/pay/prepare",
+    payload: { party: P, receiver: "merchant::1220" + "cd".repeat(32), amount, instrumentId: { admin: USDCX, id: "USDCx" } },
+  });
+
+  it("/holdings without ?slice keeps the old contract: the full list or 413, no `complete` field", async () => {
+    const { app } = appWith({ plain: async () => { throw capped(); }, slice: async () => ({ events: [], complete: true, limit: 200 }) });
+    const r = await (await app).inject({ method: "GET", url: `/v1/wallet/${encodeURIComponent(P)}/holdings` });
+    expect(r.statusCode).toBe(413);
+    expect(r.json().code).toBe("holdings_exceed_node_limit");
+  });
+
+  it("/holdings?slice=1 answers the oldest slice and says it is incomplete", async () => {
+    const { app, client } = appWith({
+      plain: async () => { throw capped(); },
+      slice: async (_f, limit) => ({ events: rows(limit, "0.0100000000"), complete: false, limit }),
+    });
+    const r = await (await app).inject({
+      method: "GET",
+      url: `/v1/wallet/${encodeURIComponent(P)}/holdings?admin=${encodeURIComponent(USDCX)}&id=USDCx&slice=1`,
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.json().complete).toBe(false);
+    expect(r.json().instruments[0].holdings).toHaveLength(200);
+    expect(client.queryActiveContracts).not.toHaveBeenCalled();
+    expect((client.queryActiveContractsSlice as ReturnType<typeof vi.fn>).mock.calls[0]![1]).toBe(200);
+  });
+
+  it("/holdings?slice=1 on a client without the slice capability falls back to the plain read", async () => {
+    const { app } = appWith({ plain: async () => rows(3, "1.0000000000") });
+    const r = await (await app).inject({ method: "GET", url: `/v1/wallet/${encodeURIComponent(P)}/holdings?slice=1` });
+    expect(r.statusCode).toBe(200);
+    expect(r.json().complete).toBe(true);
+  });
+
+  it("pay/prepare on a wallet the plain read refuses, not coverable from the slice → 413 holdings_merge_required (never 'insufficient')", async () => {
+    const { app } = appWith({
+      tokenRegistries: REG,
+      plain: async () => { throw capped(); },
+      slice: async (_f, limit) => ({ events: rows(limit, "0.0000000100"), complete: false, limit }),
+    });
+    const r = await (await app).inject(prepare("1.0000000000"));
+    expect(r.statusCode).toBe(413);
+    expect(r.json().code).toBe("holdings_merge_required");
+    expect(r.json().detail).toContain(`merge --admin ${USDCX} --id USDCx`);
+    expect(JSON.stringify(r.json())).not.toMatch(/insufficient/i);
+  });
+
+  it("pay/prepare from a SLICE whose amount needs more inputs than one transfer may spend → holdings_merge_required", async () => {
+    // 200 × 0.01 = 2.0 visible, but 0.95 needs 95 inputs > the slice cap of 90.
+    const { app } = appWith({
+      tokenRegistries: REG,
+      plain: async () => { throw capped(); },
+      slice: async (_f, limit) => ({ events: rows(limit, "0.0100000000"), complete: false, limit }),
+    });
+    const r = await (await app).inject(prepare("0.9500000000"));
+    expect(r.statusCode).toBe(413);
+    expect(r.json().code).toBe("holdings_merge_required");
+  });
+
+  it("a COMPLETE read keeps the old behaviour: no input cap (95 inputs reach the registry resolve)", async () => {
+    const bodies: Array<{ choiceArguments?: { transfer?: { inputHoldingCids?: string[] } } }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_u: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response("stop here", { status: 400 });
+    }));
+    try {
+      const { app } = appWith({ tokenRegistries: REG, plain: async () => rows(100, "0.0100000000") });
+      const r = await (await app).inject(prepare("0.9500000000"));
+      expect(r.json().code).not.toBe("holdings_merge_required");
+      expect(bodies[0]?.choiceArguments?.transfer?.inputHoldingCids).toHaveLength(95);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("pay/prepare that IS short on a complete read stays the ordinary 'insufficient holdings' 400", async () => {
+    const { app } = appWith({ tokenRegistries: REG, plain: async () => rows(3, "0.0100000000") });
+    const r = await (await app).inject(prepare("1.0000000000"));
+    expect(r.statusCode).toBe(400);
+    expect(r.json().error).toMatch(/insufficient holdings/);
+  });
+
+  it("pay/prepare coverable from the slice sends exactly the covering holdings to the registry resolve", async () => {
+    const bodies: Array<{ choiceArguments?: { transfer?: { inputHoldingCids?: string[] } } }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_u: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response("stop here", { status: 400 });
+    }));
+    try {
+      const { app } = appWith({
+        tokenRegistries: REG,
+        plain: async () => { throw capped(); },
+        slice: async (_f, limit) => ({ events: rows(limit, "1.0000000000"), complete: false, limit }),
+      });
+      await (await app).inject(prepare("2.0000000000"));
+      expect(bodies[0]?.choiceArguments?.transfer?.inputHoldingCids).toEqual(["us-0", "us-1"]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("holdings reads narrowed to the class asked for", () => {
+  // The ACS filter is a UNION of template/interface filters: it can name
+  // templates but not exclude one. A HoldingV1 read sees every Amulet, so
+  // Canton Coin dust fills it; the relay must still answer "is THIS class
+  // complete?" — Canton Coin by its own templates, a registry token by its
+  // holding template plus per-contract views — never "does the wallet fit".
+  afterEach(() => vi.unstubAllGlobals());
+  const P = "agent::1220" + "ab".repeat(32);
+  const DSO = "DSO::1220cafe";
+  const USDCX = "decentralized-usdc-interchain-rep::12208115" + "ef".repeat(30);
+  const REG = { [USDCX]: "https://api.utilities.digitalasset.com" };
+  const UTILITY_TEMPLATE = "#utility-registry-holding-v0:Utility.Registry.Holding.V0.Holding:Holding";
+  const AMULET_TEMPLATES = ["#splice-amulet:Splice.Amulet:Amulet", "#splice-amulet:Splice.Amulet:LockedAmulet"];
+  const HOLDING_IFACE = "#splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding";
+  const enc = encodeURIComponent;
+  const view = (admin: string, id: string, amount: string) => ({
+    interfaceId: "pkg:Splice.Api.Token.HoldingV1:Holding",
+    viewValue: { owner: P, instrumentId: { admin, id }, amount, lock: null },
+  });
+  type Ev = { contractId: string; templateId: string; packageName: string; createArgument: Record<string, unknown>; interfaceViews?: unknown[] };
+  // Holdings as the HoldingV1 INTERFACE read returns them: with their view.
+  const ccInView = (i: number): Ev => ({
+    contractId: `cc-${i}`,
+    templateId: "amuletpkgid:Splice.Amulet:Amulet",
+    packageName: "splice-amulet",
+    createArgument: {},
+    interfaceViews: [view(DSO, "Amulet", "0.0100000000")],
+  });
+  const usdcx = (cid: string, amount = "1.0000000000", pkg = "utility-registry-holding-v0"): Ev => ({
+    contractId: cid,
+    templateId: "utilpkgid:Utility.Registry.Holding.V0.Holding:Holding",
+    packageName: pkg,
+    createArgument: {},
+    interfaceViews: [view(USDCX, "USDCx", amount)],
+  });
+  // The same holding as a TEMPLATE read returns it: no interface view.
+  const bare = (e: Ev): Ev => ({ ...e, interfaceViews: undefined });
+  const dust = (n: number): Ev[] => Array.from({ length: n }, (_, i) => ccInView(i));
+  type F = { filtersByParty: Record<string, { cumulative: Array<{ identifierFilter: { TemplateFilter?: { value: { templateId: string } } } }> }> };
+  const kindOf = (f: unknown): string[] =>
+    (f as F).filtersByParty[P]!.cumulative.map((c) => c.identifierFilter.TemplateFilter?.value.templateId ?? "interface");
+  // Errors shaped as CantonClient throws them.
+  const httpError = (status: number, body: string) =>
+    Object.assign(new Error(`HTTP ${status}`), { code: "HTTP_ERROR", status, responseBody: body });
+  const timeoutError = () => Object.assign(new Error("aborted after 45000ms"), { code: "TIMEOUT" });
+
+  function appWith(o: {
+    read: (templates: string[]) => { events: Ev[]; complete: boolean };
+    /** A holding by id: its event, undefined for "not found" (the
+     *  participant's 404), or an Error to throw as is. */
+    lookup?: (cid: string) => Ev | Error | undefined;
+    tokenRegistries?: Record<string, string>;
+    noSlice?: boolean;
+    plain?: () => Promise<Ev[]>;
+  }) {
+    const s = svc({
+      ...(o.tokenRegistries ? { tokenRegistries: o.tokenRegistries } : {}),
+      tfPay: { defaultExecuteBeforeSeconds: 120, maxExecuteBeforeSeconds: 300 },
+    } as Partial<WalletRelayServices>);
+    const c = s.client as Record<string, unknown>;
+    c.queryActiveContracts = vi.fn(
+      o.plain ??
+        (async () => {
+          throw new Error("the plain (unbounded) read must not be used");
+        })
+    );
+    if (!o.noSlice) {
+      c.queryActiveContractsSlice = vi.fn(async (f: unknown, limit: number) => ({ ...o.read(kindOf(f)), limit }));
+    }
+    if (o.lookup) {
+      c.getEventsByContractId = vi.fn(async (a: { contractId: string }) => {
+        const e = o.lookup!(a.contractId);
+        if (e instanceof Error) throw e;
+        if (!e) throw httpError(404, "CONTRACT_EVENTS_NOT_FOUND");
+        return { created: e, archived: false };
+      });
+    }
+    return { app: build(s), client: c as Record<string, ReturnType<typeof vi.fn>> };
+  }
+  const get = async (app: ReturnType<typeof build>, query: string) =>
+    (await app).inject({ method: "GET", url: `/v1/wallet/${enc(P)}/holdings?${query}` });
+  const cidsOf = (r: { json: () => { instruments: Array<{ holdings: Array<{ cid: string }> }> } }) =>
+    r.json().instruments.flatMap((i) => i.holdings.map((h) => h.cid));
+  const stubDso = () =>
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ dso_party_id: DSO }), { status: 200 })));
+
+  it("Canton Coin is read by its two templates: complete is about Canton Coin, whatever else the wallet holds", async () => {
+    stubDso();
+    const amulet = (cid: string, initialAmount: string, owner = P) => ({
+      contractId: cid,
+      templateId: "amuletpkgid:Splice.Amulet:Amulet",
+      packageName: "splice-amulet",
+      createArgument: { dso: DSO, owner, amount: { initialAmount } },
+    });
+    const locked = {
+      contractId: "lk",
+      templateId: "amuletpkgid:Splice.Amulet:LockedAmulet",
+      packageName: "splice-amulet",
+      createArgument: { amulet: { dso: DSO, owner: P, amount: { initialAmount: "2.0000000000" } }, lock: { holders: [] } },
+    };
+    const reads: string[][] = [];
+    const { app } = appWith({
+      read: (t) => (reads.push(t), { events: [amulet("a1", "1.0000000000"), amulet("a2", "0.5000000000"), locked, amulet("theirs", "9.0000000000", "other::1220")], complete: true }),
+    });
+    const r = await get(app, `admin=${enc(DSO)}&id=Amulet&slice=1`);
+    expect(r.statusCode).toBe(200);
+    expect(reads).toEqual([AMULET_TEMPLATES]); // never the HoldingV1 interface
+    expect(r.json()).toMatchObject({
+      complete: true,
+      instruments: [
+        {
+          admin: DSO,
+          id: "Amulet",
+          total: "3.5000000000",
+          holdings: [
+            { cid: "a1", amount: "1.0000000000", locked: false },
+            { cid: "a2", amount: "0.5000000000", locked: false },
+            { cid: "lk", amount: "2.0000000000", locked: true },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("a Canton Coin read that comes back full says so", async () => {
+    stubDso();
+    const { app } = appWith({ read: () => ({ events: [], complete: false }) });
+    const r = await get(app, `admin=${enc(DSO)}&id=Amulet&slice=1`);
+    expect(r.json().complete).toBe(false);
+  });
+
+  it("a registry token behind a full slice of Canton Coin dust: narrowed to the Utility template, views by contract id, COMPLETE", async () => {
+    const beyond = [usdcx("us-a"), usdcx("us-b", "2.5000000000")];
+    const reads: string[][] = [];
+    const { app, client } = appWith({
+      tokenRegistries: REG,
+      read: (t) => (reads.push(t), t[0] === "interface" ? { events: dust(200), complete: false } : { events: beyond.map(bare), complete: true }),
+      lookup: (cid) => beyond.find((e) => e.contractId === cid),
+    });
+    const r = await get(app, `admin=${enc(USDCX)}&id=USDCx&slice=1`);
+    expect(r.statusCode).toBe(200);
+    expect(reads).toEqual([["interface"], [UTILITY_TEMPLATE]]);
+    expect(r.json().complete).toBe(true);
+    expect(cidsOf(r)).toEqual(["us-a", "us-b"]);
+    expect(r.json().instruments[0].total).toBe("3.5000000000");
+    expect(client.getEventsByContractId!.mock.calls.map((c) => c[0])).toEqual([
+      { contractId: "us-a", requestingParties: [P], interfaceViews: [HOLDING_IFACE] },
+      { contractId: "us-b", requestingParties: [P], interfaceViews: [HOLDING_IFACE] },
+    ]);
+  });
+
+  it("the template is learned from the token's own holdings in view (package name as the participant reports it), even for an unconfigured registrar", async () => {
+    const inView = usdcx("us-0", "1.0000000000", "utility-registry-holding-v0-renamed");
+    const fresh = usdcx("us-new", "4.0000000000", "utility-registry-holding-v0-renamed");
+    const reads: string[][] = [];
+    const { app, client } = appWith({
+      read: (t) => (reads.push(t), t[0] === "interface" ? { events: [...dust(199), inView], complete: false } : { events: [bare(inView), bare(fresh)], complete: true }),
+      lookup: (cid) => (cid === "us-new" ? fresh : undefined),
+    });
+    const r = await get(app, `admin=${enc(USDCX)}&id=USDCx&slice=1`);
+    expect(reads[1]).toEqual(["#utility-registry-holding-v0-renamed:Utility.Registry.Holding.V0.Holding:Holding"]);
+    expect(r.json().complete).toBe(true);
+    expect(cidsOf(r).sort()).toEqual(["us-0", "us-new"]);
+    // Only the holding the interface slice did not show is looked up.
+    expect(client.getEventsByContractId).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays incomplete when the registry class itself is past the cap (tokens of one registry share a template)", async () => {
+    const beyond = [usdcx("us-a")];
+    const { app } = appWith({
+      tokenRegistries: REG,
+      read: (t) => (t[0] === "interface" ? { events: dust(200), complete: false } : { events: beyond.map(bare), complete: false }),
+      lookup: (cid) => beyond.find((e) => e.contractId === cid),
+    });
+    const r = await get(app, `admin=${enc(USDCX)}&id=USDCx&slice=1`);
+    expect(r.json().complete).toBe(false);
+    expect(cidsOf(r)).toEqual(["us-a"]); // what it found is still listed
+  });
+
+  it("stays incomplete when more holdings lie beyond the slice than it looks up (90), or a lookup fails", async () => {
+    const many = Array.from({ length: 95 }, (_, i) => usdcx(`m-${i}`));
+    const capped = appWith({
+      tokenRegistries: REG,
+      read: (t) => (t[0] === "interface" ? { events: dust(200), complete: false } : { events: many.map(bare), complete: true }),
+      lookup: (cid) => many.find((e) => e.contractId === cid),
+    });
+    const r1 = await get(capped.app, `admin=${enc(USDCX)}&id=USDCx&slice=1`);
+    expect(capped.client.getEventsByContractId).toHaveBeenCalledTimes(90);
+    expect(r1.json().complete).toBe(false);
+    expect(cidsOf(r1)).toHaveLength(90);
+
+    const two = [usdcx("ok"), usdcx("gone")];
+    const failing = appWith({
+      tokenRegistries: REG,
+      read: (t) => (t[0] === "interface" ? { events: dust(200), complete: false } : { events: two.map(bare), complete: true }),
+      lookup: (cid) => (cid === "ok" ? two[0] : undefined),
+    });
+    const r2 = await get(failing.app, `admin=${enc(USDCX)}&id=USDCx&slice=1`);
+    expect(r2.json().complete).toBe(false);
+    expect(cidsOf(r2)).toEqual(["ok"]);
+  });
+
+  it("a participant that refuses the template read (package unknown) gets the HoldingV1 slice back, incomplete — not an error", async () => {
+    const { app } = appWith({
+      tokenRegistries: REG,
+      read: (t) => {
+        if (t[0] === "interface") return { events: [...dust(199), usdcx("us-0")], complete: false };
+        throw Object.assign(new Error("PACKAGE_NAMES_NOT_FOUND"), { status: 400 });
+      },
+      lookup: () => undefined,
+    });
+    const r = await get(app, `admin=${enc(USDCX)}&id=USDCx&slice=1`);
+    expect(r.statusCode).toBe(200);
+    expect(r.json().complete).toBe(false);
+    expect(cidsOf(r)).toEqual(["us-0"]);
+  });
+
+  it("an unconfigured registrar with nothing in view has no template to narrow to: incomplete, no template read", async () => {
+    const reads: string[][] = [];
+    const { app } = appWith({
+      read: (t) => (reads.push(t), { events: dust(200), complete: false }),
+      lookup: () => undefined,
+    });
+    const r = await get(app, `admin=${enc(USDCX)}&id=USDCx&slice=1`);
+    expect(reads).toEqual([["interface"]]);
+    expect(r.json()).toMatchObject({ complete: false, instruments: [] });
+  });
+
+  it("class=registry: every token but Canton Coin, complete about the tokens alone", async () => {
+    const inView = Array.from({ length: 50 }, (_, i) => usdcx(`v-${i}`));
+    const beyond = [usdcx("b-0"), usdcx("b-1")];
+    const reads: string[][] = [];
+    const { app } = appWith({
+      tokenRegistries: REG,
+      read: (t) => (reads.push(t), t[0] === "interface" ? { events: [...dust(150), ...inView], complete: false } : { events: [...inView, ...beyond].map(bare), complete: true }),
+      lookup: (cid) => beyond.find((e) => e.contractId === cid),
+    });
+    const r = await get(app, "class=registry&slice=1");
+    expect(r.statusCode).toBe(200);
+    expect(reads[1]).toEqual([UTILITY_TEMPLATE]);
+    expect(r.json().complete).toBe(true);
+    expect(r.json().instruments.map((i: { id: string }) => i.id)).toEqual(["USDCx"]);
+    expect(cidsOf(r)).toHaveLength(52);
+  });
+
+  it("without class, a full HoldingV1 slice is the answer and stays incomplete (no narrowing for 'everything')", async () => {
+    const reads: string[][] = [];
+    const { app } = appWith({ tokenRegistries: REG, read: (t) => (reads.push(t), { events: dust(200), complete: false }) });
+    const r = await get(app, "slice=1");
+    expect(reads).toEqual([["interface"]]);
+    expect(r.json().complete).toBe(false);
+  });
+
+  it("class=registry without slice filters the plain read; bad class values are refused", async () => {
+    const { app } = appWith({ noSlice: true, read: () => ({ events: [], complete: true }), plain: async () => [ccInView(0), usdcx("u")] });
+    const r = await get(app, "class=registry");
+    expect(r.statusCode).toBe(200);
+    expect(cidsOf(r)).toEqual(["u"]);
+    expect(r.json().complete).toBeUndefined();
+    expect((await get(app, "class=coin")).statusCode).toBe(400);
+    expect((await get(app, `class=registry&admin=${enc(USDCX)}&id=USDCx`)).statusCode).toBe(400);
+  });
+
+  it("pay/prepare in a registry token from a wallet full of Canton Coin dust spends the narrowed holdings — one bounded read, no plain read", async () => {
+    const beyond = [usdcx("us-a", "1.0000000000"), usdcx("us-b", "3.0000000000")];
+    const bodies: Array<{ choiceArguments?: { transfer?: { inputHoldingCids?: string[] } } }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_u: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response("stop here", { status: 400 });
+    }));
+    const { app, client } = appWith({
+      tokenRegistries: REG,
+      read: (t) => (t[0] === "interface" ? { events: dust(200), complete: false } : { events: beyond.map(bare), complete: true }),
+      lookup: (cid) => beyond.find((e) => e.contractId === cid),
+    });
+    const r = await (await app).inject({
+      method: "POST",
+      url: "/v1/wallet/pay/prepare",
+      payload: { party: P, receiver: "merchant::1220" + "cd".repeat(32), amount: "2.0000000000", instrumentId: { admin: USDCX, id: "USDCx" } },
+    });
+    expect(r.json().code).not.toBe("holdings_merge_required");
+    expect(bodies[0]?.choiceArguments?.transfer?.inputHoldingCids).toEqual(["us-b"]);
+    expect(client.queryActiveContracts).not.toHaveBeenCalled();
+  });
+
+  it("pay/prepare in Canton Coin: ONE bounded read of the Amulet template — never the plain read first", async () => {
+    const urls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (u: string) => {
+      urls.push(String(u));
+      if (String(u).includes("/dso-party-id")) return new Response(JSON.stringify({ dso_party_id: DSO }), { status: 200 });
+      return new Response("stop here", { status: 400 });
+    }));
+    const reads: string[][] = [];
+    const coin = (cid: string, initialAmount: string) => ({ contractId: cid, templateId: "amuletpkgid:Splice.Amulet:Amulet", packageName: "splice-amulet", createArgument: { dso: DSO, owner: P, amount: { initialAmount } } });
+    const { app, client } = appWith({ read: (t) => (reads.push(t), { events: [coin("c1", "5.0000000000")], complete: true }) });
+    await (await app).inject({
+      method: "POST",
+      url: "/v1/wallet/pay/prepare",
+      payload: { party: P, receiver: "merchant::1220" + "cd".repeat(32), amount: "1.0000000000" },
+    });
+    expect(reads).toEqual([["#splice-amulet:Splice.Amulet:Amulet"]]);
+    expect(client.queryActiveContractsSlice).toHaveBeenCalledTimes(1);
+    expect(client.queryActiveContracts).not.toHaveBeenCalled();
+    expect(urls.some((u) => u.includes("transfer-factory"))).toBe(true); // selection passed, resolve attempted
+  });
+
+  it("a by-id lookup that comes back WITHOUT a HoldingV1 view is not 'found': the answer is incomplete, never a short total marked complete", async () => {
+    const beyond = [usdcx("us-a"), usdcx("us-b", "2.5000000000")];
+    const { app } = appWith({
+      tokenRegistries: REG,
+      read: (t) => (t[0] === "interface" ? { events: dust(200), complete: false } : { events: beyond.map(bare), complete: true }),
+      // us-b is live, but the participant hands it back with no view.
+      lookup: (cid) => (cid === "us-b" ? bare(beyond[1]!) : beyond.find((e) => e.contractId === cid)),
+    });
+    const r = await get(app, `admin=${enc(USDCX)}&id=USDCx&slice=1`);
+    expect(r.statusCode).toBe(200);
+    expect(r.json().complete).toBe(false);
+    expect(cidsOf(r)).toEqual(["us-a"]);
+  });
+
+  it("class=registry with ANOTHER registry's holding in view still reads the Utility template: configured-registrar tokens beyond the slice are listed", async () => {
+    const zView = {
+      contractId: "z-0",
+      templateId: "zpkgid:Z.Token:Holding",
+      packageName: "z-token",
+      createArgument: {},
+      interfaceViews: [view("ztk-admin::1220" + "aa".repeat(32), "ZTK", "5.0000000000")],
+    };
+    const beyond = [usdcx("us-a"), usdcx("us-b", "2.5000000000")];
+    const reads: string[][] = [];
+    const { app } = appWith({
+      tokenRegistries: REG,
+      read: (t) => {
+        reads.push(t);
+        if (t[0] === "interface") return { events: [...dust(199), zView], complete: false };
+        const evs: Ev[] = [];
+        if (t.includes("#z-token:Z.Token:Holding")) evs.push(bare(zView));
+        if (t.includes(UTILITY_TEMPLATE)) evs.push(...beyond.map(bare));
+        return { events: evs, complete: true };
+      },
+      lookup: (cid) => beyond.find((e) => e.contractId === cid),
+    });
+    const r = await get(app, "class=registry&slice=1");
+    expect(r.statusCode).toBe(200);
+    expect([...reads[1]!].sort()).toEqual(["#z-token:Z.Token:Holding", UTILITY_TEMPLATE].sort());
+    expect(r.json().complete).toBe(true);
+    const totals = Object.fromEntries(r.json().instruments.map((i: { id: string; total: string }) => [i.id, i.total]));
+    expect(totals).toEqual({ ZTK: "5.0000000000", USDCx: "3.5000000000" });
+  });
+
+  it("a holding spent between the interface read and the template read is not counted next to its change", async () => {
+    // The interface read (earlier) shows us-old; a payment then spends it and
+    // creates us-change, which the template read (later) lists instead.
+    const old = usdcx("us-old", "10.0000000000");
+    const change = usdcx("us-change", "7.0000000000");
+    const { app } = appWith({
+      tokenRegistries: REG,
+      read: (t) => (t[0] === "interface" ? { events: [...dust(199), old], complete: false } : { events: [bare(change)], complete: true }),
+      lookup: (cid) => (cid === "us-change" ? change : undefined),
+    });
+    const r = await get(app, `admin=${enc(USDCX)}&id=USDCx&slice=1`);
+    expect(r.json().complete).toBe(true);
+    expect(cidsOf(r)).toEqual(["us-change"]);
+    expect(r.json().instruments[0].total).toBe("7.0000000000");
+  });
+
+  it("a timeout or 5xx in the narrowed read is a 502 (retryable), not an incomplete answer; a 'not found' lookup is", async () => {
+    const beyond = [usdcx("us-a")];
+    const templateFails = (err: Error) =>
+      appWith({
+        tokenRegistries: REG,
+        read: (t) => {
+          if (t[0] === "interface") return { events: dust(200), complete: false };
+          throw err;
+        },
+        lookup: (cid) => beyond.find((e) => e.contractId === cid),
+      }).app;
+    expect((await get(templateFails(timeoutError()), `admin=${enc(USDCX)}&id=USDCx&slice=1`)).statusCode).toBe(502);
+    expect((await get(templateFails(httpError(503, "unavailable")), `admin=${enc(USDCX)}&id=USDCx&slice=1`)).statusCode).toBe(502);
+
+    const lookupFails = (err: Error | undefined) =>
+      appWith({
+        tokenRegistries: REG,
+        read: (t) => (t[0] === "interface" ? { events: dust(200), complete: false } : { events: beyond.map(bare), complete: true }),
+        lookup: () => err,
+      }).app;
+    expect((await get(lookupFails(timeoutError()), `admin=${enc(USDCX)}&id=USDCx&slice=1`)).statusCode).toBe(502);
+    const notFound = await get(lookupFails(undefined), `admin=${enc(USDCX)}&id=USDCx&slice=1`);
+    expect(notFound.statusCode).toBe(200);
+    expect(notFound.json().complete).toBe(false);
+  });
+
+  it("pay/prepare whose by-id lookup times out answers 502 — never holdings_merge_required charged to the payer", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("stop here", { status: 400 })));
+    const beyond = [usdcx("us-a", "5.0000000000")];
+    const { app } = appWith({
+      tokenRegistries: REG,
+      read: (t) => (t[0] === "interface" ? { events: dust(200), complete: false } : { events: beyond.map(bare), complete: true }),
+      lookup: () => timeoutError(),
+    });
+    const r = await (await app).inject({
+      method: "POST",
+      url: "/v1/wallet/pay/prepare",
+      payload: { party: P, receiver: "merchant::1220" + "cd".repeat(32), amount: "2.0000000000", instrumentId: { admin: USDCX, id: "USDCx" } },
+    });
+    expect(r.statusCode).toBe(502);
+    expect(r.json().code).not.toBe("holdings_merge_required");
+  });
+
+  it("a holding's view is fetched by id once: a repeated read (a swap's poll, a caller looping) does not look it up again", async () => {
+    const beyond = [usdcx("us-a"), usdcx("us-b", "2.5000000000")];
+    let extra: Ev[] = [];
+    const { app, client } = appWith({
+      tokenRegistries: REG,
+      read: (t) => (t[0] === "interface" ? { events: dust(200), complete: false } : { events: [...beyond, ...extra].map(bare), complete: true }),
+      lookup: (cid) => [...beyond, ...extra].find((e) => e.contractId === cid),
+    });
+    const r1 = await get(app, `admin=${enc(USDCX)}&id=USDCx&slice=1`);
+    expect(r1.json().instruments[0].total).toBe("3.5000000000");
+    expect(client.getEventsByContractId).toHaveBeenCalledTimes(2);
+    extra = [usdcx("us-new", "1.0000000000")];
+    const r2 = await get(app, `admin=${enc(USDCX)}&id=USDCx&slice=1`);
+    expect(r2.json()).toMatchObject({ complete: true, instruments: [{ total: "4.5000000000" }] });
+    // Only the new holding is looked up; liveness still comes from the template read.
+    expect(client.getEventsByContractId).toHaveBeenCalledTimes(3);
+    expect(client.getEventsByContractId!.mock.calls[2]![0]).toMatchObject({ contractId: "us-new" });
+    extra = [];
+    const r3 = await get(app, `admin=${enc(USDCX)}&id=USDCx&slice=1`);
+    expect(r3.json().instruments[0].total).toBe("3.5000000000"); // us-new gone from the template read: gone from the answer
+    expect(client.getEventsByContractId).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("Tradecraft queued mode relay surface", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const WR = "TC.V4.Settle.WithdrawalRequest:SettlementWithdrawalRequest";
+  const create = (templateId: unknown) => ({ CreateCommand: { templateId, createArguments: {} } });
+
+  it("creates only an allowlisted template, whatever package names it", () => {
+    expect(deniedChoice([create(`#canton-swap-amm-vault:${WR}`)], ["X"], [WR])).toBeUndefined();
+    expect(deniedChoice([create(`97571dd8:${WR}`)], ["X"], [WR])).toBeUndefined();
+    expect(deniedChoice([create("#p:Evil:Contract")], ["X"], [WR])).toBe("CreateCommand Evil:Contract");
+    // A create list never widens the choice list, and vice versa.
+    expect(deniedChoice([create(`#p:${WR}`)], [WR])).toBe(`CreateCommand ${WR}`);
+    expect(deniedChoice([create(42)], ["X"], [WR])).toBe("(create without a templateId)");
+    expect(deniedChoice([create("NoColon")], ["X"], [WR])).toBe("CreateCommand NoColon");
+  });
+
+  it("submit/prepare forwards an allowlisted create and refuses another", async () => {
+    const s = svc({ walletSubmitChoices: ["TransferFactory_Transfer"], walletSubmitCreateTemplates: [WR] });
+    const a = await build(s);
+    const ok = await a.inject({
+      method: "POST",
+      url: "/v1/wallet/submit/prepare",
+      payload: { commands: [create(`#canton-swap-amm-vault:${WR}`)], actAs: ["agent::1220a"] },
+    });
+    expect(ok.statusCode).toBe(200);
+    const bad = await a.inject({
+      method: "POST",
+      url: "/v1/wallet/submit/prepare",
+      payload: { commands: [create("#p:Other:Thing")], actAs: ["agent::1220a"] },
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().error).toBe("choice_not_allowed");
+  });
+
+  describe("GET /v1/wallet/:party/contracts", () => {
+    const P = "agent::1220a";
+    const BATCHER = "#canton-swap-amm-vault:TC.V4.OrderBatch:SwapOrderBatcher";
+    const ALLOC = "#splice-api-token-allocation-v2:Splice.Api.Token.AllocationV2:Allocation";
+    const ev = { contractId: "b1", templateId: "pkg:TC.V4.OrderBatch:SwapOrderBatcher", createArgument: { actor: P }, signatories: ["v"], observers: [], packageName: "x" };
+    function appWith(ids: string[] | undefined) {
+      const q = vi.fn(async () => [ev]);
+      const s = svc({ walletReadIds: ids });
+      (s.client as { queryActiveContracts: unknown }).queryActiveContracts = q;
+      return { q, app: build(s) };
+    }
+
+    it("is off unless the operator lists ids", async () => {
+      const { app } = appWith(undefined);
+      const r = await (await app).inject({ method: "GET", url: `/v1/wallet/${P}/contracts?templateId=${encodeURIComponent(BATCHER)}` });
+      expect(r.statusCode).toBe(404);
+    });
+
+    it("lists an allowlisted template with a TemplateFilter", async () => {
+      const { app, q } = appWith([BATCHER, ALLOC]);
+      const r = await (await app).inject({ method: "GET", url: `/v1/wallet/${P}/contracts?templateId=${encodeURIComponent(BATCHER)}` });
+      expect(r.statusCode).toBe(200);
+      expect(r.json().contracts).toEqual([
+        { contractId: "b1", templateId: ev.templateId, signatories: ["v"], createArgument: { actor: P } },
+      ]);
+      expect(JSON.stringify(q.mock.calls[0])).toContain("TemplateFilter");
+    });
+
+    it("lists an allowlisted interface with its views", async () => {
+      const { app, q } = appWith([ALLOC]);
+      const r = await (await app).inject({ method: "GET", url: `/v1/wallet/${P}/contracts?interfaceId=${encodeURIComponent(ALLOC)}` });
+      expect(r.statusCode).toBe(200);
+      expect(JSON.stringify(q.mock.calls[0])).toContain("InterfaceFilter");
+    });
+
+    it("refuses an id outside the allowlist, and ambiguous queries", async () => {
+      const { app } = appWith([BATCHER]);
+      const a = await app;
+      expect((await a.inject({ method: "GET", url: `/v1/wallet/${P}/contracts?templateId=${encodeURIComponent("#x:Splice.Amulet:Amulet")}` })).statusCode).toBe(400);
+      expect((await a.inject({ method: "GET", url: `/v1/wallet/${P}/contracts` })).statusCode).toBe(400);
+      expect(
+        (await a.inject({ method: "GET", url: `/v1/wallet/${P}/contracts?templateId=${encodeURIComponent(BATCHER)}&interfaceId=${encodeURIComponent(BATCHER)}` })).statusCode
+      ).toBe(400);
+    });
+  });
+
+  describe("POST /v1/wallet/resolve/allocation-factory", () => {
+    const CBTC = "cbtc-network::1220cb";
+    const UTIL = "https://registry.example";
+    function stub(capture: (url: string, body: string) => void, status = 200) {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: unknown, init?: RequestInit) => {
+          const u = String(url);
+          capture(u, String(init?.body ?? ""));
+          if (u.includes("/dso-party-id")) return new Response(JSON.stringify({ dso_party_id: "DSO::1220cafe" }), { status: 200 });
+          if (u.includes("/allocation-factory")) {
+            return status === 200
+              ? new Response(JSON.stringify({ factoryId: "00af", choiceContext: { choiceContextData: { values: {} }, disclosedContracts: [{ contractId: "d" }] } }), { status: 200 })
+              : new Response("Missing field settlement", { status });
+          }
+          return new Response("not found", { status: 404 });
+        })
+      );
+    }
+    const args = { settlement: {}, allocation: {}, inputHoldingCids: [] };
+
+    it("asks the SV Scan for Canton Coin", async () => {
+      const calls: string[] = [];
+      stub((u) => calls.push(u));
+      const a = await build(svc({ tokenRegistries: { [CBTC]: UTIL } }));
+      const r = await a.inject({ method: "POST", url: "/v1/wallet/resolve/allocation-factory", payload: { instrumentId: { admin: "DSO::1220cafe", id: "Amulet" }, choiceArguments: args } });
+      expect(r.statusCode).toBe(200);
+      expect(r.json()).toEqual({ factoryId: "00af", choiceContextData: { values: {} }, disclosedContracts: [{ contractId: "d" }] });
+      expect(calls.some((u) => u.endsWith("/registry/allocation-instruction/v2/allocation-factory") && !u.includes(UTIL))).toBe(true);
+    });
+
+    it("asks the token's DA Registry Utility for a registry token, forwarding the arguments", async () => {
+      const calls: Array<[string, string]> = [];
+      stub((u, b) => calls.push([u, b]));
+      const a = await build(svc({ tokenRegistries: { [CBTC]: UTIL } }));
+      const r = await a.inject({ method: "POST", url: "/v1/wallet/resolve/allocation-factory", payload: { instrumentId: { admin: CBTC, id: "CBTC" }, choiceArguments: args } });
+      expect(r.statusCode).toBe(200);
+      const hit = calls.find(([u]) => u.includes("/allocation-factory"))!;
+      expect(hit[0]).toBe(`${UTIL}/api/token-standard/v0/registrars/${encodeURIComponent(CBTC)}/registry/allocation-instruction/v2/allocation-factory`);
+      expect(JSON.parse(hit[1])).toEqual({ choiceArguments: args, excludeDebugFields: true });
+    });
+
+    it("resolves the V2 settlement factory on the same routing", async () => {
+      const calls: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: unknown) => {
+          const u = String(url);
+          calls.push(u);
+          if (u.includes("/dso-party-id")) return new Response(JSON.stringify({ dso_party_id: "DSO::1220cafe" }), { status: 200 });
+          if (u.includes("/settlement-factory")) {
+            return new Response(JSON.stringify({ factoryId: "00sf", choiceContext: { choiceContextData: {}, disclosedContracts: [] } }), { status: 200 });
+          }
+          return new Response("not found", { status: 404 });
+        })
+      );
+      const a = await build(svc({ tokenRegistries: { [CBTC]: UTIL } }));
+      const r = await a.inject({ method: "POST", url: "/v1/wallet/resolve/settlement-factory", payload: { instrumentId: { admin: CBTC, id: "CBTC" }, choiceArguments: { settlement: {} } } });
+      expect(r.statusCode).toBe(200);
+      expect(r.json().factoryId).toBe("00sf");
+      expect(calls).toContain(`${UTIL}/api/token-standard/v0/registrars/${encodeURIComponent(CBTC)}/registry/allocation/v2/settlement-factory`);
+    });
+
+    it("refuses an admin with no registry, and passes a registry refusal through as 400", async () => {
+      stub(() => undefined, 400);
+      const a = await build(svc({ tokenRegistries: { [CBTC]: UTIL } }));
+      const none = await a.inject({ method: "POST", url: "/v1/wallet/resolve/allocation-factory", payload: { instrumentId: { admin: "who::1220", id: "X" }, choiceArguments: args } });
+      expect(none.statusCode).toBe(400);
+      const refused = await a.inject({ method: "POST", url: "/v1/wallet/resolve/allocation-factory", payload: { instrumentId: { admin: CBTC, id: "CBTC" }, choiceArguments: args } });
+      expect(refused.statusCode).toBe(400);
+      expect(refused.json().detail).toContain("Missing field settlement");
+    });
+  });
+});
+
+describe("holdings-scan (Scan ACS snapshot, whale path)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("pages through Scan v2 holdings/state with a string cursor", async () => {
+    const PARTY = "agent::1220whale";
+    const AMULET = "#splice-amulet:Splice.Amulet:Amulet";
+    const holdingsCalls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: { body?: string }) => {
+        const u = String(url);
+        if (u.includes("/state/acs/snapshot-timestamp")) {
+          // Only the live migration answers; older ones have no snapshot.
+          return u.includes("migration_id=4")
+            ? new Response(JSON.stringify({ record_time: "2026-10-21T09:00:00Z" }), { status: 200 })
+            : new Response("not found", { status: 404 });
+        }
+        if (u.includes("/holdings/state")) {
+          const body = JSON.parse(init?.body ?? "{}") as Record<string, unknown>;
+          holdingsCalls.push({ url: u, body });
+          const page = body.after === undefined
+            ? { created_events: [{ contract_id: "c1", template_id: AMULET, create_arguments: { owner: PARTY, amount: { initialAmount: "1.0000000000" } } }], next_page_token: "tok-2" }
+            : { created_events: [{ contract_id: "c2", template_id: AMULET, create_arguments: { owner: PARTY, amount: { initialAmount: "2.0000000000" } } }], next_page_token: null };
+          return new Response(JSON.stringify(page), { status: 200 });
+        }
+        return new Response("not found", { status: 404 });
+      })
+    );
+    const a = await build(svc());
+    const r = await a.inject({ method: "GET", url: `/v1/wallet/${encodeURIComponent(PARTY)}/holdings-scan` });
+    expect(r.statusCode).toBe(200);
+    const body = r.json() as { holdings: Array<{ cid: string }>; complete: boolean; recordTime: string };
+    expect(body.holdings.map((h) => h.cid)).toEqual(["c1", "c2"]);
+    expect(body.complete).toBe(true);
+    expect(body.recordTime).toBe("2026-10-21T09:00:00Z");
+    // v2 only (Scan 0.9.0 removed v0/v1 holdings/state), and the cursor is a string.
+    expect(holdingsCalls.every((c) => c.url.includes("/api/scan/v2/holdings/state"))).toBe(true);
+    expect(holdingsCalls[0]!.body.after).toBeUndefined();
+    expect(holdingsCalls[1]!.body.after).toBe("tok-2");
+    expect(holdingsCalls[0]!.body.migration_id).toBe(4);
   });
 });
