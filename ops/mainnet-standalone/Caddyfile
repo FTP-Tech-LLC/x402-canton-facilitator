@@ -1,0 +1,19 @@
+# TLS front for the facilitator. Caddy gets and renews a Let's Encrypt
+# certificate for {$FACILITATOR_DOMAIN} and forwards to the facilitator on the
+# internal network.
+
+{$FACILITATOR_DOMAIN} {
+	encode gzip
+
+	# Keep operational endpoints off the internet. Check them from the host:
+	#   docker compose exec facilitator wget -qO- http://127.0.0.1:4022/ready
+	@ops path /metrics /ready
+	respond @ops 404
+
+	# Replace any client-sent X-Forwarded-For with the real peer address, so
+	# per-IP rate limits cannot be dodged with a forged header.
+	reverse_proxy facilitator:4022 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}
