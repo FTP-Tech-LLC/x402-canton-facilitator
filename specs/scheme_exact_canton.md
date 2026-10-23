@@ -3,7 +3,10 @@
 This document specifies the `exact` payment scheme for the x402 protocol on
 Canton Network. The client signs a `TransferFactory_Transfer` (CIP-56 Token
 Standard transfer instruction) naming the merchant as receiver, but does **not**
-submit it. The facilitator relays the payer-signed transaction and pays the
+submit it. The client carries the complete signed transaction **inline**
+(gzip-compressed) in the payment payload, so **any** facilitator can relay it —
+the client is not bound to, and needs no prior relationship with, a specific
+facilitator. The facilitator relays the payer-signed transaction and pays the
 network traffic fee. Because the merchant holds a standing `TransferPreapproval`,
 the transfer resolves directly — moving Canton Coin to the merchant in a single
 facilitator-submitted transaction. No escrow, no lock step, no facilitator
@@ -28,8 +31,11 @@ One transaction settles each payment:
 - **Client (off-ledger):** signs a `TransferFactory_Transfer` — `sender = payer`,
   `receiver = merchant`, `amount`, the specific `inputHoldingCids` spent, and an
   `executeBefore` deadline — as an interactive submission. The client does not
-  submit it to the ledger; it hands the signed submission to the facilitator in
-  the payment payload.
+  submit it to the ledger; it carries the complete signed submission — the
+  prepared transaction (with its disclosed contracts embedded) plus the payer's
+  signature — **inline and gzip-compressed** in the payment payload. The prepared
+  transaction is self-contained, so any facilitator can relay it without prior
+  state about this payer or payment.
 - **Facilitator (on-ledger):** relays (submits) the payer-signed transaction and
   pays the traffic fee. Because the merchant holds a live `TransferPreapproval`,
   the transfer resolves `direct` and pays the merchant in one transaction. The
@@ -45,7 +51,7 @@ sequenceDiagram
     C->>R: GET /resource
     R->>C: 402 Payment Required (PAYMENT-REQUIRED header)
     note over C,F: Client prepares + signs TransferFactory_Transfer<br/>(interactive submission) — does NOT submit
-    C->>R: GET /resource + PAYMENT-SIGNATURE (submissionRef, payer)
+    C->>R: GET /resource + PAYMENT-SIGNATURE (gzip(preparedTx) + signature)
     R->>F: POST /verify
     F-->>R: VerifyResponse (valid) — no ledger write
     R->>F: POST /settle
@@ -54,6 +60,16 @@ sequenceDiagram
     F-->>R: SettlementResponse (updateId)
     R->>C: 200 + PAYMENT-RESPONSE
 ```
+
+### Facilitator Independence
+
+A server selects its facilitator opaquely to the client, and there may be many
+facilitators. Because the signed submission travels **inline** in the payload and
+is self-contained, any facilitator can relay it: the relaying participant submits
+the payer-signed transaction on the payer's behalf (it neither hosts the payer
+nor signs for it) and pays the traffic fee. There is no requirement that the
+client be hosted on, or have any relationship with, the facilitator's
+participant.
 
 ## Merchant Onboarding
 
@@ -133,23 +149,59 @@ MUST renew it before expiry to keep the one-transaction path available.
   },
   "payload": {
     "assetTransferMethod": "transfer-factory",
-    "payer": "agent_party::1220...",
-    "submissionRef": "...",
-    "preparedTxHash": "1220..."
+    "preparedTransaction": "<base64( gzip( prepared TransferFactory_Transfer, disclosed contracts embedded ) )>",
+    "preparedTxHash": "<hex hash of the prepared tx the payer signed>",
+    "signature": "<base64 ed25519 sig over preparedTxHash>",
+    "hashingSchemeVersion": "HASHING_SCHEME_VERSION_V2"
   }
 }
 ```
 
 - `assetTransferMethod`: `"transfer-factory"`.
-- `payer`: The client's Canton party id — the transfer sender. This is a claim;
-  the facilitator binds the *proven* payer from the signed submission (Rule 8).
-- `submissionRef`: Reference to the payer-signed interactive submission — the
-  prepared `TransferFactory_Transfer` together with the payer's signature — that
-  the facilitator relays. An implementation MAY instead carry the prepared
-  transaction and signature inline; the only requirement is that the facilitator
-  can obtain the payer-signed transfer in order to submit it.
-- `preparedTxHash`: The hash the payer signed. Binds the submission to the
-  validated transfer bytes.
+- `preparedTransaction`: The complete prepared `TransferFactory_Transfer` (with
+  its disclosed contracts embedded), carried inline as base64 of a **single gzip
+  member**. It is self-contained: the facilitator relays exactly these bytes and
+  resolves nothing on the client's behalf. Encoding and size limits are defined in
+  *Payload Encoding & Limits*.
+- `preparedTxHash`: The hex hash of the prepared transaction the payer signed. The
+  facilitator recomputes it from the decoded prepared transaction and MUST match
+  this.
+- `signature`: The payer's `ed25519` signature (base64) over `preparedTxHash`. The
+  facilitator wraps it into the ledger's `partySignatures` for the payer party and
+  derives the payer from the decoded prepared transaction's sender (Rule 8).
+- `hashingSchemeVersion`: The Canton hashing scheme used to compute the signed hash
+  — `HASHING_SCHEME_VERSION_V1` or `HASHING_SCHEME_VERSION_V2` (default V2).
+
+## Payload Encoding & Limits
+
+`payload.preparedTransaction` is the prepared transaction encoded as
+`base64( gzip( bytes ) )`. Facilitators MUST enforce all of the following when
+decoding it, and reject a payload that violates any of them with
+`invalid_exact_canton_malformed_payload`:
+
+- **Single gzip member.** The input MUST be exactly one gzip member: reject
+  trailing bytes after the member and concatenated members, and reject the
+  optional filename / comment / extra header fields.
+- **Bounded decompression.** Decompress incrementally and abort as soon as either
+  bound is exceeded: a compressed-size cap (RECOMMENDED ~8 KiB of gzip data) and a
+  decompressed-size cap (RECOMMENDED ~64 KiB). Never allocate the output up front
+  from a declared size.
+- **Bounded decode.** After decompression, cap the work spent decoding the
+  transaction: bound structural nesting depth, total node count, and parse time,
+  and stop immediately at the first breach.
+
+These bounds make the inline payload safe to accept from an untrusted client
+(decompression-bomb, resource-exhaustion, and ambiguous-input resistance).
+
+### Header size
+
+HTTP servers and intermediaries supporting this scheme SHOULD accept a
+`PAYMENT-SIGNATURE` header of at least 16 KiB end to end. This provides headroom
+for the full payload and extension metadata: `base64(gzip(preparedTransaction))`
+alone is typically 6–7 KiB, and encoding the complete `PaymentPayload` commonly
+produces a header exceeding 8 KiB. Deployments that cannot accept a 16 KiB
+`PAYMENT-SIGNATURE` header SHOULD use a transport, such as MCP, that does not
+carry the `PaymentPayload` in an HTTP header.
 
 ## `SettlementResponse`
 
@@ -181,13 +233,15 @@ On failure:
 1. **Network match.** `paymentRequirements.network` MUST equal the facilitator's
    configured network.
 
-2. **Proof present.** The payload MUST reference a payer-signed submission
-   (`submissionRef`, with `preparedTxHash`). If absent, reject with
-   `invalid_exact_canton_missing_proof`.
+2. **Proof present & well-formed.** The payload MUST carry `preparedTransaction`,
+   `preparedTxHash` and `signature`. If absent, reject with
+   `invalid_exact_canton_missing_proof`. `preparedTransaction` MUST decode within
+   the bounds of *Payload Encoding & Limits*; a malformed or over-limit payload
+   rejects with `invalid_exact_canton_malformed_payload`.
 
-3. **Signature valid.** The referenced submission MUST be a
-   `TransferFactory_Transfer` signed by the payer, and the signature MUST verify
-   against the payer party over `preparedTxHash`. Reject with
+3. **Signature valid.** The decoded prepared transaction MUST contain exactly one
+   `TransferFactory_Transfer`, its recomputed hash MUST equal `preparedTxHash`, and
+   `signature` MUST verify against the payer party over that hash. Reject with
    `invalid_exact_canton_signature_invalid`.
 
 4. **Amount.** The transfer amount MUST equal `paymentRequirements.amount`
@@ -208,7 +262,7 @@ On failure:
    `invalid_exact_canton_preapproval_missing`.
 
 8. **Proven payer.** The facilitator binds the sender of the signed transfer as
-   the proven payer; the client's `payload.payer` claim is not trusted.
+   the proven payer; the client does not supply the payer.
 
 9. **Fee payer.** `extra.feePayer` MUST equal the facilitator's own party — it is
    the relayer that submits the transfer and pays its traffic fee. Reject with
@@ -221,13 +275,19 @@ On failure:
 11. **Self-payment guard.** The proven sender MUST NOT equal the facilitator /
     `feePayer` party. Reject with `invalid_exact_canton_self_payment`.
 
-## Funds Sufficiency
+12. **Memo.** If `paymentRequirements.extra.memo` is set, the transfer metadata
+    MUST carry the identical value under `x402.memo`. Reject with
+    `invalid_exact_canton_memo_mismatch`.
 
-There is no lock or escrow step. The payer-signed transfer names the payer's
-specific input holdings; when the facilitator relays it, the ledger executes the
-transfer atomically and rejects it if those inputs do not cover the amount. The
-facilitator performs no separate off-chain balance read. Insufficient funds
-surface as a relay rejection (`invalid_exact_canton_execute_failed`).
+13. **Input sufficiency.** The input holdings embedded in the prepared transaction
+    MUST have distinct contract ids and sum to at least `amount` plus the transfer's
+    Amulet fees. When the facilitator's participant hosts the proven sender with read
+    access, it SHOULD additionally verify each input holding is active in its ledger
+    view. Reject with `invalid_exact_canton_insufficient_inputs`. Absent the
+    hosted-payer check, verification does not establish the inputs are unspent; that
+    is enforced only at settlement. Servers should therefore be aware that a passing
+    /verify leaves residual risk of wasted resource-handler work if settlement
+    subsequently fails.
 
 ## Replay & Duplicate Settlement
 
@@ -259,11 +319,12 @@ After verification succeeds:
 1. **Confirm preapproval.** Confirm the merchant holds a live
    `TransferPreapproval` for the instrument (resolves `direct`).
 
-2. **Relay.** Submit the payer-signed `TransferFactory_Transfer`, resolving the
-   transfer's execution context (instrument config, amulet rules, active open
-   round) from the SV Scan registry as disclosed contracts. The facilitator is
-   the sole submitter and pays the traffic fee; it signs nothing on the payer's
-   behalf, and the funds move from the payer's own holdings.
+2. **Relay.** Submit the payer-signed `TransferFactory_Transfer` exactly as
+   decoded — its execution context (instrument config, amulet rules, active open
+   round) is already embedded as disclosed contracts, so the facilitator resolves
+   nothing further. The facilitator is the sole submitter and pays the traffic
+   fee; it signs nothing on the payer's behalf, and the funds move from the
+   payer's own holdings.
 
 3. **Confirm funds moved.** The settlement transaction consumes the payer's input
    holding and pays the merchant directly, with no pending `TransferInstruction`
@@ -276,8 +337,9 @@ After verification succeeds:
 
 | Code | Meaning |
 |---|---|
-| `invalid_exact_canton_missing_proof` | Payload does not reference a payer-signed submission. |
-| `invalid_exact_canton_signature_invalid` | The submission is not validly signed by the payer over `preparedTxHash`. |
+| `invalid_exact_canton_missing_proof` | Payload does not carry the payer-signed submission. |
+| `invalid_exact_canton_malformed_payload` | `preparedTransaction` is not valid base64 / a single gzip member, or exceeds the compressed, decompressed, or decode bounds. |
+| `invalid_exact_canton_signature_invalid` | `signature` does not verify against the payer over `preparedTxHash`. |
 | `invalid_exact_canton_amount_mismatch` | Transfer amount ≠ `paymentRequirements.amount`. |
 | `invalid_exact_canton_merchant_mismatch` | Transfer receiver ≠ `paymentRequirements.payTo`. |
 | `invalid_exact_canton_instrument_id_mismatch` | Transfer instrument is not Canton Coin. |
@@ -293,6 +355,6 @@ After verification succeeds:
 - [x402 v2 spec](https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md)
 - [SVM scheme spec (precedent)](https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_svm.md)
 - [CIP-56 Canton Token Standard](https://github.com/canton-foundation/cips/blob/main/cip-0056/cip-0056.md)
-- [`splice-api-token-transfer-instruction-v1` (TransferFactory / TransferInstruction)](https://github.com/canton-foundation/splice/tree/main/token-standard/splice-api-token-transfer-instruction-v1)
-- [Splice Amulet `TransferPreapproval`](https://github.com/canton-foundation/splice/tree/main/daml/splice-amulet)
+- [`splice-api-token-transfer-instruction-v1` (TransferFactory / TransferInstruction)](https://github.com/hyperledger-labs/splice/tree/main/token-standard/splice-api-token-transfer-instruction-v1)
+- [Splice Amulet `TransferPreapproval`](https://github.com/hyperledger-labs/splice/tree/main/daml/splice-amulet)
 - [Canton network identifiers](https://docs.walletconnect.network/wallet-sdk/chain-support/canton#network-/-chain-information)
