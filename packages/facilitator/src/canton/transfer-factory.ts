@@ -94,6 +94,10 @@ export interface TransferFactoryDeps {
   /** Ledger user the relay executes as (validator m2m; holds CanActAs on the
    *  payer party). */
   userId: string;
+  /** Which of our participants hosts the payer (participant-router.ts).
+   *  Absent: every call goes to `client` as `userId`. The execute, the offset
+   *  before it, the completion and the confirm read all go to the SAME one. */
+  router?: TfRouter | undefined;
   /** getTransactionById confirmation retry (the payer projection can lag the
    *  execute completion by a beat). */
   confirmRetry?: { attempts: number; delayMs: number };
@@ -102,6 +106,19 @@ export interface TransferFactoryDeps {
    *  the preapproval probe routes to that utility (per-registrar path) instead
    *  of the SV Scan. Absent/empty → Amulet-only (SV Scan), the default. */
   tokenRegistries?: Record<string, string>;
+}
+
+/** One of our participants, with our ledger user there. */
+export interface TfLedger {
+  /** Stable identity (participant-router.ts `participantId`), recorded with a
+   *  settle intent row. */
+  id: string;
+  client: TransferFactoryDeps["client"];
+  userId: string;
+}
+export interface TfRouter {
+  forParty(party: string): Promise<TfLedger>;
+  byId(id: string): TfLedger | undefined;
 }
 
 export interface TfExecuteResult {
@@ -159,6 +176,22 @@ export class SubmissionOutcomeUnknownError extends Error {
 
 export class TransferFactoryService {
   constructor(private readonly deps: TransferFactoryDeps) {}
+
+  /** The participant hosting the payer, or ours when there is no router. */
+  private async ledgerFor(payer: string): Promise<TfLedger> {
+    const r = this.deps.router;
+    if (!r) return { id: "", client: this.deps.client, userId: this.deps.userId };
+    return r.forParty(payer);
+  }
+
+  /** The participant a submission was recorded against, by its id; undefined
+   *  when that participant is no longer configured. Without a router there is
+   *  only ours. */
+  private recordedLedger(id: string): TfLedger | undefined {
+    const r = this.deps.router;
+    if (!r) return { id: "", client: this.deps.client, userId: this.deps.userId };
+    return r.byId(id);
+  }
 
   /**
    * Does the merchant hold a live TransferPreapproval for this instrument?
@@ -252,6 +285,9 @@ export class TransferFactoryService {
     submissionId: string;
     /** Ledger end captured by the caller BEFORE it recorded its intent row. */
     beginExclusive?: number;
+    /** Id of the participant that offset was read on (ledgerEndFor). The
+     *  execute must go to the same one: the offset means nothing on another. */
+    participant?: string;
     /** Instrument admin of the transfer. When it names a registry-utility token
      *  (present in `tokenRegistries`), the funds-moved gate uses the CIP-56
      *  generic signal (committed + no pending instruction) rather than looking
@@ -265,9 +301,19 @@ export class TransferFactoryService {
     // starting point, so a later resolve of an unknown outcome searches the
     // window this submission was actually made in. Reading our own would leave
     // the row pointing somewhere subtly later.
+    let ledger: TfLedger;
+    if (input.participant !== undefined) {
+      // Named by ledgerEndFor in this same request, so it is configured; if it
+      // somehow is not, refuse before anything is submitted.
+      const recorded = this.recordedLedger(input.participant);
+      if (!recorded) throw new Error(`participant ${input.participant} is not configured`);
+      ledger = recorded;
+    } else {
+      ledger = await this.ledgerFor(input.payer);
+    }
     const offset0 =
-      input.beginExclusive ?? (await this.deps.client.getLedgerEnd()).offset;
-    const r = await this.deps.client.interactiveSubmissionExecute({
+      input.beginExclusive ?? (await ledger.client.getLedgerEnd()).offset;
+    const r = await ledger.client.interactiveSubmissionExecute({
       preparedTransaction: input.preparedTransaction,
       hashingSchemeVersion: input.hashingSchemeVersion,
       partySignatures:
@@ -302,8 +348,8 @@ export class TransferFactoryService {
     let updateId = r.updateId;
     if (!updateId) {
       try {
-        updateId = await this.deps.client.pollCompletionUpdateId(
-          this.deps.userId,
+        updateId = await ledger.client.pollCompletionUpdateId(
+          ledger.userId,
           input.payer,
           input.submissionId,
           offset0
@@ -339,7 +385,7 @@ export class TransferFactoryService {
     // (The old comment here claimed the payer is "always hosted by the
     // facilitator". That is false for the inline carriage, which exists to
     // relay for payers we do not host.)
-    return this.confirmTransferred(input.payer, updateId, input.instrumentAdmin);
+    return this.confirmTransferred(input.payer, updateId, input.instrumentAdmin, ledger);
   }
 
   /**
@@ -349,6 +395,15 @@ export class TransferFactoryService {
    */
   async ledgerEnd(): Promise<number> {
     return (await this.deps.client.getLedgerEnd()).offset;
+  }
+
+  /** The ledger end on the participant that will execute for `payer`, and
+   *  which participant that is — to be recorded with the intent row and handed
+   *  back into `execute`/`resolveDispatched`. */
+  async ledgerEndFor(payer: string): Promise<{ offset: number; participant?: string }> {
+    const ledger = await this.ledgerFor(payer);
+    const offset = (await ledger.client.getLedgerEnd()).offset;
+    return ledger.id ? { offset, participant: ledger.id } : { offset };
   }
 
   /**
@@ -377,6 +432,10 @@ export class TransferFactoryService {
     payer: string;
     submissionId: string;
     beginExclusive: number;
+    /** Id of the participant the submission went to (recorded with the intent
+     *  row). Its completion stream is the only one that can answer. Absent on
+     *  rows from builds before it was recorded: the one hosting the payer. */
+    participant?: string;
     /** Instrument admin — threads the same registry-utility funds-moved rule as
      *  {@link execute} into a resolved (missed-outcome) settlement. */
     instrumentAdmin?: string;
@@ -386,9 +445,19 @@ export class TransferFactoryService {
     | { state: "unknown" }
   > {
     let found: Awaited<ReturnType<TransferFactoryDeps["client"]["findCompletion"]>>;
+    let ledger: TfLedger;
+    if (input.participant !== undefined) {
+      const recorded = this.recordedLedger(input.participant);
+      // The participant it went to is no longer configured, and no other one
+      // can see its completion. Unknown, never a guess from another stream.
+      if (!recorded) return { state: "unknown" };
+      ledger = recorded;
+    } else {
+      ledger = await this.ledgerFor(input.payer);
+    }
     try {
-      found = await this.deps.client.findCompletion(
-        this.deps.userId,
+      found = await ledger.client.findCompletion(
+        ledger.userId,
         input.payer,
         input.submissionId,
         input.beginExclusive
@@ -407,7 +476,8 @@ export class TransferFactoryService {
     const confirmed = await this.confirmTransferred(
       input.payer,
       found.updateId,
-      input.instrumentAdmin
+      input.instrumentAdmin,
+      ledger
     );
     return {
       state: "settled",
@@ -429,9 +499,13 @@ export class TransferFactoryService {
   async confirmTransferred(
     payer: string,
     updateId: string,
-    instrumentAdmin?: string
+    instrumentAdmin?: string,
+    /** The participant the submission went to; read there. Absent: the one
+     *  hosting the payer. */
+    ledger?: TfLedger
   ): Promise<TfExecuteResult> {
     const cfg = this.deps.confirmRetry ?? DEFAULT_CONFIRM_RETRY;
+    const on = ledger ?? (await this.ledgerFor(payer));
     for (let i = 0; i < cfg.attempts; i++) {
       let events: Awaited<
         ReturnType<TransferFactoryDeps["client"]["getTransactionById"]>
@@ -446,7 +520,7 @@ export class TransferFactoryService {
           ? Boolean(this.deps.tokenRegistries?.[instrumentAdmin])
           : false;
         events = (
-          await this.deps.client.getTransactionById({
+          await on.client.getTransactionById({
             updateId,
             requestingParties: [payer],
             ...(wantEffects ? { fullEffects: true } : {}),

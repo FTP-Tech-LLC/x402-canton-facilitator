@@ -11,6 +11,7 @@ import {
   sumDecimals10,
   parseAppRewardCoupons,
   emitX402RoundMarker,
+  x402RoundMarkerCommandId,
   FEATURED_APP_RIGHT_V2_TEMPLATE,
 } from "./rewards.js";
 import type { CantonClient, CreatedEvent } from "./client.js";
@@ -375,6 +376,66 @@ describe("emitX402RoundMarker", () => {
       { beneficiary: FTP_PARTY, weight: "1.0000000000" },
     ]);
     expect(cmd.choiceArgument.weight).toBe("3.1400000000");
+  });
+
+  it("carries the attempt's submissionId and an OFFSET deduplication period", async () => {
+    const submit = makeSubmit();
+    await emitX402RoundMarker(asClient(submit), {
+      app: FTP_PARTY,
+      userId: "facilitator",
+      synchronizerId: SYNC_ID,
+      featuredAppRightCid: FAR_CID,
+      weight: 3.14,
+      roundNumber: 42,
+      submissionId: "sub-1",
+      deduplicationOffset: 777,
+    });
+    const body = submit.mock.calls[0]![0] as Record<string, unknown>;
+    expect(body.commandId).toBe(x402RoundMarkerCommandId(42));
+    expect(body.submissionId).toBe("sub-1");
+    expect(body.deduplicationPeriod).toEqual({ DeduplicationOffset: { value: 777 } });
+  });
+
+  it("omits both when not given (the participant applies its default)", async () => {
+    const submit = makeSubmit();
+    await emitX402RoundMarker(asClient(submit), {
+      app: FTP_PARTY,
+      userId: "facilitator",
+      synchronizerId: SYNC_ID,
+      featuredAppRightCid: FAR_CID,
+      weight: 3.14,
+      roundNumber: 42,
+    });
+    const body = submit.mock.calls[0]![0] as Record<string, unknown>;
+    expect(body).not.toHaveProperty("submissionId");
+    expect(body).not.toHaveProperty("deduplicationPeriod");
+  });
+
+  it("names an explicit beneficiary, still acting as the app", async () => {
+    const VALIDATOR = "FTP-validator-2::1220da";
+    const submit = makeSubmit();
+    await emitX402RoundMarker(asClient(submit), {
+      app: FTP_PARTY,
+      beneficiary: VALIDATOR,
+      userId: "facilitator",
+      synchronizerId: SYNC_ID,
+      featuredAppRightCid: FAR_CID,
+      weight: 2,
+      roundNumber: 7,
+    });
+    const body = submit.mock.calls[0]![0] as {
+      actAs: string[];
+      commands: Array<{
+        ExerciseCommand: {
+          choiceArgument: { beneficiaries: Array<{ beneficiary: string; weight: string }> };
+        };
+      }>;
+    };
+    // The provider submits (it holds the FeaturedAppRight); only the reward moves.
+    expect(body.actAs).toEqual([FTP_PARTY]);
+    expect(body.commands[0]!.ExerciseCommand.choiceArgument.beneficiaries).toEqual([
+      { beneficiary: VALIDATOR, weight: "1.0000000000" },
+    ]);
   });
 
   it("commandId is deterministic on roundNumber (idempotent retries)", async () => {

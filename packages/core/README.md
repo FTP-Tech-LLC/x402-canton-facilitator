@@ -1,9 +1,9 @@
 # @ftptech/x402-canton-core
 
 Shared TypeScript types and helpers for the Canton x402 protocol
-stack. Used by `@ftptech/x402-canton-facilitator`,
-`@ftptech/x402-canton-client`, `@ftptech/x402-canton-express`, and
-`@ftptech/x402-canton-next`.
+stack. Used by the facilitator, `@ftptech/x402-canton-client`,
+`@ftptech/x402-canton-express`, `@ftptech/x402-canton-next` and
+`@ftptech/canton-agent-wallet`.
 
 ## Install
 
@@ -11,24 +11,34 @@ stack. Used by `@ftptech/x402-canton-facilitator`,
 npm i @ftptech/x402-canton-core
 ```
 
-> Note: the `@ftp` npm scope is not final and may change before the
-> first public release (see [`docs/PUBLISHING.md`](https://github.com/sunstrike228/canton-x402/blob/main/docs/PUBLISHING.md)).
-> Pin the version you install and check the README for the current
-> package name.
-
 ## What's in here
 
-- `X402ResourceInfo`, `PaymentRequirements`, `CantonPaymentPayload`,
-  `FacilitatorRequest`, `VerifyResponse`, `SettleResponse`,
-  `SupportedResponse`, `CantonErrorCode` types per x402 v2.
-- `CantonNetwork` CAIP-2-style identifiers (`canton:devnet`,
-  `canton:mainnet`, `canton:<global-synchronizer-id>`).
-- `encodeBase64Json` / `decodeBase64Json` + v1/v2 header-name
-  constants (`PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`,
-  `PAYMENT-RESPONSE`, `X-PAYMENT`, `X-PAYMENT-RESPONSE`).
+- Wire types per x402 v2: `PaymentRequirements`, `CantonPaymentPayload`,
+  `VerifyResponse`, `SettleResponse`, `SupportedResponse`,
+  `CantonErrorCode` and friends.
+- Network ids: `canton:devnet`, `canton:testnet`, `canton:mainnet`
+  (`buildNetworkId`, `isCantonNetwork`, `parseNetworkReference`).
+- Headers: `encodeBase64Json` / `decodeBase64Json` and the v2 header
+  names `PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, `PAYMENT-RESPONSE`. The
+  v1 `X-PAYMENT` header is not supported.
+- Amounts: atomic units, 1 token = 10^10 (`decimalToAtomicCC`,
+  `atomicToDecimalCC`, `wireAmountToLedgerDecimal` and the ledger
+  decimal helpers).
+- Inline payload: `encodeInlinePaymentPayload` /
+  `decodeInlinePaymentPayload` (gzip, bounded decode) and the lower
+  level `encodeInlinePayload` / `decodeInlinePayload`.
+- Verify-before-sign: `decodePrepared` and the asserts a signer or a
+  facilitator runs on prepared bytes, such as
+  `assertPreparedTransferMatches`, `assertPreparedAcceptMatches`,
+  `assertPreparedRegistrySelfPreapproval`,
+  `assertPreparedAmuletSelfPreapproval` and the Tradecraft
+  `assertPreparedTc*` family.
+- Merchant replay guard: `RedeemedStore` and
+  `createInMemoryRedeemedStore`.
+
+See [CHANGELOG.md](CHANGELOG.md) for changes per version.
 
 ## Project
 
-See [github.com/sunstrike228/canton-x402](https://github.com/sunstrike228/canton-x402)
-and the scheme spec at
-[`specs/scheme_exact_canton.md`](https://github.com/sunstrike228/canton-x402/blob/main/specs/scheme_exact_canton.md).
+Source: [FTP-Tech-LLC/x402-canton-facilitator](https://github.com/FTP-Tech-LLC/x402-canton-facilitator).
+Scheme spec: [`specs/scheme_exact_canton.md`](../../specs/scheme_exact_canton.md).

@@ -100,7 +100,7 @@ export interface SettleRouteServices extends ValidationServices {
    *  it is absent. services.ts wires it when tfEnabled. */
   transferFactory?:
     | (Pick<TransferFactoryService, "preapprovalKind" | "execute"> &
-        Partial<Pick<TransferFactoryService, "resolveDispatched" | "ledgerEnd">>)
+        Partial<Pick<TransferFactoryService, "resolveDispatched" | "ledgerEnd" | "ledgerEndFor">>)
     | undefined;
   /**
    * Rollout stage for the unknown-outcome guard (config.settleDispatchMarkMode).
@@ -394,6 +394,7 @@ export async function registerSettleRoute(
                     payer: v.payer,
                     submissionId: record.submissionId,
                     beginExclusive: record.beginExclusive,
+                    ...(record.participant !== undefined ? { participant: record.participant } : {}),
                     instrumentAdmin: v.instrumentAdmin,
                   })
                 : { state: "unknown" as const };
@@ -540,10 +541,19 @@ export async function registerSettleRoute(
         // does not make. `off` has to mean identical latency too, not just an
         // identical response body.
         let inlineBegin: number | undefined;
+        // Id of the participant the offset was read on; the execute and any
+        // later resolve must use the same one (offsets are local to it).
+        let inlineParticipant: string | undefined;
         if (markMode !== "off") {
           try {
-            inlineBegin =
-              typeof tfSvc.ledgerEnd === "function" ? await tfSvc.ledgerEnd() : undefined;
+            if (typeof tfSvc.ledgerEndFor === "function") {
+              const le = await tfSvc.ledgerEndFor(v.payer);
+              inlineBegin = le.offset;
+              inlineParticipant = le.participant;
+            } else {
+              inlineBegin =
+                typeof tfSvc.ledgerEnd === "function" ? await tfSvc.ledgerEnd() : undefined;
+            }
           } catch {
             // Not fatal: without it the mark still blocks a second relay, it
             // just cannot be resolved automatically. Refusing the payment
@@ -551,11 +561,65 @@ export async function registerSettleRoute(
             inlineBegin = undefined;
           }
         }
+        // Answer a duplicate of a settle that is relaying these same bytes right
+        // now: wait for it to record its result and answer with that, exactly
+        // as a sequential retry would be answered; 503 if it has not finished.
+        const answerFromSibling = async (
+          store: NonNullable<SettleRouteServices["inlineSettles"]>,
+          key: string,
+          how: string
+        ): Promise<SettleResponse | { error: string }> => {
+          for (let i = 0; i < 12; i++) {
+            await new Promise((r) => setTimeout(r, 500));
+            const sib = await store.getRecord(key);
+            const settled = sib?.state === "settled" ? sib.updateId : null;
+            if (settled) {
+              req.log.info(
+                { payer: v.payer, merchant: v.merchant, updateId: settled },
+                `/settle: concurrent duplicate answered from the sibling's record (${how})`
+              );
+              metrics?.recordSettle("ok");
+              return {
+                success: true,
+                payer: v.payer,
+                transaction: settled,
+                network: svc.network,
+              };
+            }
+          }
+          // The sibling has not finished within the window. Report something
+          // the caller should RETRY rather than something that reads as
+          // "this payment is void" — the submission is still in flight and
+          // paying again would be the wrong response.
+          req.log.warn(
+            { payer: v.payer, merchant: v.merchant },
+            "/settle: concurrent duplicate still in flight after waiting; outcome UNKNOWN, answering 503"
+          );
+          return inconclusive(reply);
+        };
         if (idemKey && svc.inlineSettles && markMode !== "off") {
-          await svc.inlineSettles.recordDispatched(idemKey, {
+          const first = await svc.inlineSettles.recordDispatched(idemKey, {
             submissionId: inlineSubmissionId,
             ...(inlineBegin !== undefined ? { beginExclusive: inlineBegin } : {}),
+            ...(inlineParticipant !== undefined ? { participant: inlineParticipant } : {}),
           });
+          if (!first) {
+            // A concurrent settle recorded these bytes between our read and
+            // our write, and is relaying them now. A second relay is harmless
+            // only on the same participant, which refuses it as already in
+            // flight. With two participants it can land on the other one, meet
+            // inputs the first has consumed, and come back as contention —
+            // "nothing moved, retry" — while the first commits.
+            if (markMode === "enforce") {
+              return answerFromSibling(svc.inlineSettles, idemKey, "no second submit");
+            }
+            metrics?.recordSettle("outcome_unknown_observed");
+            req.log.warn(
+              { payer: v.payer, merchant: v.merchant, idemKey },
+              "/settle: [observe] a concurrent settle already dispatched this transaction — " +
+                "enforce would wait for it instead of relaying; proceeding as today"
+            );
+          }
         }
         let ex;
         try {
@@ -580,6 +644,7 @@ export async function registerSettleRoute(
             },
             submissionId: inlineSubmissionId,
             ...(inlineBegin !== undefined ? { beginExclusive: inlineBegin } : {}),
+            ...(inlineParticipant !== undefined ? { participant: inlineParticipant } : {}),
             instrumentAdmin: v.instrumentAdmin,
           });
         } catch (e) {
@@ -591,33 +656,11 @@ export async function registerSettleRoute(
           // may pay again. So wait for the sibling to record its result and
           // answer with it, exactly as a sequential retry would be answered.
           if (isSubmissionAlreadyInFlight(e) && idemKey && svc.inlineSettles) {
-            for (let i = 0; i < 12; i++) {
-              await new Promise((r) => setTimeout(r, 500));
-              const sib = await svc.inlineSettles.getRecord(idemKey);
-              const settled = sib?.state === "settled" ? sib.updateId : null;
-              if (settled) {
-                req.log.info(
-                  { payer: v.payer, merchant: v.merchant, updateId: settled },
-                  "/settle: concurrent duplicate answered from the sibling's record (participant deduped; no second submit)"
-                );
-                metrics?.recordSettle("ok");
-                return {
-                  success: true,
-                  payer: v.payer,
-                  transaction: settled,
-                  network: svc.network,
-                };
-              }
-            }
-            // The sibling has not finished within the window. Report something
-            // the caller should RETRY rather than something that reads as
-            // "this payment is void" — the submission is still in flight and
-            // paying again would be the wrong response.
-            req.log.warn(
-              { payer: v.payer, merchant: v.merchant },
-              "/settle: concurrent duplicate still in flight after waiting; outcome UNKNOWN, answering 503"
+            return answerFromSibling(
+              svc.inlineSettles,
+              idemKey,
+              "participant deduped; no second submit"
             );
-            return inconclusive(reply);
           }
           // ONLY "the participant never answered" is unknown. An HTTP_ERROR
           // means it DID answer and the body says what it decided — a traffic

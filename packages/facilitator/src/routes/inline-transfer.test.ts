@@ -894,3 +894,55 @@ describe("classifyMismatch — staleness has three spellings, not one", () => {
     );
   });
 });
+
+describe("inline arm — switching the facilitator party", () => {
+  // The facilitator moves to a new party; merchants quote feePayer in static
+  // config, so the previous party stays accepted until their configs move.
+  const NEW = "ftp-x402-infrastructure::1220" + "ab".repeat(32);
+  const switching = { ...depsSigOk, facilitatorParty: NEW, acceptedFeePayers: [FACILITATOR] };
+
+  it("accepts a merchant still quoting the previous party as feePayer", async () => {
+    const r = await validateInlineTransferPath(request(), switching);
+    expect(r.ok).toBe(true);
+  });
+
+  it("accepts the new party as feePayer", async () => {
+    const r = await validateInlineTransferPath(request({}, { feePayer: NEW }), switching);
+    expect(r.ok).toBe(true);
+  });
+
+  it("still refuses a feePayer that is neither", async () => {
+    const r = await validateInlineTransferPath(
+      request({}, { feePayer: "other_facilitator::1220" + "11".repeat(32) }),
+      switching
+    );
+    expect(r.reason).toBe("invalid_exact_canton_fee_payer_mismatch");
+  });
+
+  it("the self-payment guard covers the previous party too", async () => {
+    const r = await validateInlineTransferPath(request(), {
+      ...depsSigOk,
+      facilitatorParty: NEW,
+      acceptedFeePayers: [META.sender],
+    });
+    expect(r.reason).toBe("invalid_exact_canton_self_payment");
+  });
+
+  it("under `provider`, only the current party proves the merchant is served", async () => {
+    // The previous party is the validator operator party: accepting it as
+    // feePayer is fine, trusting preapprovals naming it is not (a stranger can
+    // get one made in its name). Such merchants go on the allowlist instead.
+    const byOld = await validateInlineTransferPath(request({}, { feePayer: NEW }), {
+      ...switching,
+      merchantPolicy: "provider",
+      fetchPreapproval: async () => ({ ...BOUND_PREAPPROVAL, provider: FACILITATOR }),
+    });
+    expect(byOld.reason).toBe("invalid_exact_canton_merchant_not_registered");
+    const byNew = await validateInlineTransferPath(request({}, { feePayer: NEW }), {
+      ...switching,
+      merchantPolicy: "provider",
+      fetchPreapproval: async () => ({ ...BOUND_PREAPPROVAL, provider: NEW }),
+    });
+    expect(byNew.ok).toBe(true);
+  });
+});

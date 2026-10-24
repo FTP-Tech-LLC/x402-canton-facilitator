@@ -156,7 +156,7 @@ async function main(): Promise<void> {
 
   startAttributionRetryWorker(services, app);
 
-  if (services.markerStore && services.markerFtpParty && services.markerUserId) {
+  if (services.markerStore && services.markerFtpParty && services.markerUserId && config.facilitatorMemberId) {
     startPaidMarkerWorker(
       {
         markerStore: services.markerStore,
@@ -164,11 +164,11 @@ async function main(): Promise<void> {
         scan: services.scan,
         markerFtpParty: services.markerFtpParty,
         markerUserId: services.markerUserId,
+        markerBeneficiary: config.markerBeneficiary,
         markerWeightMultiplier: services.markerWeightMultiplier,
-        // Member id for scan.getTrafficStatus: use the explicit override if set,
-        // else derive from our facilitator (validator operator) party.
-        facilitatorMemberId:
-          config.facilitatorMemberId ?? `PAR::${config.facilitatorParty}`,
+        // Member id for scan.getTrafficStatus. Always explicit: loadConfig
+        // refuses to start with markers on and no CANTON_FACILITATOR_MEMBER_ID.
+        facilitatorMemberId: config.facilitatorMemberId,
         maxWeightPerRound: config.markerMaxWeightPerRound,
         freeBytesPerRound: config.markerFreeBytesPerRound,
       },

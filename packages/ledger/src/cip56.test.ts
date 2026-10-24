@@ -454,7 +454,7 @@ describe("findCip56TransferInstruction", () => {
     await findCip56TransferInstruction(client, FAC, "00any");
 
     const body = capturedBody();
-    const partyFilters = body.filter?.filtersByParty ?? {};
+    const partyFilters = body.eventFormat?.filtersByParty ?? {};
     const cumulative: any[] = Object.values(partyFilters).flatMap(
       (f: any) => f.cumulative ?? []
     );
@@ -513,9 +513,9 @@ describe("findCip56TransferInstruction", () => {
 
     const body = capturedBody();
     expect(body).not.toBeNull();
-    // The CantonClient posts { filter, verbose, activeAtOffset } to
-    // /v2/state/active-contracts. Drill into filter.filtersByParty.
-    const partyFilters = body.filter?.filtersByParty ?? {};
+    // The CantonClient posts { eventFormat: { filtersByParty, verbose }, activeAtOffset }
+    // to /v2/state/active-contracts. Drill into eventFormat.filtersByParty.
+    const partyFilters = body.eventFormat?.filtersByParty ?? {};
     const cumulative: any[] = Object.values(partyFilters).flatMap(
       (f: any) => f.cumulative ?? []
     );
@@ -629,7 +629,7 @@ describe("findCip56TransferInstruction", () => {
     await findCip56TransferInstruction(client, FAC, "00any");
 
     const body = capturedBody();
-    const partyKeys = Object.keys(body.filter?.filtersByParty ?? {});
+    const partyKeys = Object.keys(body.eventFormat?.filtersByParty ?? {});
     expect(partyKeys).toContain(FAC);
   });
 
@@ -1019,7 +1019,7 @@ describe("CIP56 constants and findCip56TransferInstruction — completeness roun
     await findCip56TransferInstruction(client, SPECIFIC_FAC, "00any");
     expect(capturedBody).not.toBeNull();
     // The filtersByParty object must use the facilitatorParty as its key
-    const partyKeys = Object.keys(capturedBody.filter?.filtersByParty ?? {});
+    const partyKeys = Object.keys(capturedBody.eventFormat?.filtersByParty ?? {});
     expect(partyKeys).toContain(SPECIFIC_FAC);
   });
 });
@@ -1045,8 +1045,12 @@ describe("findCompleted", () => {
     await findCompleted(client, FAC, "u-1");
 
     expect(capturedBody.updateId).toBe("u-1");
-    expect(capturedBody.requestingParties).toEqual([FAC]);
-    expect(capturedBody.transactionShape).toBe("TRANSACTION_SHAPE_LEDGER_EFFECTS");
+    // update-by-id (transaction-by-id is disabled in Canton 3.6): the
+    // facilitator party is the one wildcard filter, narrow ACS-delta shape —
+    // the TransferInstruction it looks for is a create, which that shape carries.
+    const tx = capturedBody.updateFormat.includeTransactions;
+    expect(Object.keys(tx.eventFormat.filtersByParty)).toEqual([FAC]);
+    expect(tx.transactionShape).toBe("TRANSACTION_SHAPE_ACS_DELTA");
   });
 
   it("returns null when getTransactionById throws (transaction not visible)", async () => {

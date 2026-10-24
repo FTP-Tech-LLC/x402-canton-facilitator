@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { CantonClient, CantonError } from "./client.js";
+import { CantonClient, CantonError, cantonErrorId, completeArrayElements } from "./client.js";
 
 const URL = "http://canton.test";
 const TOKEN = "test-jwt";
@@ -331,6 +331,48 @@ describe("CantonClient.getLedgerEnd", () => {
     expect(r.offset).toBe(12345);
     expect(calls[0]?.url).toBe(`${URL}/v2/state/ledger-end`);
     expect(calls[0]?.method).toBe("GET");
+  });
+});
+
+describe("CantonClient.grantUserRights", () => {
+  it("grants CanActAs only: it covers reads too, and one right per party doubles what fits under max-rights-per-user", async () => {
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const c = makeClient(
+      makeFetch(({ url, init }) => {
+        calls.push({ url, body: JSON.parse(String(init.body)) });
+        return { body: {} };
+      })
+    );
+    await c.grantUserRights("relay@clients", "agent::1220a");
+    expect(calls[0]!.url).toBe(`${URL}/v2/users/relay%40clients/rights`);
+    expect(calls[0]!.body).toEqual({
+      userId: "relay@clients",
+      rights: [{ kind: { CanActAs: { value: { party: "agent::1220a" } } } }],
+    });
+  });
+});
+
+describe("CantonClient.getPartyDetails", () => {
+  it("asks GET /v2/parties/{party} and reports whether this participant hosts it", async () => {
+    const calls: string[] = [];
+    const c = makeClient(
+      makeFetch(({ url }) => {
+        calls.push(url);
+        return { body: { partyDetails: [{ party: "agent::1220a", isLocal: true, identityProviderId: "" }] } };
+      })
+    );
+    expect(await c.getPartyDetails("agent::1220a")).toEqual({ party: "agent::1220a", isLocal: true });
+    expect(calls[0]).toBe(`${URL}/v2/parties/agent%3A%3A1220a`);
+  });
+
+  it("a party the participant knows nothing about comes back undefined", async () => {
+    const c = makeClient(makeFetch(() => ({ body: { partyDetails: [] } })));
+    expect(await c.getPartyDetails("stranger::1220b")).toBeUndefined();
+  });
+
+  it("isLocal false (known, hosted elsewhere) stays false", async () => {
+    const c = makeClient(makeFetch(() => ({ body: { partyDetails: [{ party: "far::1220c", isLocal: false }] } })));
+    expect(await c.getPartyDetails("far::1220c")).toEqual({ party: "far::1220c", isLocal: false });
   });
 });
 
@@ -749,29 +791,33 @@ describe("CantonClient.generateExternalPartyTopology", () => {
 });
 
 describe("CantonClient.getTransactionById", () => {
-  it("POSTs to /v2/updates/transaction-by-id with LEDGER_EFFECTS shape", async () => {
+  it("POSTs to /v2/updates/update-by-id with the ACS-delta shape (transaction-by-id is disabled in Canton 3.6)", async () => {
     let captured: any;
     const c = makeClient(
       makeFetch(({ url, init }) => {
-        expect(url).toBe(`${URL}/v2/updates/transaction-by-id`);
+        expect(url).toBe(`${URL}/v2/updates/update-by-id`);
         captured = JSON.parse(init.body as string);
         return {
           body: {
-            transaction: {
-              updateId: "1220abc",
-              offset: 42,
-              events: [
-                {
-                  CreatedEvent: {
-                    contractId: "00cid",
-                    templateId: "x:y:z",
-                    createArgument: {},
-                    signatories: [],
-                    observers: [],
-                    packageName: "x",
-                  },
+            update: {
+              Transaction: {
+                value: {
+                  updateId: "1220abc",
+                  offset: 42,
+                  events: [
+                    {
+                      CreatedEvent: {
+                        contractId: "00cid",
+                        templateId: "x:y:z",
+                        createArgument: {},
+                        signatories: [],
+                        observers: [],
+                        packageName: "x",
+                      },
+                    },
+                  ],
                 },
-              ],
+              },
             },
           },
         };
@@ -782,12 +828,32 @@ describe("CantonClient.getTransactionById", () => {
       requestingParties: ["alice::1220"],
     });
     expect(captured.updateId).toBe("1220abc");
-    expect(captured.requestingParties).toEqual(["alice::1220"]);
-    expect(captured.transactionShape).toBe(
-      "TRANSACTION_SHAPE_LEDGER_EFFECTS"
-    );
+    expect(captured.requestingParties).toBeUndefined();
+    const tx = captured.updateFormat.includeTransactions;
+    expect(tx.transactionShape).toBe("TRANSACTION_SHAPE_ACS_DELTA");
+    expect(Object.keys(tx.eventFormat.filtersByParty)).toEqual(["alice::1220"]);
+    expect(
+      tx.eventFormat.filtersByParty["alice::1220"].cumulative[0].identifierFilter.WildcardFilter
+    ).toBeDefined();
+    expect(r.updateId).toBe("1220abc");
+    expect(r.offset).toBe(42);
     expect(r.events).toHaveLength(1);
     expect(r.events[0].CreatedEvent?.contractId).toBe("00cid");
+  });
+
+  it("asks for LEDGER_EFFECTS on the same endpoint when fullEffects is set", async () => {
+    let captured: any;
+    const c = makeClient(
+      makeFetch(({ url, init }) => {
+        expect(url).toBe(`${URL}/v2/updates/update-by-id`);
+        captured = JSON.parse(init.body as string);
+        return { body: { update: { Transaction: { value: { updateId: "u", offset: 1, events: [] } } } } };
+      })
+    );
+    await c.getTransactionById({ updateId: "u", requestingParties: ["p::1220"], fullEffects: true });
+    expect(captured.updateFormat.includeTransactions.transactionShape).toBe(
+      "TRANSACTION_SHAPE_LEDGER_EFFECTS"
+    );
   });
 
   it("tolerates an empty events array", async () => {
@@ -895,7 +961,7 @@ describe("CantonClient.queryActiveContracts with InterfaceFilter", () => {
       (c.url as string).endsWith("/v2/state/active-contracts")
     );
     expect(acsCall).toBeDefined();
-    const sentFilter = (acsCall?.body as any)?.filter?.filtersByParty?.["fac::1220"];
+    const sentFilter = (acsCall?.body as any)?.eventFormat?.filtersByParty?.["fac::1220"];
     expect(sentFilter).toBeDefined();
     const ifFilter =
       sentFilter?.cumulative?.[0]?.identifierFilter?.InterfaceFilter?.value;
@@ -1062,7 +1128,7 @@ describe("CantonClient.queryActiveContracts with TemplateFilter", () => {
       (c.url as string).endsWith("/v2/state/active-contracts")
     );
     expect(acsCall).toBeDefined();
-    const sentTemplateId = (acsCall?.body as any)?.filter?.filtersByParty?.[
+    const sentTemplateId = (acsCall?.body as any)?.eventFormat?.filtersByParty?.[
       "merchant::1220abc"
     ]?.cumulative?.[0]?.identifierFilter?.TemplateFilter?.value?.templateId;
     expect(sentTemplateId).toBe(templateId);
@@ -1340,9 +1406,13 @@ describe("CantonClient.queryActiveContracts — body completeness", () => {
     const body = capturedAcsBodies[0];
     // Must include the ledger-end offset
     expect(body.activeAtOffset).toBe(42);
-    // Must include the filter
-    expect(body.filter).toBeDefined();
-    expect(body.filter?.filtersByParty?.["party-x::1220"]).toBeDefined();
+    // The filter travels inside eventFormat; the deprecated top-level
+    // filter/verbose (400 on Canton 3.6) are gone.
+    expect(body.eventFormat).toBeDefined();
+    expect(body.eventFormat?.filtersByParty?.["party-x::1220"]).toBeDefined();
+    expect(body.eventFormat?.verbose).toBe(false);
+    expect(body.filter).toBeUndefined();
+    expect(body.verbose).toBeUndefined();
   });
 });
 
@@ -1419,8 +1489,8 @@ describe("CantonClient.submitAndWaitForTransaction — 409 already-in-flight", (
   });
 });
 
-describe("CantonClient.getTransactionById — requestingParties in POST body", () => {
-  it("requestingParties appears in the POST body sent to /v2/updates/transaction-by-id", async () => {
+describe("CantonClient.getTransactionById — requesting parties in POST body", () => {
+  it("each requesting party becomes a wildcard filter in the update-by-id eventFormat", async () => {
     let captured: any = null;
     const c = makeClient(
       makeFetch(({ init }) => {
@@ -1440,10 +1510,9 @@ describe("CantonClient.getTransactionById — requestingParties in POST body", (
     });
 
     expect(captured).not.toBeNull();
-    expect(captured.requestingParties).toEqual(parties);
-    expect(captured.requestingParties).toHaveLength(2);
-    expect(captured.requestingParties).toContain("alice::1220abc");
-    expect(captured.requestingParties).toContain("bob::1220def");
+    const byParty = captured.updateFormat.includeTransactions.eventFormat.filtersByParty;
+    expect(Object.keys(byParty)).toEqual(parties);
+    expect(captured.requestingParties).toBeUndefined();
   });
 });
 
@@ -1574,5 +1643,239 @@ describe("CantonClient.getLedgerEnd — missing-offset hardening (audit M1)", ()
   it("returns a normal positive offset unchanged", async () => {
     const r = await clientWithLedgerEndBody({ offset: 123 }).getLedgerEnd();
     expect(r.offset).toBe(123);
+  });
+});
+
+describe("CantonClient.queryActiveContractsSlice", () => {
+  const entry = (cid: string) => ({
+    contractEntry: {
+      JsActiveContract: {
+        createdEvent: { contractId: cid, templateId: "#p:M:T", createArgument: {}, signatories: [], observers: [], packageName: "p" },
+      },
+    },
+  });
+  const capBody = (n: number) => ({
+    code: "JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED",
+    cause: `The number of matching elements (${n + 1}) is greater than the node limit (${n}).`,
+  });
+
+  it("sends ?limit=N on the same POST and reports a short answer as complete", async () => {
+    const urls: string[] = [];
+    const c = makeClient(
+      makeFetch(({ url }) => {
+        urls.push(url);
+        if (url.endsWith("/v2/state/ledger-end")) return { body: { offset: 5 } };
+        return { body: [entry("a"), entry("b")] };
+      })
+    );
+    const r = await c.queryActiveContractsSlice({ filtersByParty: {} }, 200);
+    expect(urls[1]).toBe(`${URL}/v2/state/active-contracts?limit=200`);
+    expect(r.events.map((e) => e.contractId)).toEqual(["a", "b"]);
+    expect(r).toMatchObject({ complete: true, limit: 200 });
+  });
+
+  it("a full slice is NOT complete (it may be a prefix)", async () => {
+    const c = makeClient(
+      makeFetch(({ url }) => {
+        if (url.endsWith("/v2/state/ledger-end")) return { body: { offset: 5 } };
+        return { body: [entry("a"), entry("b")] };
+      })
+    );
+    const r = await c.queryActiveContractsSlice({ filtersByParty: {} }, 2);
+    expect(r.complete).toBe(false);
+  });
+
+  it("completeness counts the ROWS returned, so a dropped non-created entry cannot fake a complete slice", async () => {
+    const c = makeClient(
+      makeFetch(({ url }) => {
+        if (url.endsWith("/v2/state/ledger-end")) return { body: { offset: 5 } };
+        // Two rows for limit 2: one active contract, one in-flight reassignment.
+        return { body: [entry("a"), { contractEntry: { JsIncompleteAssigned: {} } }] };
+      })
+    );
+    const r = await c.queryActiveContractsSlice({ filtersByParty: {} }, 2);
+    expect(r.events.map((e) => e.contractId)).toEqual(["a"]);
+    expect(r.complete).toBe(false);
+  });
+
+  it("a limit above the node cap is retried ONCE at the cap the node names, at the same offset", async () => {
+    const calls: Array<{ url: string; offset?: number }> = [];
+    const c = makeClient(
+      makeFetch(({ url, init }) => {
+        if (url.endsWith("/v2/state/ledger-end")) return { body: { offset: 9 } };
+        calls.push({ url, offset: JSON.parse(init.body as string).activeAtOffset });
+        if (url.endsWith("limit=500")) return { status: 413, body: capBody(100) };
+        return { body: [entry("x")] };
+      })
+    );
+    const r = await c.queryActiveContractsSlice({ filtersByParty: {} }, 500);
+    expect(calls.map((x) => x.url.split("?")[1])).toEqual(["limit=500", "limit=100"]);
+    expect(calls.every((x) => x.offset === 9)).toBe(true);
+    expect(r).toMatchObject({ limit: 100, complete: true });
+  });
+
+  it("a 413 that names no smaller cap is surfaced as ACS_LIMIT_EXCEEDED, never an empty slice", async () => {
+    const c = makeClient(
+      makeFetch(({ url }) => {
+        if (url.endsWith("/v2/state/ledger-end")) return { body: { offset: 9 } };
+        return { status: 413, body: capBody(200) };
+      })
+    );
+    const err = await c.queryActiveContractsSlice({ filtersByParty: {} }, 200).catch((e: unknown) => e);
+    expect((err as CantonError).code).toBe("ACS_LIMIT_EXCEEDED");
+  });
+
+  it("remembers the cap a node named: the next slice starts there instead of being refused again", async () => {
+    const urls: string[] = [];
+    const c = makeClient(
+      makeFetch(({ url }) => {
+        if (url.endsWith("/v2/state/ledger-end")) return { body: { offset: 9 } };
+        urls.push(url.split("?")[1]!);
+        if (url.endsWith("limit=200")) return { status: 413, body: capBody(100) };
+        return { body: [entry("x")] };
+      })
+    );
+    await c.queryActiveContractsSlice({ filtersByParty: {} }, 200);
+    const second = await c.queryActiveContractsSlice({ filtersByParty: {} }, 200);
+    expect(urls).toEqual(["limit=200", "limit=100", "limit=100"]);
+    expect(second.limit).toBe(100);
+    // A smaller request than the remembered cap is sent as asked.
+    await c.queryActiveContractsSlice({ filtersByParty: {} }, 5);
+    expect(urls.at(-1)).toBe("limit=5");
+  });
+
+  it("refuses a non-positive or fractional limit before any request", async () => {
+    let called = false;
+    const c = makeClient(makeFetch(() => ((called = true), { body: {} })));
+    for (const bad of [0, -1, 1.5]) {
+      const err = await c.queryActiveContractsSlice({ filtersByParty: {} }, bad).catch((e: unknown) => e);
+      expect((err as CantonError).code).toBe("INVALID_ARGUMENT");
+    }
+    expect(called).toBe(false);
+  });
+});
+
+describe("CantonClient.getEventsByContractId", () => {
+  const bodyOf = (init: RequestInit) => JSON.parse(init.body as string) as {
+    contractId: string;
+    eventFormat: { filtersByParty: Record<string, { cumulative: Array<{ identifierFilter: Record<string, unknown> }> }> };
+  };
+
+  it("reads through a wildcard by default", async () => {
+    const bodies: ReturnType<typeof bodyOf>[] = [];
+    const c = makeClient(makeFetch(({ init }) => (bodies.push(bodyOf(init)), { body: { created: { createdEvent: { contractId: "00c" } } } })));
+    const r = await c.getEventsByContractId({ contractId: "00c", requestingParties: ["p::1"] });
+    expect(r.created?.contractId).toBe("00c");
+    expect(Object.keys(bodies[0]!.eventFormat.filtersByParty["p::1"]!.cumulative[0]!.identifierFilter)).toEqual(["WildcardFilter"]);
+  });
+
+  it("`interfaceViews` asks through those interfaces, views included", async () => {
+    const bodies: ReturnType<typeof bodyOf>[] = [];
+    const view = { interfaceId: "#i:M:Holding", viewValue: { amount: "1.0" } };
+    const c = makeClient(
+      makeFetch(({ init }) => (bodies.push(bodyOf(init)), { body: { created: { createdEvent: { contractId: "00h", interfaceViews: [view] } } } }))
+    );
+    const r = await c.getEventsByContractId({
+      contractId: "00h",
+      requestingParties: ["p::1"],
+      interfaceViews: ["#splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding"],
+    });
+    expect(bodies[0]!.contractId).toBe("00h");
+    expect(bodies[0]!.eventFormat.filtersByParty["p::1"]!.cumulative).toEqual([
+      {
+        identifierFilter: {
+          InterfaceFilter: {
+            value: {
+              interfaceId: "#splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding",
+              includeInterfaceView: true,
+              includeCreatedEventBlob: false,
+            },
+          },
+        },
+      },
+    ]);
+    expect(r.created?.interfaceViews).toEqual([view]);
+  });
+});
+
+describe("cantonErrorId", () => {
+  it("reads the id from a JSON Ledger API error body", () => {
+    const err = new CantonError("x", "HTTP_ERROR", 409, JSON.stringify({ code: "DUPLICATE_COMMAND", cause: "c" }));
+    expect(cantonErrorId(err)).toBe("DUPLICATE_COMMAND");
+  });
+
+  it("reads the gRPC-style text form", () => {
+    const err = new CantonError("x", "HTTP_ERROR", 409, "SUBMISSION_ALREADY_IN_FLIGHT(2,ab12cd): already in flight");
+    expect(cantonErrorId(err)).toBe("SUBMISSION_ALREADY_IN_FLIGHT");
+  });
+
+  it("is undefined for a body without an id, or no body", () => {
+    expect(cantonErrorId(new CantonError("x", "HTTP_ERROR", 503, "upstream request timeout"))).toBeUndefined();
+    expect(cantonErrorId(new CantonError("x", "TIMEOUT"))).toBeUndefined();
+    expect(cantonErrorId(new Error("boom"))).toBeUndefined();
+    expect(cantonErrorId(undefined)).toBeUndefined();
+  });
+});
+
+describe("CantonClient.findCommandCompletions", () => {
+  const completion = (v: Record<string, unknown>) => ({ completionResponse: { Completion: { value: v } } });
+
+  it("returns every completion for the commandId, accepted and rejected, and nothing else", async () => {
+    let sent: Record<string, unknown> | undefined;
+    const fetch = makeFetch(({ url, init }) => {
+      expect(url).toBe(`${URL}/v2/commands/completions`);
+      sent = JSON.parse(String(init.body));
+      return {
+        body: [
+          completion({ commandId: "x402-round-marker-7", submissionId: "s1", offset: 11, status: { code: 10, message: "NOT_SEQUENCED_TIMEOUT" } }),
+          completion({ commandId: "faucet-1", submissionId: "f", updateId: "uf", offset: 12, status: { code: 0 } }),
+          completion({ commandId: "x402-round-marker-7", submissionId: "s2", updateId: "u2", offset: 13, status: { code: 0 } }),
+          completion({ commandId: "x402-round-marker-7", submissionId: "s3", updateId: "u3", offset: 14 }),
+        ],
+      };
+    });
+
+    const out = await makeClient(fetch).findCommandCompletions("user", "ftp::1", "x402-round-marker-7", 10);
+
+    expect(sent).toEqual({ userId: "user", parties: ["ftp::1"], beginExclusive: 10 });
+    expect(out).toEqual([
+      { submissionId: "s1", offset: 11, rejection: "NOT_SEQUENCED_TIMEOUT" },
+      { submissionId: "s2", updateId: "u2", offset: 13 },
+      { submissionId: "s3", updateId: "u3", offset: 14 },
+    ]);
+  });
+
+  it("a stream that cannot be read THROWS — it is never 'nothing yet'", async () => {
+    const fetch = makeFetch(() => ({ status: 403, body: "forbidden" }));
+    await expect(makeClient(fetch).findCommandCompletions("u", "p", "c", 0)).rejects.toMatchObject({
+      code: "HTTP_ERROR",
+      status: 403,
+    });
+  });
+
+  it("a stream cut mid-element keeps every element that arrived whole", async () => {
+    const whole = JSON.stringify(completion({ commandId: "c", submissionId: "s1", updateId: "u1", offset: 3 }));
+    const fetch = makeFetch(() => ({ body: `[${whole},{"completionResponse":{"Completion":{"value":{"commandId":"c","subm` }));
+    expect(await makeClient(fetch).findCommandCompletions("u", "p", "c", 0)).toEqual([
+      { submissionId: "s1", updateId: "u1", offset: 3 },
+    ]);
+  });
+});
+
+describe("completeArrayElements", () => {
+  it("splits whole top-level elements and ignores brackets inside strings", () => {
+    expect(completeArrayElements('[{"a":"}]["},{"b":[1,2]}, {"c":')).toEqual(['{"a":"}]["}', '{"b":[1,2]}']);
+  });
+  it("handles escaped quotes and an empty or missing array", () => {
+    expect(completeArrayElements('[{"a":"x\\"}"}]')).toEqual(['{"a":"x\\"}"}']);
+    expect(completeArrayElements("[]")).toEqual([]);
+    expect(completeArrayElements("not json")).toEqual([]);
+  });
+});
+
+describe("cantonErrorId on a body cut by the 1 KiB cap", () => {
+  it("still finds the leading code", () => {
+    const body = '{"code":"DUPLICATE_COMMAND","cause":"' + "x".repeat(2000);
+    expect(cantonErrorId(new CantonError("x", "HTTP_ERROR", 409, body.slice(0, 1024)))).toBe("DUPLICATE_COMMAND");
   });
 });

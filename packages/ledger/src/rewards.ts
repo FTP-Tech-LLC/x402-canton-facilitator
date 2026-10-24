@@ -209,8 +209,13 @@ export const FEATURED_APP_RIGHT_V2_TEMPLATE =
   "#splice-api-featured-app-v2:Splice.Api.FeaturedAppRightV2:FeaturedAppRight";
 
 export interface EmitX402RoundMarkerArgs {
-  /** FTP's own party — holds the FeaturedAppRight and earns the reward. */
+  /** FTP's own party — holds the FeaturedAppRight and submits the marker. */
   app: string;
+  /** The party that mints the reward. Absent: `app`. A reward is minted by the
+   *  wallet automation of a validator that has the beneficiary as a wallet user
+   *  (splice UserWalletStore), so a provider party that is not a wallet user
+   *  anywhere names its validator operator here, or its coupons expire unminted. */
+  beneficiary?: string;
   userId: string;
   synchronizerId: string;
   featuredAppRightCid: string;
@@ -218,23 +223,41 @@ export interface EmitX402RoundMarkerArgs {
   weight: number;
   /** Mining round number — baked into commandId for idempotent retries. */
   roundNumber: number;
+  /** Fresh per attempt, so the attempt can be found on its completion. */
+  submissionId?: string;
+  /** Ledger offset taken before the round's FIRST attempt and reused by every
+   *  retry: the participant refuses the command as a duplicate if an earlier
+   *  attempt was accepted after it. Unlike a duration, an offset window does not
+   *  depend on the participant's configured maximum or on clocks. */
+  deduplicationOffset?: number;
+}
+
+/** The marker's commandId: one per mining round, the same on every retry. */
+export function x402RoundMarkerCommandId(roundNumber: number): string {
+  return `x402-round-marker-${roundNumber}`;
 }
 
 /**
  * Emit one FeaturedAppActivityMarker for a mining round with a USD weight.
  * Exercises FeaturedAppRight_CreateActivityMarker directly (no X402ProviderContext)
  * so the weight reflects actual traffic burned rather than a fixed per-payment 1.0.
- * commandId is deterministic on roundNumber → safe to retry on network failure.
+ * commandId is deterministic on roundNumber. That alone does NOT make a blind
+ * retry safe: pass `deduplicationOffset`, and resubmit only once the previous
+ * attempt's completion proves it was rejected.
  */
 export async function emitX402RoundMarker(
   client: Submitter,
   args: EmitX402RoundMarkerArgs
 ): Promise<TransactionResult> {
   return client.submitAndWaitForTransaction({
-    commandId: `x402-round-marker-${args.roundNumber}`,
+    commandId: x402RoundMarkerCommandId(args.roundNumber),
     userId: args.userId,
     actAs: [args.app],
     synchronizerId: args.synchronizerId,
+    ...(args.submissionId ? { submissionId: args.submissionId } : {}),
+    ...(args.deduplicationOffset !== undefined
+      ? { deduplicationPeriod: { DeduplicationOffset: { value: args.deduplicationOffset } } }
+      : {}),
     commands: [
       {
         ExerciseCommand: {
@@ -243,7 +266,7 @@ export async function emitX402RoundMarker(
           choice: "FeaturedAppRight_CreateActivityMarker",
           choiceArgument: {
             beneficiaries: [
-              { beneficiary: args.app, weight: "1.0000000000" },
+              { beneficiary: args.beneficiary ?? args.app, weight: "1.0000000000" },
             ],
             weight: args.weight.toFixed(10),
           },

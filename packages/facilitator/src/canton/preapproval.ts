@@ -5,6 +5,10 @@ import type {
   DisclosedContract,
   ScanClient,
 } from "@ftptech/x402-canton-ledger";
+import {
+  MAX_TRANSFER_INPUTS_AMULET,
+  queryActiveContractsBounded,
+} from "@ftptech/x402-canton-ledger";
 import { selectActiveOpenRound } from "../routes/settle.js";
 import { isInputContentionError } from "./ledger-errors.js";
 
@@ -19,7 +23,9 @@ export interface PreapprovalServiceDeps {
     | "interactiveSubmissionExecute"
     | "getLedgerEnd"
     | "pollCompletionUpdateId"
-  >;
+  > &
+    // Bounded ACS read for a party with more Amulets than one read lists.
+    Partial<Pick<CantonClient, "queryActiveContractsSlice">>;
   scan: Pick<
     ScanClient,
     | "getAmuletRules"
@@ -29,6 +35,14 @@ export interface PreapprovalServiceDeps {
   >;
   facilitatorParty: string;
   userId: string;
+  /** The participant hosting a party, with our ledger user there
+   *  (participant-router.ts). The self-provider path reads, prepares and
+   *  executes for the MERCHANT there. Absent: `client` as `userId`. */
+  router?:
+    | {
+        forParty(party: string): Promise<{ client: PreapprovalServiceDeps["client"]; userId: string }>;
+      }
+    | undefined;
 }
 
 export interface CreatePreapprovalInput {
@@ -73,6 +87,14 @@ export interface CreatePreapprovalResult {
  */
 export class PreapprovalService {
   constructor(private readonly deps: PreapprovalServiceDeps) {}
+
+  /** The participant hosting `party`, and our ledger user there. */
+  private async ledgerFor(
+    party: string
+  ): Promise<{ client: PreapprovalServiceDeps["client"]; userId: string }> {
+    const r = this.deps.router;
+    return r ? r.forParty(party) : { client: this.deps.client, userId: this.deps.userId };
+  }
 
   /**
    * The DSO state this choice DISCLOSES to the ledger: AmuletRules and the
@@ -238,7 +260,7 @@ export class PreapprovalService {
     txHash: string;
     synchronizerId: string;
   }> {
-    const { client, userId } = this.deps;
+    const { client, userId } = await this.ledgerFor(input.party);
     // No retry arm here on purpose: this method only PREPARES: the merchant
     // signs and executes it themselves, so a stale disclosed round surfaces at
     // their execute, not ours, and re-reading after the fact would not help
@@ -287,7 +309,7 @@ export class PreapprovalService {
       });
     }
     // The merchant funds its OWN preapproval fee from its OWN Amulet holdings.
-    const feeInputs = await this.selectFeeInputs(input.party);
+    const feeInputs = await this.selectFeeInputs(input.party, client);
     const choiceArgument: Record<string, unknown> = {
       context: {
         amuletRules: arc.contract_id,
@@ -352,7 +374,8 @@ export class PreapprovalService {
       }>;
     };
   }): Promise<{ updateId: string }> {
-    const { client, userId } = this.deps;
+    // The offset, the execute and the completion poll on ONE participant.
+    const { client, userId } = await this.ledgerFor(input.party);
     const submissionId = `self-preapproval-exec-${randomUUID()}`;
     const offset0 = (await client.getLedgerEnd()).offset;
     const r = await client.interactiveSubmissionExecute({
@@ -404,10 +427,21 @@ export class PreapprovalService {
    * remainder as change. Empty holdings throw (the provider is unfunded).
    */
   private async selectFeeInputs(
-    party: string
+    party: string,
+    client: Pick<
+      PreapprovalServiceDeps["client"],
+      "queryActiveContracts" | "queryActiveContractsSlice"
+    > = this.deps.client
   ): Promise<Array<{ tag: "InputAmulet"; value: string }>> {
     const FEE_INPUT_TARGET_CC = 50;
-    const events = await this.deps.client.queryActiveContracts({
+    // The fee needs a few large Amulets, not an inventory. ONE bounded read: a
+    // party holding more Amulets than the participant lists in one read (a busy
+    // merchant's dust) is served its oldest slice instead of failing the whole
+    // preapproval — and without a plain read that is refused first on every
+    // call. Largest-first within that slice still covers the fee in practice,
+    // and MAX_TRANSFER_INPUTS_AMULET keeps the transaction under the 256-node
+    // cap.
+    const filter = {
       filtersByParty: {
         [party]: {
           cumulative: [
@@ -424,7 +458,8 @@ export class PreapprovalService {
           ],
         },
       },
-    });
+    };
+    const { events } = await queryActiveContractsBounded(client, filter);
     const holdings = events
       .map((e) => {
         const arg = e.createArgument as
@@ -442,7 +477,7 @@ export class PreapprovalService {
     for (const h of holdings) {
       inputs.push({ tag: "InputAmulet", value: h.cid });
       total += h.amount;
-      if (total >= FEE_INPUT_TARGET_CC) break;
+      if (total >= FEE_INPUT_TARGET_CC || inputs.length >= MAX_TRANSFER_INPUTS_AMULET) break;
     }
     if (inputs.length === 0) {
       throw new UnfundedFeePartyError(party);

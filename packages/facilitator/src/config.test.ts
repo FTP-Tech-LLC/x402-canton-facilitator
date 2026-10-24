@@ -43,6 +43,20 @@ const OPTIONAL = [
   "CANTON_X402_FAUCET_DAILY_BUDGET_CC",
   "CANTON_X402_FAUCET_LIFETIME_CAP_CC",
   "CANTON_X402_FAUCET_WINDOW_MS",
+  "CANTON_X402_FAUCET_ON_ONBOARD",
+  "CANTON_X402_MARKER_ENABLED",
+  "CANTON_X402_MARKER_BENEFICIARY",
+  "CANTON_FACILITATOR_MEMBER_ID",
+  "CANTON_X402_ACCEPTED_FEE_PAYERS",
+  "CANTON_SECONDARY_PARTICIPANT_URL",
+  "CANTON_SECONDARY_USER_ID",
+  "CANTON_SECONDARY_OIDC_TOKEN_ENDPOINT",
+  "CANTON_SECONDARY_OIDC_CLIENT_ID",
+  "CANTON_SECONDARY_OIDC_CLIENT_SECRET",
+  "CANTON_SECONDARY_LEDGER_API_AUDIENCE",
+  "CANTON_X402_ONBOARD_CO_HOST_UID",
+  "CANTON_GRANT_PARTY_RIGHTS",
+  "CANTON_SECONDARY_GRANT_PARTY_RIGHTS",
 ] as const;
 
 describe("loadConfig", () => {
@@ -71,6 +85,106 @@ describe("loadConfig", () => {
     process.env.CANTON_SCAN_URL = "http://localhost:3903";
     process.env.DATABASE_URL = "postgres://x:x@localhost/x";
   }
+
+  it("refuses to start markers without an explicit member id (guessing it silently skipped every round)", () => {
+    minimal();
+    process.env.CANTON_X402_MARKER_ENABLED = "true";
+    expect(() => loadConfig()).toThrow(/CANTON_FACILITATOR_MEMBER_ID/);
+    process.env.CANTON_FACILITATOR_MEMBER_ID = "PAR::ftp-validator-2::1220da86";
+    expect(loadConfig().facilitatorMemberId).toBe("PAR::ftp-validator-2::1220da86");
+  });
+
+  it("without markers the member id stays optional", () => {
+    minimal();
+    expect(loadConfig().facilitatorMemberId).toBeUndefined();
+  });
+
+  it("marker beneficiary: unset or blank means the marker party; a party id is kept; junk refuses to start", () => {
+    const VALIDATOR = "FTP-validator-2::1220" + "da".repeat(32);
+    minimal();
+    expect(loadConfig().markerBeneficiary).toBeUndefined();
+    process.env.CANTON_X402_MARKER_BENEFICIARY = "  ";
+    expect(loadConfig().markerBeneficiary).toBeUndefined();
+    process.env.CANTON_X402_MARKER_BENEFICIARY = ` ${VALIDATOR} `;
+    expect(loadConfig().markerBeneficiary).toBe(VALIDATOR);
+    // The ledger would refuse every round's marker; fail at boot instead.
+    for (const bad of ["FTP-validator-2", "FTP-validator-2::1220da", `PAR::${VALIDATOR}`]) {
+      process.env.CANTON_X402_MARKER_BENEFICIARY = bad;
+      expect(() => loadConfig()).toThrow(/CANTON_X402_MARKER_BENEFICIARY/);
+    }
+  });
+
+  it("no secondary participant by default: one participant, as before", () => {
+    minimal();
+    expect(loadConfig().secondaryParticipant).toBeUndefined();
+  });
+
+  it("a secondary participant needs its own ledger user, and its own OIDC client under oidc", () => {
+    minimal();
+    process.env.CANTON_SECONDARY_PARTICIPANT_URL = "http://node1:7575";
+    expect(() => loadConfig()).toThrow(/CANTON_SECONDARY_USER_ID/);
+    process.env.CANTON_SECONDARY_USER_ID = "node1-user";
+    expect(loadConfig().secondaryParticipant).toMatchObject({ url: "http://node1:7575", userId: "node1-user" });
+    process.env.JWT_ISSUER = "oidc";
+    process.env.OIDC_TOKEN_ENDPOINT = "https://idp/token";
+    process.env.OIDC_CLIENT_ID = "c";
+    process.env.OIDC_CLIENT_SECRET = "s";
+    process.env.LEDGER_API_AUDIENCE = "aud";
+    expect(() => loadConfig()).toThrow(/CANTON_SECONDARY_OIDC_TOKEN_ENDPOINT/);
+    process.env.CANTON_SECONDARY_OIDC_TOKEN_ENDPOINT = "https://idp1/token";
+    process.env.CANTON_SECONDARY_OIDC_CLIENT_ID = "c1";
+    process.env.CANTON_SECONDARY_OIDC_CLIENT_SECRET = "s1";
+    process.env.CANTON_SECONDARY_LEDGER_API_AUDIENCE = "aud1";
+    expect(loadConfig().secondaryParticipant).toMatchObject({ oidcClientId: "c1", ledgerApiAudience: "aud1" });
+  });
+
+  const NODE2_UID = "FTP-validator-2::1220" + "da".repeat(32);
+
+  it("co-hosting new wallets needs the secondary participant it allocates on", () => {
+    minimal();
+    process.env.CANTON_X402_ONBOARD_CO_HOST_UID = NODE2_UID;
+    expect(() => loadConfig()).toThrow(/CANTON_SECONDARY_PARTICIPANT_URL/);
+    process.env.CANTON_SECONDARY_PARTICIPANT_URL = "http://node2:7575";
+    process.env.CANTON_SECONDARY_USER_ID = "node2-user";
+    expect(loadConfig().onboardCoHostParticipantUid).toBe(NODE2_UID);
+  });
+
+  it("refuses a co-host uid every onboarding would fail on: PAR:: prefix, or the primary's own", () => {
+    minimal();
+    process.env.CANTON_SECONDARY_PARTICIPANT_URL = "http://node2:7575";
+    process.env.CANTON_SECONDARY_USER_ID = "node2-user";
+    process.env.CANTON_X402_ONBOARD_CO_HOST_UID = `PAR::${NODE2_UID}`;
+    expect(() => loadConfig()).toThrow(/no PAR:: prefix/);
+    process.env.CANTON_X402_ONBOARD_CO_HOST_UID = NODE2_UID;
+    process.env.CANTON_FACILITATOR_MEMBER_ID = `PAR::${NODE2_UID}`;
+    expect(() => loadConfig()).toThrow(/must be the secondary/);
+  });
+
+  it("per-party rights grants are on by default and can be turned off per participant", () => {
+    minimal();
+    expect(loadConfig().grantPartyRights).toBe(true);
+    process.env.CANTON_GRANT_PARTY_RIGHTS = "false";
+    expect(loadConfig().grantPartyRights).toBe(false);
+    process.env.CANTON_SECONDARY_PARTICIPANT_URL = "http://node2:7575";
+    process.env.CANTON_SECONDARY_USER_ID = "node2-user";
+    expect(loadConfig().secondaryParticipant?.grantPartyRights).toBe(true);
+    process.env.CANTON_SECONDARY_GRANT_PARTY_RIGHTS = "false";
+    expect(loadConfig().secondaryParticipant?.grantPartyRights).toBe(false);
+  });
+
+  it("the secondary must be another participant: a settle records which one by URL", () => {
+    minimal();
+    process.env.CANTON_SECONDARY_PARTICIPANT_URL = "http://LOCALHOST:3975/";
+    process.env.CANTON_SECONDARY_USER_ID = "u";
+    expect(() => loadConfig()).toThrow(/different participant/);
+  });
+
+  it("accepted fee payers: trimmed, de-duplicated, never the facilitator party itself", () => {
+    minimal();
+    expect(loadConfig().acceptedFeePayers).toEqual([]);
+    process.env.CANTON_X402_ACCEPTED_FEE_PAYERS = " old::1220a, other::1220b,,old::1220a, ftp_facilitator::1220 ";
+    expect(loadConfig().acceptedFeePayers).toEqual(["old::1220a", "other::1220b"]);
+  });
 
   it("returns sensible defaults with minimum required env", () => {
     minimal();
@@ -656,6 +770,22 @@ describe("loadConfig", () => {
     process.env.CANTON_X402_FAUCET_AMOUNT_CC = "0";
     process.env.CANTON_X402_FAUCET_DAILY_BUDGET_CC = "0";
     expect(() => loadConfig()).not.toThrow();
+  });
+
+  it("the starter grant is off by default and rides on the faucet", () => {
+    minimal();
+    expect(loadConfig().faucetOnOnboard).toBe(false);
+    process.env.CANTON_X402_FAUCET_ENABLED = "true";
+    process.env.CANTON_X402_FAUCET_ON_ONBOARD = "true";
+    process.env.CANTON_X402_FAUCET_AMOUNT_CC = "1";
+    process.env.CANTON_X402_FAUCET_DAILY_BUDGET_CC = "200";
+    expect(loadConfig().faucetOnOnboard).toBe(true);
+  });
+
+  it("refuses a starter grant with the faucet off (it would silently pay nothing)", () => {
+    minimal();
+    process.env.CANTON_X402_FAUCET_ON_ONBOARD = "true";
+    expect(() => loadConfig()).toThrow(/CANTON_X402_FAUCET_ENABLED/);
   });
 });
 

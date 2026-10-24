@@ -89,6 +89,20 @@ export type SendOutcome =
  */
 export type InlineKeyLookupOutcome = "ok" | "unavailable" | "no_key";
 
+/**
+ * Which side a relay-route failure is attributed to, labelled on
+ * `relay_error_total{kind=...}`.
+ *
+ * The relay money-path routes (pay/prepare, preapproval/self|registry/*) all
+ * fail through one helper (`relayError` in routes/wallet.ts), which already
+ * separates a caller-attributed refusal (a stranger party we cannot read — the
+ * caller's question answered, 404) from OUR outage (a real dependency/ledger
+ * failure — 502, logged level 50). `server` is the alertable one: it is the
+ * class that took CC payments down when Scan started 403ing while /settle
+ * (registry) still looked healthy — the blind spot this counter closes.
+ */
+export type RelayErrorKind = "server" | "client";
+
 export interface FacilitatorMetrics {
   /** The registry to serialize on GET /metrics. */
   registry: Registry;
@@ -110,6 +124,11 @@ export interface FacilitatorMetrics {
   sendOutcomeTotal: CounterT<"outcome">;
   /** See {@link FacilitatorMetrics.recordInlineKeyLookup}. */
   inlineKeyLookupTotal: CounterT<"outcome">;
+  /** relay_error_total{route,kind} — failures of the wallet-relay money-path
+   *  routes (pay/prepare, preapproval self/registry prepare+commit), which are
+   *  NOT covered by settle_total. `kind=server` is our outage (alert on it);
+   *  `kind=client` is a caller-attributed refusal. See {@link RelayErrorKind}. */
+  relayErrorTotal: CounterT<"route" | "kind">;
   /** Convenience: record one settle outcome (increments settle_total{result}). */
   recordSettle(result: SettleResult): void;
   /** Convenience: record a 429 rejection for `scope`. */
@@ -127,6 +146,9 @@ export interface FacilitatorMetrics {
    *  climbing means OUR dependency is down; `no_key` climbing means payers are
    *  arriving without a published protocol signing key. */
   recordInlineKeyLookup(outcome: InlineKeyLookupOutcome): void;
+  /** Convenience: record one wallet-relay route failure (increments
+   *  relay_error_total{route,kind}). */
+  recordRelayError(route: string, kind: RelayErrorKind): void;
 }
 
 /**
@@ -188,6 +210,13 @@ export function createMetrics(opts?: {
     registers: [registry],
   });
 
+  const relayErrorTotal = new Counter({
+    name: "x402_facilitator_relay_error_total",
+    help: "Wallet-relay money-path route failures by route + kind (server = our outage, alertable; client = caller-attributed refusal). Covers pay/prepare + preapproval routes not seen by settle_total",
+    labelNames: ["route", "kind"] as const,
+    registers: [registry],
+  });
+
   return {
     registry,
     settleTotal,
@@ -196,6 +225,7 @@ export function createMetrics(opts?: {
     settleDuration,
     sendOutcomeTotal,
     inlineKeyLookupTotal,
+    relayErrorTotal,
     recordSettle(result: SettleResult): void {
       settleTotal.inc({ result });
     },
@@ -207,6 +237,9 @@ export function createMetrics(opts?: {
     },
     recordInlineKeyLookup(outcome: InlineKeyLookupOutcome): void {
       inlineKeyLookupTotal.inc({ outcome });
+    },
+    recordRelayError(route: string, kind: RelayErrorKind): void {
+      relayErrorTotal.inc({ route, kind });
     },
   };
 }

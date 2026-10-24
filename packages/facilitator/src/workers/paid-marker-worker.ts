@@ -11,19 +11,79 @@
  *     snapshot instead of emitting (FA Rule 5).
  *   - Clamped: per-round weight is capped at maxWeightPerRound, so an abuse/anomaly
  *     spike can never be amplified into an FA overuse-cap breach / revocation.
- *   - Idempotent: commandId = `x402-round-marker-{round}` → Canton dedup.
+ *   - At most once per round: the attempt is recorded BEFORE it is submitted,
+ *     every attempt deduplicates against one ledger offset, and a submit whose
+ *     answer was lost (`unknown`) is never resubmitted until its completion
+ *     proves it was rejected. See "Why a lost answer is not a failure" below.
  *
  * featuredAppRightCid + synchronizerId are resolved ONCE at startup (cached in the
  * loop closure) to avoid per-tick Scan round-trips.
  */
+import { randomUUID } from "node:crypto";
 import type { FastifyBaseLogger } from "fastify";
 import type { CantonClient } from "@ftptech/x402-canton-ledger";
 import type { ScanClient } from "@ftptech/x402-canton-ledger";
-import { emitX402RoundMarker } from "@ftptech/x402-canton-ledger";
-import type { MarkerStore } from "../db/marker-store.js";
+import {
+  cantonErrorId,
+  emitX402RoundMarker,
+  x402RoundMarkerCommandId,
+} from "@ftptech/x402-canton-ledger";
+import type { MarkerRoundRow, MarkerStore } from "../db/marker-store.js";
 
 const TICK_INTERVAL_MS = 60_000;
 const TRAFFIC_PRICE_USD_PER_MB = 60;
+
+/**
+ * Why a lost answer is not a failure.
+ *
+ * MainNet, 2026-10-17, during a slow-mediator incident: submit-and-wait answered
+ * HTTP 503 while the marker went on to commit. The worker recorded `failed` and
+ * resubmitted the same commandId every minute; the participant did not refuse
+ * the repeats, and 24 extra markers landed (one round seven times, another
+ * eight), 669 weight on a 4,252 day. That is over-claiming, the direction that
+ * puts the FeaturedAppRight at risk.
+ *
+ * Why the participant let them through, read from its own completions: each
+ * accepted repeat reports its applied window as the offset of the PREVIOUS
+ * acceptance, i.e. the minute-old marker already lay outside it. Node 2's
+ * maximum deduplication duration (what an absent period resolves to) is under
+ * a minute, not Canton's 7-day default. Probed live on 2026-10-18: with the
+ * same commandId, a repeat carrying the first attempt's offset got 409
+ * DUPLICATE_COMMAND after 70 s, and a repeat with no period committed after 75 s.
+ *
+ * So a submit ends in one of three ways, and only one of them permits a retry:
+ *   - accepted                → `emitted`
+ *   - provably rejected       → `failed`, may be retried
+ *   - anything else           → `unknown`: wait for the completion stream
+ * The participant emits a completion for every submission it registered, and
+ * one that never gets sequenced still receives NOT_SEQUENCED_TIMEOUT at its max
+ * sequencing time (canton TransactionProcessor), so an attempt the participant
+ * received resolves on the completion stream. One it never received (a proxy
+ * 503, a dropped connection before the request landed) never gets a completion:
+ * it stays `unknown` until UNKNOWN_RECONCILE_ROUNDS and is then given up on
+ * without a resubmit — losing that round is the safe direction.
+ *
+ * The deduplication offset is the second, independent guard: every attempt for
+ * a round carries the ledger offset taken before its first attempt, and the
+ * participant refuses a command whose change was accepted after that offset
+ * (canton CommandDeduplicator, offset branch). A duration — what an absent
+ * period resolves to — depends on the participant's configured maximum; an
+ * offset depends on nothing.
+ */
+
+/** How long an `unknown` attempt is reconciled before the worker gives up on it
+ *  (expired, never resubmitted). In mining rounds, ~10 min each. A completion
+ *  arrives within minutes even for a lost submission (max sequencing time), so
+ *  this only bounds how long a participant outage can keep a row open. */
+const UNKNOWN_RECONCILE_ROUNDS = 12;
+
+/** Canton error ids that the Ledger API returns synchronously, before the
+ *  submission is registered: load shedding and an API that is not up. */
+const REFUSED_BEFORE_REGISTRATION = new Set([
+  "PARTICIPANT_BACKPRESSURE",
+  "SERVICE_NOT_RUNNING",
+  "SERVER_IS_SHUTTING_DOWN",
+]);
 
 /**
  * The floor the DAML choice enforces, quoted from the participant's own
@@ -52,6 +112,9 @@ export interface PaidMarkerWorkerServices {
   scan: ScanClient;
   markerFtpParty: string;
   markerUserId: string;
+  /** Who mints the reward (CANTON_X402_MARKER_BENEFICIARY). Absent: the marker
+   *  party itself. See EmitX402RoundMarkerArgs.beneficiary. */
+  markerBeneficiary?: string | undefined;
   /** Overuse / cost-recovery coefficient applied to the round's total GS traffic
    *  (target 1.15 = +15%). Env-driven (CANTON_X402_MARKER_WEIGHT_MULTIPLIER),
    *  re-tunable with a restart and no rebuild. In total-traffic mode the old
@@ -94,6 +157,7 @@ export async function processRound(
     scan,
     markerFtpParty,
     markerUserId,
+    markerBeneficiary,
     markerWeightMultiplier,
     facilitatorMemberId,
     maxWeightPerRound,
@@ -107,6 +171,20 @@ export async function processRound(
   const row = await store.getRow(targetRound);
   if (!row) {
     log.warn({ targetRound }, "marker_worker: getRow returned undefined after insert");
+    return;
+  }
+  // Only a round with no attempt in flight may submit. `unknown` belongs to
+  // reconcileUnknown; emitted/seeded/skipped/expired are final.
+  if (row.status !== "pending" && row.status !== "failed") return;
+  // A `failed` row from a worker that predates this mechanism: it was submitted
+  // with no submissionId and no dedup offset, and that worker called a lost
+  // answer `failed` too — the very rows that duplicated. Its attempt cannot be
+  // looked up and a fresh offset would not cover it, so it is not retried.
+  if (row.status === "failed" && !row.submission_id && row.traffic_usd != null) {
+    await store.updateStatus(targetRound, "expired", {
+      error_message: "attempted by a worker without outcome tracking — not retried",
+    });
+    log.warn({ targetRound }, "marker_worker: legacy failed round — not retried, its outcome is unknowable");
     return;
   }
 
@@ -244,36 +322,195 @@ export async function processRound(
     return;
   }
 
+  // Write the attempt down BEFORE submitting it. A crash between the submit and
+  // the status write would otherwise leave a `pending` row that the next tick
+  // resubmits blind — the same double emission as a lost answer.
+  let dedupOffset: number;
+  if (row.dedup_offset !== null && row.dedup_offset !== undefined) {
+    dedupOffset = Number(row.dedup_offset);
+  } else {
+    try {
+      dedupOffset = (await client.getLedgerEnd()).offset;
+    } catch (err) {
+      // Nothing submitted. Keep the round's right edge so the next tick prices
+      // the same window, and try again then.
+      await store.updateStatus(targetRound, row.status, { traffic_consumed: consumedBig });
+      log.warn({ targetRound, err }, "marker_worker: ledger-end read failed — not submitting this tick");
+      return;
+    }
+  }
+  const submissionId = randomUUID();
+  await store.updateStatus(targetRound, "unknown", {
+    traffic_bytes: totalBytesBig,
+    traffic_consumed: consumedBig,
+    traffic_usd: totalUsd.toFixed(10),
+    submission_id: submissionId,
+    dedup_offset: BigInt(dedupOffset),
+    submitted: true,
+  });
+
+  let result: Awaited<ReturnType<typeof emitX402RoundMarker>>;
   try {
-    const result = await emitX402RoundMarker(client, {
+    result = await emitX402RoundMarker(client, {
       app: markerFtpParty,
+      ...(markerBeneficiary ? { beneficiary: markerBeneficiary } : {}),
       userId: markerUserId,
       synchronizerId,
       featuredAppRightCid,
       weight: totalUsd,
       roundNumber: targetRound,
+      submissionId,
+      deduplicationOffset: dedupOffset,
     });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const outcome = classifySubmitFailure(err);
+    if (outcome === "rejected") {
+      const status = currentRound > targetRound + 1 ? "expired" : "failed";
+      await store.updateStatus(targetRound, status, { error_message: msg.slice(0, 500) });
+      log.error({ targetRound, status, err }, "marker_worker: emission rejected");
+      return;
+    }
+    // Stays `unknown`: reconcileUnknown resolves it from the completion stream.
+    await store.updateStatus(targetRound, "unknown", {
+      error_message: `${cantonErrorId(err) ?? ""} ${msg}`.trim().slice(0, 500),
+    });
+    if (outcome === "duplicate") {
+      // An attempt this worker did not know had landed: the exact near-miss
+      // this mechanism exists for. The dedup offset caught it.
+      log.error(
+        { targetRound, submissionId, err },
+        "marker_worker: DUPLICATE_COMMAND — an earlier attempt for this round committed; resolving from completions"
+      );
+    } else {
+      log.warn(
+        { targetRound, submissionId, err },
+        "marker_worker: emission outcome unknown — not resubmitting until its completion says rejected"
+      );
+    }
+    return;
+  }
+  // Outside the submit's try: a DB failure here is not a ledger outcome. If it
+  // throws, the row stays `unknown` and reconcileUnknown finds this update.
+  try {
     await store.updateStatus(targetRound, "emitted", {
-      traffic_bytes: totalBytesBig,
-      traffic_consumed: consumedBig,
-      traffic_usd: totalUsd.toFixed(10),
       weight: totalUsd.toFixed(10),
       update_id: result.updateId,
     });
-    log.info(
-      { targetRound, weight: totalUsd.toFixed(4), updateId: result.updateId },
-      "marker_worker: emitted"
-    );
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    const status = currentRound > targetRound + 1 ? "expired" : "failed";
-    await store.updateStatus(targetRound, status, {
-      traffic_bytes: totalBytesBig,
-      traffic_consumed: consumedBig,
-      traffic_usd: totalUsd.toFixed(10),
-      error_message: msg.slice(0, 500),
-    });
-    log.error({ targetRound, status, err }, "marker_worker: emission failed");
+    log.error(
+      { targetRound, updateId: result.updateId, err },
+      "marker_worker: emitted, but recording it failed — row left unknown for reconcile"
+    );
+    return;
+  }
+  log.info(
+    { targetRound, weight: totalUsd.toFixed(4), updateId: result.updateId },
+    "marker_worker: emitted"
+  );
+}
+
+/**
+ * What a failed submit proves about the ledger.
+ *   - "duplicate": the participant refused it because an earlier attempt WAS
+ *     accepted — the marker exists.
+ *   - "rejected": a definite refusal; nothing committed, a retry is safe.
+ *   - "unknown": a timeout, a dropped connection, a 5xx, a 408/429, or a 409
+ *     "still in flight" — the attempt may yet commit.
+ * Only a 4xx with a body says "rejected", and 409 needs its id read: the JSON
+ * API maps ABORTED and ALREADY_EXISTS both to 409, so an accepted duplicate and
+ * a mediator rejection share the status code.
+ */
+export function classifySubmitFailure(err: unknown): "duplicate" | "rejected" | "unknown" {
+  const id = cantonErrorId(err);
+  if (id === "DUPLICATE_COMMAND") return "duplicate";
+  if (id === "SUBMISSION_ALREADY_IN_FLIGHT") return "unknown";
+  // Refused synchronously, before the participant registered the submission:
+  // there will never be a completion to wait for, and nothing was submitted.
+  if (id !== undefined && REFUSED_BEFORE_REGISTRATION.has(id)) return "rejected";
+  const e = err as { code?: unknown; status?: unknown };
+  if (e?.code !== "HTTP_ERROR") return "unknown";
+  const s = typeof e.status === "number" ? e.status : 0;
+  if (s === 408 || s === 429) return "unknown";
+  // A 409 we cannot read the id of may be DUPLICATE_COMMAND or IN_FLIGHT.
+  if (s === 409 && id === undefined) return "unknown";
+  return s >= 400 && s < 500 ? "rejected" : "unknown";
+}
+
+/**
+ * Resolve `unknown` rows from the completion stream: an accepted completion for
+ * the round's commandId makes it `emitted`; a rejection of its latest attempt
+ * makes it `failed` (or `expired` once the round is past retrying); nothing yet
+ * leaves it `unknown`. More than one accepted completion means duplicates
+ * reached the ledger anyway — logged as an error, it is the event this whole
+ * mechanism exists to prevent.
+ */
+export async function reconcileUnknown(
+  services: PaidMarkerWorkerServices,
+  currentRound: number,
+  log: Logger
+): Promise<void> {
+  const { markerStore: store, client, markerFtpParty, markerUserId } = services;
+  const floor = currentRound - UNKNOWN_RECONCILE_ROUNDS;
+  for (const row of await store.getUnknown(floor)) {
+    await reconcileRow(row);
+  }
+  const abandoned = await store.expireUnknown(
+    floor,
+    `outcome still unknown after ${UNKNOWN_RECONCILE_ROUNDS} rounds — not resubmitted`
+  );
+  for (const row of abandoned) {
+    // We gave up without knowing: a marker may or may not be on the ledger.
+    log.error(
+      { round: row.round_number, submissionId: row.submission_id, dedupOffset: row.dedup_offset },
+      "marker_worker: gave up on an unknown round — check the ledger for its commandId"
+    );
+  }
+
+  async function reconcileRow(row: MarkerRoundRow): Promise<void> {
+    const round = row.round_number;
+    if (row.dedup_offset === null || row.dedup_offset === undefined) {
+      log.error({ round }, "marker_worker: unknown row without a dedup offset — left for expiry");
+      return;
+    }
+    let completions;
+    try {
+      completions = await client.findCommandCompletions(
+        markerUserId,
+        markerFtpParty,
+        x402RoundMarkerCommandId(round),
+        Number(row.dedup_offset)
+      );
+    } catch (err) {
+      log.warn({ round, err }, "marker_worker: completion read failed — still unknown");
+      return;
+    }
+    const accepted = completions.filter((c) => c.rejection === undefined);
+    if (accepted.length > 0) {
+      if (accepted.length > 1) {
+        log.error(
+          { round, count: accepted.length, updateIds: accepted.map((c) => c.updateId) },
+          "marker_worker: DUPLICATE markers on the ledger for one round"
+        );
+      }
+      await store.updateStatus(round, "emitted", {
+        weight: row.traffic_usd ?? "0",
+        update_id: accepted[0]!.updateId ?? "",
+      });
+      log.info({ round, updateId: accepted[0]!.updateId }, "marker_worker: unknown resolved — emitted");
+      return;
+    }
+    const mine = completions.find((c) => c.submissionId === row.submission_id);
+    if (mine?.rejection !== undefined) {
+      const status = currentRound > round + 1 ? "expired" : "failed";
+      await store.updateStatus(round, status, { error_message: mine.rejection.slice(0, 500) });
+      log.warn({ round, status, rejection: mine.rejection }, "marker_worker: unknown resolved — rejected");
+      return;
+    }
+    log.warn(
+      { round, submissionId: row.submission_id, roundsLeft: round - floor },
+      "marker_worker: round still unknown — no completion yet, not resubmitting"
+    );
   }
 }
 
@@ -293,6 +530,10 @@ export async function processAllRounds(
   const { markerStore: store, scan } = services;
 
   const currentRound = await scan.getCurrentOpenRoundNumber();
+
+  // First settle what earlier attempts did: a row resolved to `failed` here can
+  // still be retried below in the same tick.
+  await reconcileUnknown(services, currentRound, log);
 
   // Expire all pending/failed rows that are more than 1 round old (FA Rule 5).
   await store.expireRows(currentRound - 1);
@@ -330,7 +571,13 @@ export function startPaidMarkerWorker(
   app: { log: Logger }
 ): void {
   const log = app.log;
-  log.info("marker_worker: starting (interval=60s)");
+  log.info(
+    {
+      provider: services.markerFtpParty,
+      beneficiary: services.markerBeneficiary ?? services.markerFtpParty,
+    },
+    "marker_worker: starting (interval=60s)"
+  );
 
   let running = true;
   const tick = async (): Promise<void> => {

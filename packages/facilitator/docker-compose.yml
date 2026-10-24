@@ -3,11 +3,8 @@
 # Brings up:
 #   - Postgres for merchant-registry mirror + per-payment audit log
 #   - The facilitator pointed at a CANTON_PARTICIPANT_URL and
-#     CANTON_SCAN_URL the operator supplies via .env (see
-#     `packages/facilitator/README.md`).
-#
-# For an end-to-end local demo with no real Canton participant, use
-# `examples/mock-facilitator.mjs` instead — see `docs/quickstart.md`.
+#     CANTON_SCAN_URL the operator supplies via .env next to this file
+#     (see docs/deployment.md). The whole .env is forwarded.
 
 services:
   postgres:
@@ -32,9 +29,13 @@ services:
       context: ../..
       dockerfile: packages/facilitator/Dockerfile
     restart: unless-stopped
+    # Shutdown drains an in-flight /settle for up to 55s (src/shutdown.ts).
+    stop_grace_period: 70s
     depends_on:
       postgres:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       PORT: "4022"
       CANTON_NETWORK: ${CANTON_NETWORK:-canton:devnet}

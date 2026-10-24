@@ -367,6 +367,12 @@ export function isTransientScanError(err: unknown): boolean {
   if (err.code === "TIMEOUT" || err.code === "TRANSPORT_ERROR") return true;
   return (
     err.status === 429 ||
+    // 403 too: on 2026-09-07 DA's Scan gateway began refusing every request
+    // whose Host header carried a port, and the failure was ours alone —
+    // another SV served the same public reads fine. A 403 on an
+    // unauthenticated registry/DSO GET is a per-gateway refusal, not an answer
+    // that is the same on every SV, so it earns the same failover.
+    err.status === 403 ||
     // 500 belongs here with the rest. The list was written from what the SV
     // Scan was observed shedding (502/503/504) and a bare 500 was simply never
     // seen, not reasoned about — but every read through this client is an

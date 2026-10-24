@@ -1,175 +1,176 @@
 # Compatibility Matrix
 
-What versions of the runtime, the Canton platform, the Daml contracts,
-the x402 wire protocol, and the published packages work together. This is
-the reference for "will version X of the client talk to version Y of the
-facilitator on network Z", and the checklist to re-run before any major
-platform upgrade.
+What versions of the runtime, the Canton platform, the x402 wire
+protocol, and the published packages work with the facilitator in this
+repo. Re-check it before any platform upgrade.
 
-Snapshot date: 2026-07-04 (transfer-factory-only; allocation-direct removed). The versions below are what the production
-deployment is built and run against, not just what the manifests request.
+Snapshot date: 2026-10-23. Code: core 1.4.0, ledger 0.6.2, facilitator
+0.0.12.
 
 ## 1. Runtime and toolchain
 
-| Layer | Required | Verified in production |
-|---|---|---|
-| Node.js | `>=22` (root `engines`) | v22.23.1 on `node:22-alpine` |
-| Package manager | pnpm 9.12.0 (pinned via `packageManager`, installed by corepack) | same |
-| PostgreSQL | 16.x | 16.14 (`postgres:16-alpine`) |
-| Docker base image | `node:22-alpine` (build + runtime stages) | same |
-| TypeScript | 5.6 | 5.6.3 |
-| Test runner | vitest 2.1 | 2.1.8 |
-| Lint | eslint 9 / typescript-eslint 8, `--max-warnings 0` | same |
+| Layer | Required |
+|---|---|
+| Node.js | `>=22` (root `engines`); the Docker image uses `node:22-alpine` |
+| Package manager | pnpm 9.12.0 (`packageManager`, installed by corepack) |
+| PostgreSQL | 16.x |
+| TypeScript | 5.x |
+| Test runner | vitest 2.1 |
+| Lint | eslint 9 / typescript-eslint 8, `--max-warnings 0` |
 
-The one Node exception: `@ftptech/canton-x402-mcp` declares `node >=18`
-because MCP hosts install it standalone. Everything else inherits the
-root `>=22`.
-
-## 2. Canton platform, Daml, and Splice
+## 2. Canton platform and Splice
 
 | Component | Version | Notes |
 |---|---|---|
-| Canton participant | 3.5.x line | production runs a `3.5.1-snapshot` build; the JSON Ledger API v2 surface used is stable across the 3.4.x and 3.5.x lines |
-| Daml SDK (contracts) | 3.4.11 | minimum 3.4.11; `3.4.0` does not exist |
-| Daml-LF target | 2.1 (`--target=2.1`) | required for the Canton 3.4/3.5 line |
-| OpenJDK (to build the DAR) | 21 | Canton 3.4+ will not start on 17 |
+| Canton participant | 3.6 (Splice 0.9.x) | needs ledger 0.6.2 or later, included here. On an older line, run the checklist in the playbook first |
+| Splice Scan | 0.9.x | Splice 0.9 removed Scan v0/v1 `holdings/state`; the relay reads v2 |
+| Topology reader route | Canton 3.5.10 / Splice 0.6.14 or later | older participants return no keys, so every payment is refused |
+
+Canton 3.6 changes this repo already handles:
+
+- `POST /v2/state/active-contracts` rejects the top-level `filter` and
+  `verbose` fields. Ledger 0.6.1+ sends `eventFormat`, which Canton
+  accepts since 3.3.
+- `POST /v2/updates/transaction-by-id` is disabled (3.7 removes it).
+  Ledger 0.6.2 reads through `POST /v2/updates/update-by-id`.
 
 ### Daml packages
 
-The `transfer-factory` path uses **no custom DAR**. It settles entirely
-through Splice token-standard interfaces plus the Amulet
-`TransferPreapproval`, all resolved at runtime via `#package-name`
-references, so the stack survives Splice package upgrades without a
-recompile. (The legacy `x402-direct` DAR that backed `allocation-direct`
-has been retired along with that method.)
+The money path uses **no custom DAR**. It settles through Splice
+token-standard interfaces plus the Amulet `TransferPreapproval`, resolved
+at runtime by `#package-name`, so it survives Splice package upgrades
+without a rebuild.
 
 | Interface (via `#package-name`) | Used for |
 |---|---|
-| `splice-api-token-transfer-instruction-v1 :TransferFactory` / `:TransferInstruction` | the settled transfer (pay), plus funding / claim / consolidation |
-| `Splice.AmuletRules:AmuletRules` → `AmuletRules_CreateTransferPreapproval` | merchant self-provisions its `TransferPreapproval` |
-| `Splice.Amulet:Amulet`, `Splice.Amulet:TransferPreapproval` | payer holdings + the `direct`-resolve precondition |
+| `Splice.Api.Token.TransferInstructionV1` (`TransferFactory_Transfer`) | the payment the payer signs and the facilitator relays |
+| `Splice.AmuletRules:AmuletRules`, choice `AmuletRules_CreateTransferPreapproval` | merchant self-provisioned Canton Coin preapproval |
+| `Splice.Amulet:Amulet` | payer holdings |
+| `Splice.AmuletRules:TransferPreapproval` | the live merchant preapproval that makes the transfer resolve `direct` |
+
+CIP-56 registry tokens resolve their transfer factory and preapproval on
+the token's registry (`CANTON_X402_TOKEN_REGISTRIES`).
 
 ## 3. x402 wire protocol
 
 | Property | Value |
 |---|---|
-| x402 version | 2 |
+| x402 version | 2. Headers `PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, `PAYMENT-RESPONSE`. The v1 `X-PAYMENT` header is not supported |
 | Scheme | `exact` (only) |
-| Envelope field names | `assetTransferMethod`, `feePayer`, `payer` (canonical) |
-| Asset symbol | `CC` |
-| Amount encoding | atomic integers on the wire (1 CC = 10^10) |
-| 402 challenge | `accepts[]` carried in the `PAYMENT-REQUIRED` header (base64 JSON) |
+| `assetTransferMethod` | `transfer-factory` (only) |
+| `requirements.extra` | `assetTransferMethod`, `feePayer`, `synchronizerId`, `instrumentId`, `executeBeforeSeconds`, `memo` (optional) |
+| `payload` | `assetTransferMethod`, `preparedTransaction` (base64 gzip), `preparedTxHash`, `signature`, `hashingSchemeVersion`. No `payer`: the facilitator reads it from the signed transaction |
+| Asset | `CC`, or a CIP-56 token as `<admin>::<id>` with `extra.instrumentId` |
+| Amount encoding | atomic integer strings; 1 token = 10^10 for every instrument |
+| Payment header size | about 8 to 10 KiB; servers must accept at least 16 KiB |
 
-### Scheme-name history (the breaking boundary)
+The upstream spec ([`specs/scheme_exact_canton.md`](../specs/scheme_exact_canton.md),
+merged in x402-foundation/x402) covers Canton Coin. CIP-56 tokens are an
+extension of this facilitator.
 
-The scheme name changed once. This is the single most important
-compatibility line for anyone integrating a pinned client:
+### Breaking boundaries
 
-| Wire era | Scheme string | Package range |
+| Change | Date | Package boundary |
 |---|---|---|
-| Legacy | `exact-canton` | core/client 0.2.x and earlier |
-| Current | `exact` | core/client 0.3.0 and later |
+| scheme `exact-canton` renamed to `exact` | 2026-06-29 | core/client 0.3.0 |
+| `allocation-direct`, `external-party-amulet-rules`, `cip56-transfer-factory` removed | 2026-07-05 | |
+| `payload.payer` removed | 2026-07-09 | |
+| stash carriage (`submissionRef`, `pay/commit`) removed; inline only | 2026-08-23 | core, client, agent-wallet 1.0.0 |
 
-A client on the `exact-canton` string will not match a facilitator that
-advertises only `exact`, and vice versa. Both sides must be on the same
-era. Production advertises `exact` only.
+## 4. Payment method
 
-## 4. Payment method (`assetTransferMethod`)
+The facilitator speaks one method: **`transfer-factory`**. The payer
+signs a relay-prepared `TransferFactory_Transfer` (sender = payer,
+receiver = merchant) and carries the signed transaction in the payload.
+The facilitator verifies it and relays it in one transaction
+(`ExecuteSubmission`), paying the traffic. No nonce: replay is blocked
+because the input holdings are consumed, and `executeBefore` bounds the
+signature's life.
 
-The facilitator speaks ONE method: **`transfer-factory`**. The legacy
-`allocation-direct`, `external-party-amulet-rules` (v1) and
-`cip56-transfer-factory` methods have been removed — `transfer-factory`
-is the sole `exact`-scheme settlement path.
-
-| Method | Sponsored gas | Client nonce | Merchant preapproval | Settle mechanism |
-|---|---|---|---|---|
-| `transfer-factory` | yes (facilitator relays) | none (per-holding + `executeBefore` deadline) | yes | payer signs a relay-prepared `TransferFactory_Transfer`; the facilitator relays it (ExecuteSubmission) in ONE tx — no custom DAR, no custody |
-
-The merchant MUST hold a live `TransferPreapproval` (it self-provisions
-one with `canton-agent-wallet preapproval` — its own key, no operator
-token) so the incoming transfer resolves `direct` and settles in a single
-facilitator-relayed transaction. Without it the transfer would resolve to
-a two-step Pending and `/settle` fails closed with
+The merchant MUST hold a live `TransferPreapproval` per instrument it
+accepts, renewed before expiry (`canton-agent-wallet preapproval`
+defaults to 30 days). Without it `/settle` fails with
 `invalid_exact_canton_preapproval_missing`.
 
-`/supported` advertises `["transfer-factory"]`. The path is gated on by
-`CANTON_X402_TF_ENABLED` (+ `CANTON_X402_ADVERTISE_TF`).
+`/supported` always advertises `["transfer-factory"]` and
+`carriages: ["inline"]`. Settlement itself is gated by
+`CANTON_X402_TF_ENABLED`. `CANTON_X402_ADVERTISE_TF` has no effect.
 
 ## 5. Networks
 
-| Network | `transfer-factory` | Faucet | Auth |
-|---|---|---|---|
-| LocalNet | yes | n/a | unsafe HMAC |
-| DevNet | yes | yes | OIDC |
-| TestNet | yes | yes | OIDC |
-| MainNet | yes | no | OIDC |
-
-## 6. Published packages
-
-All under the `@ftptech` scope on npm, Apache-2.0. Internal dependencies
-use caret ranges so patch releases propagate to fresh installs.
-
-| Package | Version | Depends on (internal) | Role |
-|---|---|---|---|
-| `x402-canton-core` | 0.6.0 | (none) | wire types for the `exact` scheme |
-| `x402-canton-ledger` | 0.1.1 | (none) | JSON Ledger API v2 + Scan client |
-| `x402-canton-client` | 0.6.0 | core, ledger | buyer-side payment scheme |
-| `x402-canton-express` | 0.2.1 | core | merchant middleware for Express |
-| `x402-canton-next` | 0.2.1 | core | merchant middleware for Next.js |
-| `canton-agent-wallet` | 0.6.0 | ledger, client | self-custody wallet CLI |
-| `canton-x402-mcp` | 0.5.0 | agent-wallet | MCP server wrapping the wallet |
-
-Notable third-party pins: `@canton-network/core-tx-visualizer` and
-`@canton-network/core-ledger-proto` at `~1.4.0` (patch drift only),
-`@modelcontextprotocol/sdk ^1.29`, `fastify ^5.1`, `pg ^8.21`,
-`undici ^7.1`, `zod ^3.25`.
-
-The facilitator and pay-proxy services are not published to npm; they
-ship as Docker images built from the same workspace.
-
-### Client-to-facilitator compatibility
-
-| Client (`x402-canton-client`) | Facilitator wire | Compatible |
+| Network | Auth | Faucet |
 |---|---|---|
-| 0.3.0+ (`exact`) | advertises `exact` | yes |
-| 0.3.0+ (`exact`) | advertises only `exact-canton` | no |
-| 0.2.x (`exact-canton`) | advertises `exact` | no |
-| 0.2.x (`exact-canton`) | advertises `exact-canton` | yes |
+| LocalNet | unsafe HMAC | env-gated |
+| DevNet | OIDC | env-gated |
+| TestNet | OIDC | env-gated |
+| MainNet | OIDC | env-gated; keep the claim route behind `CANTON_X402_FAUCET_INTERNAL_SECRET` |
 
-Rule of thumb: keep the client on 0.3.0 or later against any current
-facilitator. The middleware packages (`express`, `next`) follow the same
-`exact` boundary through their `core` dependency.
+The faucet is one feature (`CANTON_X402_FAUCET_ENABLED`, default off) on
+any network, not a per-network branch.
+
+## 6. Packages
+
+All under the `@ftptech` scope on npm, Apache-2.0. Versions as published
+on 2026-10-23.
+
+| Package | npm | Depends on (internal) | Role |
+|---|---|---|---|
+| `x402-canton-core` | 1.4.0 | (none) | wire types, amounts, verify-before-sign decoders (in this repo) |
+| `x402-canton-ledger` | 0.6.2 | (none) | JSON Ledger API v2 + Scan client (in this repo) |
+| `x402-canton-client` | 1.2.2 | core ^1.4.0, ledger ^0.6.0 | buyer-side payment scheme |
+| `x402-canton-express` | 0.2.6 | core ^1.2.0 | merchant middleware for Express |
+| `x402-canton-next` | 0.2.6 | core ^1.2.0 | merchant middleware for Next.js |
+| `canton-agent-wallet` | 2.4.0 | core, client, ledger | self-custody wallet CLI |
+| `canton-x402-mcp` | 2.3.0 | agent-wallet | MCP server wrapping the wallet |
+
+The facilitator (`@ftptech/x402-canton-facilitator`) is not on npm. It
+ships as a Docker image built from this repo. Its third-party pins:
+`fastify ^5.1.0`, `pg ^8.21.0`, `undici ^7.1.0`, `pino ^9.5.0`,
+`prom-client ^15.1.3`.
+
+### Client to facilitator
+
+| Client | Works with this facilitator |
+|---|---|
+| client, agent-wallet 1.0.0 or later | yes (inline carriage) |
+| client, agent-wallet before 1.0.0 | no: `invalid_exact_canton_missing_proof` |
+| core/client before 0.3.0 (`exact-canton`) | no |
+| agent-wallet 2.3.0 or later, `merge` and token holdings | yes; uses `GET /v1/wallet/:party/holdings?slice=1` |
+| agent-wallet 2.4.0 `tc` (Tradecraft queued mode) | only with `CANTON_X402_WALLET_SUBMIT_CHOICES`, `_SUBMIT_CREATE_TEMPLATES` and `_READ_IDS` set |
+
+The middleware packages (`express`, `next`) follow the `exact` boundary
+through `core`.
 
 ## 7. JSON Ledger API v2 surface
 
-The facilitator uses a small, stable slice of the JSON Ledger API v2.
-The endpoint-specific body shapes matter and are easy to get wrong.
-
-| Endpoint | Body shape | Used for |
+| Endpoint | Note | Used for |
 |---|---|---|
-| `/v2/commands/submit-and-wait-for-transaction` | wrapped: `{commands: {commandId, actAs, commands, ...}}` | settle submission |
-| `/v2/state/active-contracts` | filter by template/interface | verify reads |
-| `/v2/updates/...` (Scan) | per-update read | Scan-read verify (cip56 path) |
-| `/v2/interactive-submission/*` | prepare + execute | external-party flows |
+| `/v2/state/ledger-end` | offset read | before an execute; readiness |
+| `/v2/state/active-contracts` | `eventFormat` filter by template or interface; `?limit=N` slices | holdings, preapprovals, fee inputs |
+| `/v2/interactive-submission/prepare` | | relay pay, submit and self-preapproval prepare |
+| `/v2/interactive-submission/execute` | requires `deduplicationPeriod` | settle relay; relay execute |
+| `/v2/updates/update-by-id` | the requesting party's projection | the settle funds-moved check |
+| `/v2/commands/submit-and-wait-for-transaction` | wrapped `{commands: {...}}` | markers; legacy provider preapproval |
+| `/v2/commands/completions` | | marker outcome after a lost answer |
+| `/v2/parties/external/{generate-topology,allocate}` | | relay onboarding |
+| `/v2/users/{id}/rights` | | relay onboarding grants |
 
-Note on `submit-and-wait-for-transaction-tree`: this stack does NOT use
-it anywhere. It is listed only as an upgrade tripwire — the endpoint is
-deprecated in 3.4 and removed in 3.5, and it is common in older Canton
-examples and generated snippets, so any external script or dependency
-still calling it breaks on a 3.5 participant. Run the ledger-API compat
-checklist in [MAINTENANCE-PLAYBOOK.md](MAINTENANCE-PLAYBOOK.md) before
-any participant major upgrade.
+Scan reads: AmuletRules and mining rounds (`/api/scan/v0`, POST on SV
+Scans), transfer preapprovals by party, the token-standard transfer
+factory, and `/api/scan/v2/holdings/state` for the relay's
+`holdings-scan`.
+
+Run the ledger-API checklist in
+[MAINTENANCE-PLAYBOOK.md](MAINTENANCE-PLAYBOOK.md) before any
+participant upgrade.
 
 ## 8. Support and upgrade policy
 
-- Published packages follow semver. Internal dependencies use caret
-  ranges; a minor bump of `core` reaches dependents on their next
-  install.
-- `@canton-network/*` are tilde-pinned (`~1.4.0`): patch drift only, no
-  automatic minor upgrades.
-- The Daml contracts target LF 2.1. That target is compatible across the
-  Canton 3.4.x and 3.5.x lines, but re-vet the DAR against the
-  participant before any major platform upgrade.
-- A scheme-name or envelope-field change is a breaking change and gets a
-  major bump on `core` plus a coordinated facilitator redeploy, because
-  it moves the `exact` boundary in section 3.
+- Published packages follow semver. Internal dependencies use
+  `workspace:^` (a caret range at publish).
+- `@canton-network/core-tx-visualizer` is tilde-pinned (`~1.4.0`) in
+  `ledger`: patch drift only.
+- The money path binds Splice interfaces by `#package-name`. Re-check
+  only if a bound interface or choice signature changes.
+- A scheme-name or envelope-field change is breaking: a major bump of
+  `core` and a coordinated facilitator redeploy.

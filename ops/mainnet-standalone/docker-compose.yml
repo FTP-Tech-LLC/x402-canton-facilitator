@@ -1,0 +1,209 @@
+# Canton x402 facilitator on a dedicated host (not the validator host).
+#
+# The facilitator reaches the participant's JSON Ledger API and Scan over the
+# network (a private link, never the public internet). Caddy on this host owns
+# 80/443 and gets the TLS certificate. Only Caddy is published; the facilitator
+# and Postgres sit on the internal network.
+#
+# This file has no env_file on purpose: every variable the facilitator reads is
+# listed below, so this file is the full reference. A bare `KEY:` passes the
+# value through from .env when set and leaves it unset otherwise.
+# packages/facilitator/src/config-compose-drift.test.ts keeps this list complete.
+#
+# Guide: docs/deployment.md. Template: .env.example next to this file.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: x402-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-x402}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-x402}
+    volumes:
+      - ${POSTGRES_DATA_DIR:-./postgres-data}:/var/lib/postgresql/data
+    networks:
+      - x402-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-x402}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  facilitator:
+    # A /settle can wait about 57s on the ledger and shutdown drains for up to
+    # 55s. Docker's default 10s stop would kill a payment mid-flight.
+    stop_grace_period: 70s
+    image: ${IMAGE_TAG:?set IMAGE_TAG to the facilitator image, e.g. canton-x402-facilitator:<tag>}
+    container_name: x402-facilitator
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "4022"
+      DATABASE_URL: postgres://${POSTGRES_USER:-x402}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-x402}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+      # Network and participant
+      CANTON_NETWORK: ${CANTON_NETWORK:?missing CANTON_NETWORK}
+      CANTON_PARTICIPANT_URL: ${CANTON_PARTICIPANT_URL:?missing CANTON_PARTICIPANT_URL}
+      CANTON_FACILITATOR_PARTY: ${CANTON_FACILITATOR_PARTY:?missing CANTON_FACILITATOR_PARTY}
+      CANTON_SYNCHRONIZER_ID: ${CANTON_SYNCHRONIZER_ID:?missing CANTON_SYNCHRONIZER_ID}
+      CANTON_USER_ID: ${CANTON_USER_ID:?missing CANTON_USER_ID}
+      CANTON_FACILITATOR_MEMBER_ID:
+
+      # Scan
+      CANTON_SCAN_URL: ${CANTON_SCAN_URL:?missing CANTON_SCAN_URL}
+      CANTON_SCAN_FLAVOR: ${CANTON_SCAN_FLAVOR:-sv}
+      CANTON_SCAN_AUTH: ${CANTON_SCAN_AUTH:-false}
+      CANTON_SCAN_FALLBACK_URLS:
+
+      # Participant auth
+      JWT_ISSUER: ${JWT_ISSUER:-oidc}
+      JWT_SECRET:
+      OIDC_TOKEN_ENDPOINT: ${OIDC_TOKEN_ENDPOINT:?missing OIDC_TOKEN_ENDPOINT}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?missing OIDC_CLIENT_ID}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?missing OIDC_CLIENT_SECRET}
+      OIDC_SCOPE:
+      LEDGER_API_AUDIENCE: ${LEDGER_API_AUDIENCE:?missing LEDGER_API_AUDIENCE}
+
+      # Settlement
+      CANTON_X402_TF_ENABLED: ${CANTON_X402_TF_ENABLED:-false}
+      CANTON_X402_TF_DEFAULT_EXECUTE_BEFORE_S:
+      CANTON_X402_TF_MAX_EXECUTE_BEFORE_S:
+      CANTON_X402_TOPOLOGY_READER_URL:
+      CANTON_X402_TOPOLOGY_READER_TOKEN:
+      CANTON_X402_ACCEPTED_FEE_PAYERS:
+      CANTON_X402_INLINE_MERCHANT_POLICY:
+      CANTON_X402_INLINE_MERCHANT_ALLOWLIST:
+      CANTON_X402_SETTLE_DISPATCH_MARK:
+      # CANTON_X402_ADVERTISE_TF is still parsed but has no effect: /supported
+      # always advertises transfer-factory. Not passed through.
+
+      # CIP-56 registry tokens
+      CANTON_X402_TOKEN_REGISTRIES:
+      CANTON_X402_TOKEN_INSTRUMENTS:
+      CANTON_X402_REGISTRY_TRUSTED_PARTIES:
+
+      # Rate limits and breaker
+      CANTON_X402_TRUST_PROXY: ${CANTON_X402_TRUST_PROXY:-uniquelocal}
+      CANTON_X402_SETTLE_RATE_MAX_PER_PAYER:
+      CANTON_X402_SETTLE_RATE_MAX_PER_IP:
+      CANTON_X402_SETTLE_RATE_MAX_GLOBAL:
+      CANTON_X402_SETTLE_RATE_WINDOW_MS:
+      CANTON_X402_VERIFY_RATE_MAX_PER_IP:
+      CANTON_X402_VERIFY_RATE_WINDOW_MS:
+      CANTON_X402_SETTLE_BREAKER_THRESHOLD:
+      CANTON_X402_SETTLE_BREAKER_COOLDOWN_MS:
+      CANTON_X402_SETTLE_BREAKER_WINDOW_MS:
+      CANTON_X402_SETTLE_BREAKER_FAILURE_RATE:
+      CANTON_X402_SETTLE_BREAKER_MIN_SAMPLES:
+
+      # Agent-wallet relay
+      CANTON_X402_ENABLE_AGENT_WALLET: ${CANTON_X402_ENABLE_AGENT_WALLET:-false}
+      CANTON_X402_AGENT_WALLET_KEY:
+      CANTON_X402_WALLET_SUBMIT_CHOICES:
+      CANTON_X402_WALLET_SUBMIT_CREATE_TEMPLATES:
+      CANTON_X402_WALLET_READ_IDS:
+      CANTON_X402_WALLET_SUBMIT_RATE_MAX:
+      CANTON_X402_WALLET_SUBMIT_RATE_MAX_PER_IP:
+      CANTON_X402_WALLET_ONBOARD_RATE_MAX_GLOBAL:
+      CANTON_X402_WALLET_ONBOARD_DAILY_MAX:
+      CANTON_X402_WALLET_PREPARE_WASTE_MAX:
+      CANTON_X402_WALLET_PREPARE_WASTE_WINDOW_MS:
+      CANTON_X402_ABUSE_STRIKES_TO_BAN:
+      CANTON_X402_ABUSE_STRIKE_WINDOW_MS:
+      CANTON_X402_ABUSE_STRIKE_SPACING_MS:
+      CANTON_X402_ABUSE_BASE_BAN_MS:
+      CANTON_X402_ABUSE_BAN_MULTIPLIER:
+      CANTON_X402_ABUSE_MAX_BAN_MS:
+      CANTON_GRANT_PARTY_RIGHTS:
+
+      # Second participant (party replication)
+      CANTON_SECONDARY_PARTICIPANT_URL:
+      CANTON_SECONDARY_USER_ID:
+      CANTON_SECONDARY_OIDC_TOKEN_ENDPOINT:
+      CANTON_SECONDARY_OIDC_CLIENT_ID:
+      CANTON_SECONDARY_OIDC_CLIENT_SECRET:
+      CANTON_SECONDARY_OIDC_SCOPE:
+      CANTON_SECONDARY_LEDGER_API_AUDIENCE:
+      CANTON_SECONDARY_GRANT_PARTY_RIGHTS:
+      CANTON_X402_ONBOARD_CO_HOST_UID:
+
+      # Faucet and starter grant (sends real CC)
+      CANTON_X402_FAUCET_ENABLED: ${CANTON_X402_FAUCET_ENABLED:-false}
+      CANTON_X402_FAUCET_ON_ONBOARD:
+      CANTON_X402_FAUCET_INTERNAL_SECRET:
+      CANTON_X402_FAUCET_AMOUNT_CC:
+      CANTON_X402_FAUCET_MAX_PER_IP:
+      CANTON_X402_FAUCET_DAILY_BUDGET_CC:
+      CANTON_X402_FAUCET_LIFETIME_CAP_CC:
+      CANTON_X402_FAUCET_WINDOW_MS:
+      CANTON_X402_FAUCET_MAX_GLOBAL_PER_MIN:
+      CANTON_X402_FAUCET_BURST_WINDOW_MS:
+      CANTON_X402_FAUCET_IP_EXEMPT:
+
+      # Operator routes and discovery
+      CANTON_X402_OPERATOR_TOKEN:
+      CANTON_X402_ENABLE_PREAPPROVAL_PROVIDER:
+      CANTON_X402_ENABLE_CLOSE_ROUTE:
+      CANTON_X402_DISCOVERY_RESOURCES:
+
+      # Attribution and app-reward markers
+      CANTON_ATTRIBUTION_SCAN_URLS:
+      CANTON_ATTRIBUTION_SCAN_AUTH:
+      CANTON_ATTRIBUTION_REQUIRED:
+      CANTON_X402_ATTRIBUTION_RETRY_MS:
+      CANTON_EXCLUDED_PARTICIPANTS:
+      CANTON_EXCLUDED_PARTIES:
+      CANTON_X402_MARKER_ENABLED:
+      CANTON_X402_MARKER_FTP_PARTY:
+      CANTON_X402_MARKER_USER_ID:
+      CANTON_X402_MARKER_BENEFICIARY:
+      CANTON_X402_MARKER_WEIGHT_MULTIPLIER:
+      CANTON_X402_MARKER_MAX_WEIGHT_PER_ROUND:
+      CANTON_X402_MARKER_FREE_BYTES_PER_ROUND:
+    networks:
+      - x402-internal
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4022/health >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  caddy:
+    image: caddy:2
+    container_name: x402-caddy
+    restart: unless-stopped
+    depends_on:
+      - facilitator
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      FACILITATOR_DOMAIN: ${FACILITATOR_DOMAIN:?missing FACILITATOR_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - x402-internal
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+networks:
+  x402-internal:
+    driver: bridge
+
+volumes:
+  caddy-data:
+  caddy-config:

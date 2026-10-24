@@ -1,5 +1,61 @@
 # @ftptech/x402-canton-core
 
+## 1.4.0
+
+### Minor Changes
+
+- 068b32d: Tradecraft queued mode: trade through committed allocations and batched orders
+  instead of a pool-address transfer. The wallet's new `tc` command (`setup`,
+  `orders`, `status`, `cancel`, `withdraw`) and the local MCP's `tradecraft_queued_*`
+  tools create a SwapOrderBatcher and one committed token-standard V2 allocation
+  per pool instrument (topped up on later setups), queue exact-input orders with
+  per-order minimums in one transaction, and ask the venue to release funded
+  allocations back to the wallet.
+  Core adds verify-before-sign for the six shapes: the venue is the sole
+  executor, every allocation and holding they create is the agent's, pool
+  metadata, amounts and minimums are pinned, and the withdrawal request (the
+  only create the agent authorizes alone) is pinned to Tradecraft's package.
+  Needs a relay with the queued surface enabled (see the facilitator's
+  `CANTON_X402_WALLET_SUBMIT_CREATE_TEMPLATES` and `CANTON_X402_WALLET_READ_IDS`).
+  Pool-address swaps are unchanged.
+
+## 1.3.1
+
+### Patch Changes
+
+- 0668ea1: CBTC transfers sign again. BitSafe replaced CBTC's reward beneficiary
+  (`cbtc-beneficiary` → `cbtc-beneficiary-2`) in its `InstrumentConfiguration`,
+  and verify-before-sign refused every CBTC transfer as naming an unexpected
+  party. The foreign-party backstop now admits the parties of the pinned
+  registrar's own `InstrumentConfiguration` (the input contract signed by the
+  instrument admin) inside that contract only, so a registrar changing its
+  reward beneficiaries or credential issuers no longer breaks its token. Such a
+  party anywhere else, and every party of an unpinned or other registrar's
+  configuration, is still refused. Canton Coin is unaffected. The wallet drops
+  its hard-coded `cbtc-beneficiary` entry, which the rule replaces.
+
+## 1.3.0
+
+### Minor Changes
+
+- d9cd495: ledger: `CantonClient.queryActiveContractsSlice(filter, limit)` — a bounded ACS read (`?limit=N`) for parties with more contracts than the participant lists in one response; reports `complete` and retries once at the cap the node names.
+
+  core: `assertPreparedAmuletSelfPreapproval` — full verify-before-sign for a merchant's Amulet self-preapproval: root template pinned, consequences and creates whitelisted from MainNet captures, receiver/provider/expiry bound, party backstop of {merchant, DSO}.
+
+## 1.2.1
+
+### Patch Changes
+
+- verify-before-sign admits `EventLog_HoldingsChange` on the DA Registry Utility
+  `Holding` template. After the registry-utility 0.14.4 bundle (holding-v0 0.3.2)
+  every registry-token transfer emits this token-standard accounting event on the
+  registrar's Holding, and the whitelist refused to sign every registry send
+  (token→CC swaps, registry withdrawals, USDCx/CBTC x402 payments) with
+  `unexpected exercise(s) "EventLog_HoldingsChange"`. Inspected on real MainNet
+  prepared bytes: the node is a leaf with no creates, archives or nested
+  exercises, so admitting it cannot move or re-own funds; amount, receiver,
+  instrument, inputs and every create stay pinned exactly as before.
+
 ## 1.2.0
 
 ### Minor Changes

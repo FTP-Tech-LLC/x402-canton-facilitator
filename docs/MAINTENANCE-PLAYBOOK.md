@@ -22,10 +22,11 @@ facilitator, [COMPATIBILITY.md](COMPATIBILITY.md) for the version matrix.
 ## 1. Version upgrade procedure
 
 There are four independently-versioned surfaces: the npm packages, the
-facilitator service image, the Daml DAR, and the Canton participant
-underneath. Upgrade them one at a time and verify between each.
+facilitator service image, the topology reader beside the participant,
+and the Canton participant underneath. Upgrade them one at a time and
+verify between each.
 
-### 1a. npm packages (core, ledger, client, express, next, agent-wallet, mcp)
+### 1a. npm packages (core, ledger)
 
 1. Make the change on a branch. Keep internal dependencies on caret
    ranges (`workspace:^`) so published tarballs carry caret ranges, not
@@ -67,11 +68,11 @@ underneath. Upgrade them one at a time and verify between each.
    docker compose -f packages/facilitator/docker-compose.production.yml up -d
    ```
 4. Verify readiness and one real payment before declaring done:
-   - `curl https://<host>/ready` returns 200.
-   - `curl https://<host>/supported` lists the expected methods.
-   - Run one live settle (a small-amount e2e from `e2e/`) and confirm on
-     Scan that funds moved. A success response is not proof; the ledger
-     is.
+   - `/ready` returns 200 (from the host; the edge hides it).
+   - `curl https://<host>/supported` lists the expected network,
+     instruments and signer.
+   - Run one small live payment and confirm on Scan that funds moved. A
+     success response is not proof; the ledger is.
 5. If `/ready` stays red or the settle fails, roll back immediately:
    revert `IMAGE_TAG` in `.env` and `up` the previous image.
 
@@ -80,21 +81,11 @@ underneath. Upgrade them one at a time and verify between each.
 > scan-bridge entries) live only on the box and are not in the repo.
 > Sync the built artifact, not the ops config.
 
-### 1c. Daml DAR (`x402-direct`)
+The money path uses no custom DAR, so there is no DAR to rebuild or
+vet. A Splice package upgrade needs no rebuild either: Splice interfaces
+are bound by `#package-name`.
 
-1. Rebuild with the pinned SDK:
-   ```bash
-   cd daml/x402-direct && daml build
-   ```
-2. Record the new DAR sha256 and update COMPATIBILITY.md section 2.
-3. Vet the DAR on every participant that hosts the facilitator party or
-   a merchant party. A participant missing it fails with
-   `PACKAGE_NAMES_NOT_FOUND [x402-direct]`.
-4. Because the stack exercises Splice interfaces via `#package-name`
-   references, a Splice package upgrade does not require a DAR rebuild.
-   A change to our own templates does.
-
-### 1d. Canton participant
+### 1c. Canton participant
 
 A participant minor or major upgrade is the highest-risk change. Treat
 it as a platform migration:
@@ -102,9 +93,11 @@ it as a platform migration:
 1. Read the Canton release notes for JSON Ledger API v2 changes.
 2. Run the entire [ledger-API compatibility checklist](#2-ledger-api-compatibility-checklist)
    against the upgraded participant on a test network first.
-3. Re-vet the `x402-direct` DAR on the upgraded participant.
-4. Run the full live e2e (verify + settle + refund-on-expiry) on the
-   test network before touching MainNet.
+3. Confirm the topology reader still answers for a known party.
+4. On the test network, before touching MainNet: one payment through
+   verify and settle, and one payment to a merchant without a
+   preapproval, which must be refused with
+   `invalid_exact_canton_preapproval_missing`.
 
 ---
 
@@ -119,7 +112,8 @@ hours in the wild.
       leading `#` is mandatory. Without it the parser reads the first
       segment as a literal package-id hash and the call fails.
 - [ ] **Body shape is endpoint-dependent.**
-      `submit-and-wait-for-transaction` wants the wrapped shape
+      `submit-and-wait-for-transaction` (markers, legacy provider
+      preapproval) wants the wrapped shape
       `{commands: {commandId, actAs, commands, ...}}`. The flat variant
       returns `400 Missing required field at 'commands.commands'`.
 - [ ] **`submit-and-wait-for-transaction-tree` is gone.** Deprecated in
@@ -135,17 +129,29 @@ hours in the wild.
       allocation/transfer factory). Missing it returns
       `CONTRACT_NOT_FOUND` 404. The `created_event_blob` comes from Scan.
 - [ ] **ACS reads for heavy parties must filter by template or
-      interface**, not wildcard. A wildcard active-contracts read for a
-      party with many holdings blows past the node's
-      `JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER` cap and returns a 413-class
-      error. Use a template filter (for balance) or interface filter (for
-      pending), and use a bounded per-transaction read
-      (`getTransactionById`) where possible.
+      interface**, not wildcard. A party with more contracts than the
+      node lists in one response (200 by default) gets a 413-class
+      error. Ledger 0.5+ reads in bounded slices (`?limit=N`); the relay
+      serves them as `/holdings?slice=1`.
+- [ ] **ACS filters go in `eventFormat`.** Canton 3.6 rejects the
+      top-level `filter` and `verbose` fields with HTTP 400 (3.7 removes
+      them). Needs ledger 0.6.1 or later.
+- [ ] **`transaction-by-id` is disabled from Canton 3.6**
+      (`DEPRECATED_API_DISABLED`; 3.7 removes it). The settle
+      funds-moved check reads `update-by-id`. Needs ledger 0.6.2.
+- [ ] **Scan `holdings/state` is v2 only from Splice 0.9.** v0 and v1
+      answer 404.
+- [ ] **Maximum deduplication duration.** A participant may set it far
+      below Canton's default. A resubmitted command id can then commit
+      twice. The marker worker deduplicates against a ledger offset and
+      never resubmits an unknown outcome; keep custom scripts the same.
+- [ ] **Topology route available.** The topology reader needs Canton
+      3.5.10 (Splice 0.6.14) or later.
 - [ ] **Auth token audience and issuer match** what the upgraded
       participant expects. An OIDC audience change is a silent 401 until
       you re-read the participant config.
-- [ ] **`/ready` is green** after the upgrade: participant, Scan, and
-      Postgres all reachable.
+- [ ] **`/ready` is green** after the upgrade: ledger token, participant
+      and Scan reachable.
 - [ ] **One live settle moves funds on Scan.** The only real proof.
 
 ---
@@ -153,9 +159,9 @@ hours in the wild.
 ## 3. Audit findings remediation log
 
 The security audit is a milestone gate: all Critical and High findings
-must be remediated before milestone acceptance, and the audit report is
-published at `docs/audit-report-v1.md`. Track every finding here through
-to a merged fix.
+must be remediated before milestone acceptance. The audit report will be
+published in this repo when final. Track every finding here through to
+a merged fix.
 
 | ID | Severity | Summary | Status | Fix (PR / commit) | Date closed |
 |---|---|---|---|---|---|
@@ -192,23 +198,29 @@ Process:
    endpoint is down it cannot settle.
 3. Check Scan. A `503` from one SV should fail over to
    `CANTON_SCAN_FALLBACK_URLS`. If all Scan URLs are down, factory
-   resolution fails and settles cannot be built.
-4. Check the Global-Synchronizer traffic budget if the member-id monitor
+   resolution fails and settles cannot be built. A 403 usually means the
+   host is not on the SV allowlist or the URL carries a port.
+4. Check the topology reader. If it is down or its token is wrong,
+   every payment fails with `invalid_exact_canton_signature_invalid`.
+5. Check the Global-Synchronizer traffic budget if the member-id monitor
    is enabled. A depleted budget throttles the facilitator's own
    submissions.
 
 ### `/ready` red
 
-`/ready` fails closed if any of participant, Scan, or Postgres is
-unreachable. The response body names the failing dependency. Fix that
-dependency; the probe recovers on its own.
+`/ready` fails closed if the ledger token cannot be minted or the
+participant or Scan is unreachable. The response names the failing
+check. Fix that dependency; the probe recovers on its own.
 
 ### Payer-side retry storm
 
-The per-payer burn guard and the settle rate limiter bound the damage
-from a client that re-pays in a loop. If one payer is burning the
-budget, add its party to `CANTON_EXCLUDED_PARTIES` and redeploy; the
-client should fix its retry logic.
+The per-payer settle cap (`CANTON_X402_SETTLE_RATE_MAX_PER_PAYER`) and
+the circuit breaker bound the damage from a client that re-pays in a
+loop. To restrict whom the facilitator relays for, set
+`CANTON_X402_INLINE_MERCHANT_POLICY=provider-or-allowlist`. On the relay,
+`CANTON_X402_ABUSE_*` bans repeat offenders by IP. There is no per-payer
+block list. `CANTON_EXCLUDED_PARTIES` only filters the attribution
+report and blocks nothing.
 
 ### Rollback
 

@@ -51,6 +51,10 @@ export function isInlineCarriage(payload: unknown): boolean {
 export interface InlineValidationDeps {
   /** This facilitator's own party — it relays and pays the traffic fee. */
   facilitatorParty: string;
+  /** Other parties this facilitator answers to as `extra.feePayer` (a previous
+   *  facilitator party kept during a switch). Also "us" for the self-payment
+   *  guard. Absent means only `facilitatorParty`. */
+  acceptedFeePayers?: readonly string[];
   /** Clock override for tests; production reads the real clock. */
   nowMs?: number;
   /**
@@ -271,10 +275,14 @@ export async function validateInlineTransferPath(
     return fail("invalid_exact_canton_malformed_payload");
   }
 
+  // Every identity this facilitator answers to as the relayer: its party, plus
+  // a previous party still accepted during a switch.
+  const ourParties = [deps.facilitatorParty, ...(deps.acceptedFeePayers ?? [])];
+
   // Rule 11 — self-payment guard. Checked BEFORE the structural match so that a
   // facilitator-impersonating payload is named for what it is instead of
   // surfacing as some downstream mismatch.
-  if (payer === deps.facilitatorParty) {
+  if (ourParties.includes(payer)) {
     return fail("invalid_exact_canton_self_payment", payer);
   }
 
@@ -292,7 +300,7 @@ export async function validateInlineTransferPath(
   // missing feePayer as "fine" let anyone hand this facilitator a transfer
   // quoted against a different relayer and make it pay the Global Synchronizer
   // fee in real CC. The merchant must name us explicitly.
-  if (extra.feePayer !== deps.facilitatorParty) {
+  if (typeof extra.feePayer !== "string" || !ourParties.includes(extra.feePayer)) {
     return fail("invalid_exact_canton_fee_payer_mismatch", payer);
   }
 
@@ -483,6 +491,9 @@ export async function validateInlineTransferPath(
     // payer signs, instead of taking a signature and refusing afterwards.
     const policy = deps.merchantPolicy ?? "open";
     if (policy !== "open") {
+      // Only the current party. A previous facilitator party stays accepted as
+      // feePayer, but it is the validator operator party, whose preapprovals a
+      // stranger can manufacture (see merchantPolicy) — not a provider proof.
       const byProvider =
         (policy === "provider" || policy === "provider-or-allowlist") &&
         pre.provider !== undefined &&

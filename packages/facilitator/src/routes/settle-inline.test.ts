@@ -315,6 +315,69 @@ describe("/settle inline — an unknown outcome is remembered, not re-relayed", 
   });
 });
 
+/**
+ * TWO PARTICIPANTS: THE SAME BYTES MUST NOT BE RELAYED THROUGH BOTH.
+ *
+ * On one participant a concurrent duplicate is refused as already in flight
+ * and waits for its sibling. On two, it can land on the other one, meet the
+ * inputs the first consumed, come back as contention — "nothing moved, retry"
+ * — and the caller pays again while the first commits. The mark row is the
+ * one thing both requests share, so losing the race to write it has to mean
+ * "someone is relaying this already".
+ */
+describe("/settle inline — a concurrent duplicate waits for its sibling instead of relaying", () => {
+  function racedStore() {
+    const inner = createInMemoryInlineSettleStore();
+    return {
+      ...inner,
+      // The sibling writes its mark between our read and our write, and
+      // settles a moment later.
+      recordDispatched: async (k: string, meta?: Parameters<typeof inner.recordDispatched>[1]) => {
+        await inner.recordDispatched(k, { submissionId: "sibling" });
+        setTimeout(() => void inner.recordSettled(k, "1220-sibling-settled"), 50);
+        return inner.recordDispatched(k, meta);
+      },
+    };
+  }
+
+  it("enforce: answers with the sibling's result and never submits", async () => {
+    const h = harness({ settleDispatchMark: "enforce", inlineSettles: racedStore() });
+    const r = await settle(h.svc);
+    expect(r.success).toBe(true);
+    expect(r.transaction).toBe("1220-sibling-settled");
+    expect(h.executes).toHaveLength(0);
+  });
+
+  it("observe: counted, then relays exactly as today", async () => {
+    const h = harness({ settleDispatchMark: "observe", inlineSettles: racedStore() });
+    const r = await settle(h.svc);
+    expect(r.success).toBe(true);
+    expect(h.executes).toHaveLength(1);
+  });
+
+  it("records the participant the offset was read on, by id, and executes there", async () => {
+    const store = createInMemoryInlineSettleStore();
+    let executedOn: unknown;
+    let markAtDispatch: unknown;
+    const h = harness({
+      settleDispatchMark: "enforce",
+      inlineSettles: store,
+      transferFactory: {
+        preapprovalKind: async () => "receiver",
+        ledgerEndFor: async () => ({ offset: 41, participant: "https://node1" }),
+        execute: async (a: { participant?: string }) => {
+          executedOn = a.participant;
+          markAtDispatch = await store.getRecord(TRUE_HASH_HEX);
+          return { updateId: UPDATE_ID, transferred: true, confirmInconclusive: false };
+        },
+      } as never,
+    });
+    expect((await settle(h.svc)).success).toBe(true);
+    expect(executedOn).toBe("https://node1");
+    expect(markAtDispatch).toMatchObject({ state: "dispatched", beginExclusive: 41, participant: "https://node1" });
+  });
+});
+
 describe("/settle inline — the traffic we burn is accounted for", () => {
   it("records attribution keyed by the settle updateId", async () => {
     const h = harness();
