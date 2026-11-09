@@ -275,7 +275,9 @@ describe("the dispatch marker — Postgres SQL shape", () => {
         throw new Error("db down");
       },
     });
-    expect(await s.recordDispatched("aa")).toBe(true);
+    // Truthy, so the caller dispatches; and distinct, so it knows no mark
+    // guards a retry of this submission.
+    expect(await s.recordDispatched("aa")).toBe("unrecorded");
     expect(await s.getRecord("aa")).toBeNull();
   });
 });

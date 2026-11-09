@@ -85,6 +85,26 @@ export interface SlidingWindowLimiter {
     chargeGlobal?: boolean
   ): boolean;
   /**
+   * Would {@link allowKeys} allow this attempt? The same checks, nothing
+   * recorded. For a budget that must be checked before a cheaper one is
+   * charged and charged after it, with no await in between.
+   */
+  wouldAllow(
+    keys: readonly (string | { key: string; max: number })[],
+    now: number,
+    chargeGlobal?: boolean
+  ): boolean;
+  /**
+   * Takes back one attempt that {@link allowKeys} recorded at `at` with the
+   * same keys: for a budget charged before work that then turned out to do
+   * nothing. An entry already aged out is left alone.
+   */
+  release(
+    keys: readonly (string | { key: string; max: number })[],
+    at: number,
+    chargeGlobal?: boolean
+  ): void;
+  /**
    * Is `key` still under `max` — WITHOUT recording an attempt?
    *
    * Exists for budgets that are spent on an OUTCOME rather than on arrival:
@@ -146,10 +166,11 @@ export function createSlidingWindowLimiter(
     lastSweepAt = now;
   };
 
-  const allowKeys = (
+  const evaluate = (
     keys: readonly (string | { key: string; max: number })[],
     now: number,
-    chargeGlobal = true
+    chargeGlobal: boolean,
+    record: boolean
   ): boolean => {
     // Normalize: a bare string is capped at maxPerPayer; an object carries its
     // own cap (e.g. the IP key on /settle uses the higher per-IP cap).
@@ -184,6 +205,7 @@ export function createSlidingWindowLimiter(
       seen.add(key);
       let arr = perKey.get(key);
       if (!arr) {
+        if (!record) continue; // no bucket yet: room, and nothing to create
         arr = [];
         perKey.set(key, arr);
       }
@@ -191,6 +213,7 @@ export function createSlidingWindowLimiter(
       if (arr.length >= max) return false; // this key is over its own cap
       buckets.push(arr);
     }
+    if (!record) return true;
 
     // Global + every per-key bucket has room — record the hit.
     if (globalInPlay) globalHits.push(now);
@@ -203,11 +226,44 @@ export function createSlidingWindowLimiter(
     return true;
   };
 
+  const allowKeys = (
+    keys: readonly (string | { key: string; max: number })[],
+    now: number,
+    chargeGlobal = true
+  ): boolean => evaluate(keys, now, chargeGlobal, true);
+
+  const dropOne = (arr: number[] | undefined, at: number): void => {
+    if (!arr) return;
+    const i = arr.lastIndexOf(at);
+    if (i >= 0) arr.splice(i, 1);
+  };
+
   return {
     allow(key: string, now: number): boolean {
       return allowKeys([key], now);
     },
     allowKeys,
+    wouldAllow(
+      keys: readonly (string | { key: string; max: number })[],
+      now: number,
+      chargeGlobal = true
+    ): boolean {
+      return evaluate(keys, now, chargeGlobal, false);
+    },
+    release(
+      keys: readonly (string | { key: string; max: number })[],
+      at: number,
+      chargeGlobal = true
+    ): void {
+      if (chargeGlobal && maxGlobal > 0) dropOne(globalHits, at);
+      const seen = new Set<string>();
+      for (const k of keys) {
+        const { key, max } = typeof k === "string" ? { key: k, max: maxPerPayer } : k;
+        if (max <= 0 || seen.has(key)) continue;
+        seen.add(key);
+        dropOne(perKey.get(key), at);
+      }
+    },
     peek(key: string, now: number, max: number): boolean {
       if (max <= 0) return true;
       const arr = perKey.get(key);

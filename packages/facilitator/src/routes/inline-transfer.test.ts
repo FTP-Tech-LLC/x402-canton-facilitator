@@ -7,7 +7,13 @@ import {
   decodePrepared,
   type FacilitatorRequest,
 } from "@ftptech/x402-canton-core";
-import { validateInlineTransferPath, isInlineCarriage, classifyMismatch } from "./inline-transfer.js";
+import {
+  validateInlineTransferPath,
+  isInlineCarriage,
+  classifyMismatch,
+  decodeInlineClaim,
+  claimedInlinePayer,
+} from "./inline-transfer.js";
 
 /* Real MainNet bytes. Every assertion below is against a transaction that
  * actually settled on MainNet, so a check that passes here passes against the
@@ -837,6 +843,200 @@ describe("inline arm — audit round 2: pinning and binding", () => {
   });
 });
 
+describe("inline arm — a one-step delivery that does not match is still preapproval_missing", () => {
+  // The validator now refuses a TransferPreapproval_SendV2 that does not pay the
+  // root's value on the payee's preapproval. Before that check these bytes
+  // passed it and failed deliversViaAmuletPreapproval, so the payer was told
+  // preapproval_missing; its message says "amount", which classifyMismatch read
+  // as amount_mismatch until it learned the delivery wording.
+  it("an inflated SendV2 under an honest root answers preapproval_missing", async () => {
+    const bytes = Buffer.from(RAW);
+    const at = bytes.indexOf("TransferPreapproval_SendV2");
+    bytes.write("9.9900000000", bytes.indexOf("0.0100000000", at), "latin1");
+    const payload = encodeInlinePaymentPayload({
+      preparedTransactionBytes: bytes,
+      preparedTxHash: "1220" + "ab".repeat(32),
+      signatureB64: Buffer.alloc(64, 7).toString("base64"),
+    });
+    const fetchPreapproval = vi.fn(async () => BOUND_PREAPPROVAL);
+    const r = await validateInlineTransferPath(request({}, {}, payload), {
+      ...depsSigOk,
+      fetchPreapproval,
+    });
+    expect(r).toMatchObject({ ok: false, reason: "invalid_exact_canton_preapproval_missing" });
+    // Refused from the bytes, before any Scan lookup.
+    expect(fetchPreapproval).not.toHaveBeenCalled();
+  });
+});
+
+/* A protobuf editor that keeps field order: enough to edit captured bytes. */
+type PbF = { field: number; wire: number; v?: bigint; bytes?: Buffer };
+function pbVarint(buf: Buffer, i: number): [bigint, number] {
+  let x = 0n;
+  let sh = 0n;
+  let b: number;
+  do {
+    b = buf[i++]!;
+    x |= BigInt(b & 0x7f) << sh;
+    sh += 7n;
+  } while (b & 0x80);
+  return [x, i];
+}
+function pbParse(buf: Buffer): PbF[] {
+  const out: PbF[] = [];
+  let i = 0;
+  while (i < buf.length) {
+    let k: bigint;
+    [k, i] = pbVarint(buf, i);
+    const field = Number(k >> 3n);
+    const wire = Number(k & 7n);
+    if (wire === 0) {
+      let v: bigint;
+      [v, i] = pbVarint(buf, i);
+      out.push({ field, wire, v });
+    } else if (wire === 1 || wire === 5) {
+      const n = wire === 1 ? 8 : 4;
+      out.push({ field, wire, bytes: buf.subarray(i, i + n) });
+      i += n;
+    } else {
+      let n: bigint;
+      [n, i] = pbVarint(buf, i);
+      out.push({ field, wire, bytes: buf.subarray(i, i + Number(n)) });
+      i += Number(n);
+    }
+  }
+  return out;
+}
+function pbEncode(fs: PbF[]): Buffer {
+  const venc = (x: bigint): Buffer => {
+    const b: number[] = [];
+    do {
+      let c = Number(x & 0x7fn);
+      x >>= 7n;
+      if (x) c |= 0x80;
+      b.push(c);
+    } while (x);
+    return Buffer.from(b);
+  };
+  return Buffer.concat(
+    fs.map((f) => {
+      const key = venc((BigInt(f.field) << 3n) | BigInt(f.wire));
+      if (f.wire === 0) return Buffer.concat([key, venc(f.v!)]);
+      if (f.wire === 1 || f.wire === 5) return Buffer.concat([key, f.bytes!]);
+      return Buffer.concat([key, venc(BigInt(f.bytes!.length)), f.bytes!]);
+    })
+  );
+}
+const pbLen = (field: number, bytes: Buffer): PbF => ({ field, wire: 2, bytes });
+const pbStr = (field: number, t: string): PbF => pbLen(field, Buffer.from(t, "utf8"));
+const pbText = (f: PbF | undefined): string => Buffer.from(f?.bytes ?? []).toString("utf8");
+
+/** The captured tree with one more create, a child of the root, signed by
+ *  `signatories` (the review's attack on PR #279). */
+function withChildCreate(raw: Buffer, signatories: string[]): Buffer {
+  const top = pbParse(raw);
+  const txI = top.findIndex((f) => f.field === 1);
+  const tx = pbParse(top[txI]!.bytes!);
+  const rootId = pbText(tx.find((f) => f.field === 2));
+  for (const f of tx) {
+    if (f.field !== 3) continue;
+    const node = pbParse(f.bytes!);
+    if (pbText(node.find((x) => x.field === 1)) !== rootId) continue;
+    const v1I = node.findIndex((x) => x.field === 1000);
+    const v1 = pbParse(node[v1I]!.bytes!);
+    const exI = v1.findIndex((x) => x.field === 3);
+    const ex = pbParse(v1[exI]!.bytes!);
+    ex.push(pbStr(12, "9999"));
+    v1[exI] = pbLen(3, pbEncode(ex));
+    node[v1I] = pbLen(1000, pbEncode(v1));
+    f.bytes = pbEncode(node);
+  }
+  const create = pbEncode([
+    pbStr(1, "2.1"),
+    pbStr(2, "00" + "ab".repeat(33)),
+    pbStr(3, "attacker-package"),
+    pbLen(4, pbEncode([pbStr(1, "cd".repeat(32)), pbStr(2, "Attack.Proxy"), pbStr(3, "Proxy")])),
+    pbLen(5, pbEncode([pbLen(14, pbEncode([]))])),
+    ...signatories.map((p) => pbStr(6, p)),
+    ...signatories.map((p) => pbStr(7, p)),
+  ]);
+  tx.push(pbLen(3, pbEncode([pbStr(1, "9999"), pbLen(1000, pbEncode([pbLen(1, create)]))])));
+  top[txI] = pbLen(1, pbEncode(tx));
+  return pbEncode(top);
+}
+
+/** The captured tree with its root contract (Metadata.input_contracts) signed by
+ *  `signatories` instead. */
+function withRootSignedBy(raw: Buffer, signatories: string[]): Buffer {
+  const rootCid = decodePrepared(raw.toString("base64")).exercises.find(
+    (e) => e.choiceId === "TransferFactory_Transfer"
+  )!.contractId!;
+  const top = pbParse(raw);
+  const mdI = top.findIndex((f) => f.field === 2);
+  const md = pbParse(top[mdI]!.bytes!).map((f) => {
+    if (f.field !== 7) return f;
+    const ic = pbParse(f.bytes!);
+    const cI = ic.findIndex((x) => x.field === 1);
+    const c = pbParse(ic[cI]!.bytes!);
+    if (pbText(c.find((x) => x.field === 2)) !== rootCid) return f;
+    const kept = c.filter((x) => x.field !== 6);
+    const at = kept.findIndex((x) => x.field === 7);
+    kept.splice(at < 0 ? kept.length : at, 0, ...signatories.map((p) => pbStr(6, p)));
+    ic[cI] = pbLen(1, pbEncode(kept));
+    return pbLen(7, pbEncode(ic));
+  });
+  top[mdI] = pbLen(2, pbEncode(md));
+  return pbEncode(top);
+}
+
+describe("inline arm — what the payment creates", () => {
+  it("refuses a contract the payer signs without the DSO, before any Scan lookup", async () => {
+    const payload = encodeInlinePaymentPayload({
+      preparedTransactionBytes: withChildCreate(RAW, [META.sender]),
+      preparedTxHash: "1220" + "ab".repeat(32),
+      signatureB64: Buffer.alloc(64, 7).toString("base64"),
+    });
+    const fetchPreapproval = vi.fn(async () => BOUND_PREAPPROVAL);
+    const r = await validateInlineTransferPath(request({}, {}, payload), {
+      ...depsSigOk,
+      fetchPreapproval,
+    });
+    expect(r).toMatchObject({ ok: false, reason: "invalid_exact_canton_malformed_payload" });
+    expect(fetchPreapproval).not.toHaveBeenCalled();
+  });
+
+  it("refuses a Canton Coin root the merchant signed: the factory is the DSO's", async () => {
+    const payload = encodeInlinePaymentPayload({
+      preparedTransactionBytes: withRootSignedBy(RAW, [META.receiver]),
+      preparedTxHash: "1220" + "ab".repeat(32),
+      signatureB64: Buffer.alloc(64, 7).toString("base64"),
+    });
+    const fetchPreapproval = vi.fn(async () => BOUND_PREAPPROVAL);
+    const r = await validateInlineTransferPath(request({}, {}, payload), {
+      ...depsSigOk,
+      fetchPreapproval,
+    });
+    expect(r).toMatchObject({ ok: false, reason: "invalid_exact_canton_malformed_payload" });
+    expect(fetchPreapproval).not.toHaveBeenCalled();
+  });
+
+  it("keeps that pin when the DSO's entry in tokenRegistries is empty", async () => {
+    // An empty registry URL is not a registry: the payment stays Canton Coin,
+    // pinned, as the registry branch also treats it.
+    const payload = encodeInlinePaymentPayload({
+      preparedTransactionBytes: withRootSignedBy(RAW, [META.receiver]),
+      preparedTxHash: "1220" + "ab".repeat(32),
+      signatureB64: Buffer.alloc(64, 7).toString("base64"),
+    });
+    const r = await validateInlineTransferPath(request({}, {}, payload), {
+      ...depsSigOk,
+      fetchPreapproval: vi.fn(async () => BOUND_PREAPPROVAL),
+      tokenRegistries: { [META.instrumentId.admin]: "" },
+    });
+    expect(r).toMatchObject({ ok: false, reason: "invalid_exact_canton_malformed_payload" });
+  });
+});
+
 describe("classifyMismatch — staleness has three spellings, not one", () => {
   /**
    * Driven by the REAL validator, not by strings invented here. The core
@@ -946,3 +1146,27 @@ describe("inline arm — switching the facilitator party", () => {
     expect(byNew.ok).toBe(true);
   });
 });
+
+describe("inline arm: the payload is decoded once", () => {
+  // /verify reads the claimed payer before its budgets and hands that decode to
+  // the validator, so a payload is decoded once per request, not twice.
+  it("a claim decoded up front is the one the validator uses", async () => {
+    const claim = decodeInlineClaim(inlinePayload());
+    expect(claim.ok).toBe(true);
+    // The body's own payload would not decode at all: only the claim can pass.
+    const body = request({}, {}, { preparedTransaction: "not-base64!" });
+    const viaClaim = await validateInlineTransferPath(body, depsSigOk, claim);
+    expect(viaClaim).toMatchObject({ ok: true, payer: META.sender });
+    const decodedHere = await validateInlineTransferPath(body, depsSigOk);
+    expect(decodedHere.ok).toBe(false);
+  });
+
+  it("a claim keeps the validator's own refusals: Rule 2's code, Rule 8's malformed", async () => {
+    const bad = decodeInlineClaim({ preparedTransaction: "x" });
+    expect(bad).toMatchObject({ ok: false, reason: "invalid_exact_canton_missing_proof" });
+    const r = await validateInlineTransferPath(request(), depsSigOk, bad);
+    expect(r).toMatchObject({ ok: false, reason: "invalid_exact_canton_missing_proof" });
+    expect(claimedInlinePayer(inlinePayload())).toBe(META.sender);
+  });
+});
+

@@ -624,3 +624,36 @@ describe("createPenaltyBox — strike spacing (one episode = one strike)", () =>
     expect(p.bannedUntil("ip", 3)).toBe(2 + 60_000);
   });
 });
+
+describe("wouldAllow", () => {
+  it("answers as allowKeys would, records nothing and creates no bucket", () => {
+    const l = createSlidingWindowLimiter({ maxPerPayer: 0, maxGlobal: 2, windowMs: 1000 });
+    const keys = [{ key: "a", max: 1 }];
+    expect(l.wouldAllow(keys, 0)).toBe(true);
+    expect(l._size()).toBe(0);
+    expect(l.allowKeys(keys, 0)).toBe(true);
+    expect(l.wouldAllow(keys, 1)).toBe(false);
+    expect(l.wouldAllow([{ key: "b", max: 1 }], 1)).toBe(true);
+    expect(l.allowKeys([{ key: "b", max: 1 }], 1)).toBe(true);
+    // Global full now: refused for any key, and still nothing recorded.
+    expect(l.wouldAllow([{ key: "c", max: 5 }], 2)).toBe(false);
+    expect(l.wouldAllow([], 2)).toBe(false);
+    expect(l._size()).toBe(2);
+    expect(l.wouldAllow(keys, 1001)).toBe(true);
+  });
+});
+
+describe("release", () => {
+  it("takes back the attempt recorded at that time, globally and per key", () => {
+    const l = createSlidingWindowLimiter({ maxPerPayer: 0, maxGlobal: 2, windowMs: 1000 });
+    const keys = [{ key: "net", max: 1 }];
+    expect(l.allowKeys(keys, 10)).toBe(true);
+    expect(l.allowKeys([{ key: "other", max: 1 }], 20)).toBe(true);
+    expect(l.allowKeys([{ key: "third", max: 1 }], 30)).toBe(false);
+    l.release(keys, 10);
+    expect(l.allowKeys(keys, 40)).toBe(true);
+    // A time with no recorded attempt changes nothing.
+    l.release([{ key: "other", max: 1 }], 99);
+    expect(l.allowKeys([{ key: "other", max: 1 }], 50)).toBe(false);
+  });
+});

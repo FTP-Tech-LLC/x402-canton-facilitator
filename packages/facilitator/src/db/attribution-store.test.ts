@@ -335,3 +335,17 @@ describe("AttributionStore.record — the row must be fetchable the moment it ex
     expect((store as Record<string, unknown>)["getAttempted"]).toBeUndefined();
   });
 });
+
+describe("AttributionStore.recentMerchants", () => {
+  it("lists the merchants of recent settled payments, most recent first", async () => {
+    const exec = makeExecSeq([{ merchant_party: "m2::1220" }, { merchant_party: "m1::1220" }]);
+    const store = createPostgresAttributionStore(exec);
+    expect(await store.recentMerchants!({ withinMs: 7 * 86_400_000, limit: 256 })).toEqual(["m2::1220", "m1::1220"]);
+    const call = (exec.query as ReturnType<typeof vi.fn>).mock.calls[2];
+    expect(call[0]).toContain("settle_status='served'");
+    expect(call[0]).toContain("GROUP BY merchant_party");
+    expect(call[0]).toContain("ORDER BY MAX(settled_at) DESC");
+    expect(call[1]).toEqual([7 * 86_400, 256]);
+  });
+});
+

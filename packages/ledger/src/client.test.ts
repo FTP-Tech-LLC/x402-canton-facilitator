@@ -1879,3 +1879,79 @@ describe("cantonErrorId on a body cut by the 1 KiB cap", () => {
     expect(cantonErrorId(new CantonError("x", "HTTP_ERROR", 409, body.slice(0, 1024)))).toBe("DUPLICATE_COMMAND");
   });
 });
+
+describe("CantonClient.getUpdatesPage", () => {
+  const filter = { filtersByParty: { "agent::1220a": { cumulative: [] } } };
+
+  it("asks for one bounded ledger-effects page and keeps only transactions", async () => {
+    let seen: { url: string; body: Record<string, unknown> } | undefined;
+    const c = makeClient(
+      makeFetch(({ url, init }) => {
+        seen = { url, body: JSON.parse(String(init.body)) };
+        return {
+          body: [
+            { update: { Transaction: { value: { updateId: "u1", offset: 11, recordTime: "t", events: [{ CreatedEvent: { contractId: "c" } }] } } } },
+            { update: { OffsetCheckpoint: { value: { offset: 12 } } } },
+          ],
+        };
+      })
+    );
+    const page = await c.getUpdatesPage({ filter, beginExclusive: 10, endInclusive: 99, limit: 2 });
+    expect(seen!.url).toBe(`${URL}/v2/updates?limit=2`);
+    expect(seen!.body).toMatchObject({
+      beginExclusive: 10,
+      endInclusive: 99,
+      updateFormat: {
+        includeTransactions: {
+          eventFormat: { ...filter, verbose: true },
+          transactionShape: "TRANSACTION_SHAPE_LEDGER_EFFECTS",
+        },
+      },
+    });
+    expect(page.rows).toBe(2);
+    expect(page.lastOffset).toBe(12);
+    expect(page.transactions.map((t) => t.updateId)).toEqual(["u1"]);
+  });
+
+  it("refuses a limit that is not a positive integer", async () => {
+    const c = makeClient(makeFetch(() => ({ body: [] })));
+    await expect(c.getUpdatesPage({ filter, beginExclusive: 0, endInclusive: 1, limit: 0 })).rejects.toThrow(/limit/);
+  });
+
+  it("an empty list is an empty page", async () => {
+    const c = makeClient(makeFetch(() => ({ body: [] })));
+    expect(await c.getUpdatesPage({ filter, beginExclusive: 0, endInclusive: 1, limit: 5 })).toEqual({
+      transactions: [],
+      rows: 0,
+      lastOffset: undefined,
+    });
+  });
+
+  it("throws on a body that is not a list, or on rows without offsets, instead of ending the range", async () => {
+    const notList = makeClient(makeFetch(() => ({ body: { updates: [] } })));
+    await expect(notList.getUpdatesPage({ filter, beginExclusive: 0, endInclusive: 9, limit: 5 })).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+    const noOffsets = makeClient(makeFetch(() => ({ body: [{ update: { Transaction: { value: { updateId: "u1" } } } }] })));
+    await expect(noOffsets.getUpdatesPage({ filter, beginExclusive: 0, endInclusive: 9, limit: 5 })).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+  });
+
+  it("refuses a page with a row it cannot read, even when another row would move the cursor past it", async () => {
+    const checkpoint = { update: { OffsetCheckpoint: { value: { offset: 12 } } } };
+    for (const bad of [
+      { update: { Transaction: { value: { updateId: "u1", offset: "11", events: [] } } } },
+      { update: { Transaction: { value: { offset: 11, events: [] } } } },
+      { update: { Transaction: { value: { updateId: "u1", offset: 11 } } } },
+      { update: { TransactionV2: { value: { updateId: "u1", offset: 11, events: [] } } } },
+      { update: { Transaction: { value: { updateId: "u1", offset: 11, events: [{ ExercisedEventV2: { contractId: "c" } }] } } } },
+      { notAnUpdate: true },
+    ]) {
+      const c = makeClient(makeFetch(() => ({ body: [bad, checkpoint] })));
+      await expect(c.getUpdatesPage({ filter, beginExclusive: 0, endInclusive: 99, limit: 5 })).rejects.toMatchObject({
+        code: "INVALID_RESPONSE",
+      });
+    }
+  });
+});

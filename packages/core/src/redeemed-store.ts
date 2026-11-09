@@ -2,12 +2,15 @@
  * ONE PAYMENT, ONE DELIVERY.
  *
  * The facilitator answers a repeated /settle of the same signed transaction
- * with the recorded success and the ORIGINAL updateId. That is correct for the
- * payer — it is what stops a retry from charging twice — but on its own it is
- * exactly wrong for the merchant, because nothing in the protocol binds a
- * settle to one delivery: the facilitator never sees which resource is being
- * bought (it receives no resource URL), and the merchant's requirements are
- * static per route.
+ * from its record with the ORIGINAL updateId: as the recorded success
+ * (CANTON_X402_SETTLE_ANSWERS=legacy), or as the scheme requires with a refusal
+ * that still carries it (`invalid_exact_canton_payment_already_settled`, which
+ * the middlewares read the same way). That is correct for the payer — it is
+ * what stops a retry from charging twice — but on its own it is exactly wrong
+ * for the merchant, because nothing in the protocol binds a settle to one
+ * delivery: the facilitator never sees which resource is being bought (it
+ * receives no resource URL), and the merchant's requirements are static per
+ * route.
  *
  * So a payer who buys once can replay the identical PAYMENT-SIGNATURE header
  * forever and be served every time. Each replay re-validates (the bytes are

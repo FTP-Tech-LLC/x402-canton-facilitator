@@ -54,10 +54,16 @@ export type SettleResult =
   /** The same state, met while the guard is in `observe`: counted so the
    *  rollout decision is made on a number rather than a guess, while the
    *  response stays what it is today. */
-  | "outcome_unknown_observed";
+  | "outcome_unknown_observed"
+  /** Answered 503: the shared Scan budget shed the Rule 7 lookup of a merchant
+   *  we do not serve yet (scan-budget.ts). Not a rate limit on the caller. */
+  | "scan_busy";
 
-/** The two rate-limited endpoints, labelled on `ratelimit_rejected_total{scope=...}`. */
-export type RateLimitScope = "verify" | "settle";
+/** What a 429 (or a shed) was refused by, labelled on
+ *  `ratelimit_rejected_total{scope=...}`: the two public endpoints, the relay's
+ *  facilitator-wide submission arm and breaker (`relay_submit`), and outbound
+ *  SV Scan reads shed by the shared Scan budget (`scan`). */
+export type RateLimitScope = "verify" | "settle" | "relay_submit" | "scan";
 
 /** Outcomes of a v1 TransferCommand_Send relative to the ~8KB / ~$0.50 of GS
  *  traffic each Send costs. Two are burns AVOIDED (a doomed Send the cost-gate
@@ -88,6 +94,17 @@ export type SendOutcome =
  * is our outage, and on the wire they are the same refusal.
  */
 export type InlineKeyLookupOutcome = "ok" | "unavailable" | "no_key";
+
+/**
+ * Why the payer-proof hash recompute failed, labelled on
+ * `inline_hash_recompute_failed_total{kind=...}`. `graph`: the bytes carry a
+ * node graph the hasher refuses (a cycle, a shared child, over a limit), so
+ * someone sent bad bytes. `budget`: the bytes take more hashing steps than a
+ * payment needs; a real payment here means the budget is too tight. `error`:
+ * anything else, meaning our hasher could not encode the input. All refuse the
+ * payment as `signature_invalid`.
+ */
+export type InlineHashRecomputeFailure = "graph" | "budget" | "error";
 
 /**
  * Which side a relay-route failure is attributed to, labelled on
@@ -124,11 +141,18 @@ export interface FacilitatorMetrics {
   sendOutcomeTotal: CounterT<"outcome">;
   /** See {@link FacilitatorMetrics.recordInlineKeyLookup}. */
   inlineKeyLookupTotal: CounterT<"outcome">;
+  /** inline_hash_recompute_failed_total{kind}. See {@link InlineHashRecomputeFailure}. */
+  inlineHashRecomputeFailedTotal: CounterT<"kind">;
   /** relay_error_total{route,kind} — failures of the wallet-relay money-path
    *  routes (pay/prepare, preapproval self/registry prepare+commit), which are
    *  NOT covered by settle_total. `kind=server` is our outage (alert on it);
    *  `kind=client` is a caller-attributed refusal. See {@link RelayErrorKind}. */
   relayErrorTotal: CounterT<"route" | "kind">;
+  /** wallet_read_proof_total{result,reason}: the signed-read check on the relay's
+   *  per-party GETs. result: absent | valid | invalid | expired | wrong_host |
+   *  unverifiable; reason, for unverifiable only: budget | breaker | backoff |
+   *  error (none otherwise). Not counted in mode off or for trusted keys. */
+  walletReadProofTotal: CounterT<"result" | "reason">;
   /** Convenience: record one settle outcome (increments settle_total{result}). */
   recordSettle(result: SettleResult): void;
   /** Convenience: record a 429 rejection for `scope`. */
@@ -146,9 +170,21 @@ export interface FacilitatorMetrics {
    *  climbing means OUR dependency is down; `no_key` climbing means payers are
    *  arriving without a published protocol signing key. */
   recordInlineKeyLookup(outcome: InlineKeyLookupOutcome): void;
+  /** Convenience: record one failed payer-proof hash recompute. */
+  recordInlineHashRecomputeFailed(kind: InlineHashRecomputeFailure): void;
   /** Convenience: record one wallet-relay route failure (increments
    *  relay_error_total{route,kind}). */
   recordRelayError(route: string, kind: RelayErrorKind): void;
+  /** scan_cooldown_total{host}: a Scan host answered 429 and the shared Scan
+   *  budget started holding best-effort reads to it back (scan-budget.ts).
+   *  Counted when a cooldown STARTS, not each time a 429 extends it. */
+  scanCooldownTotal: CounterT<"host">;
+  recordScanCooldown(host: string): void;
+  /** Convenience: record one relay-read proof check. */
+  recordWalletReadProof(
+    result: "absent" | "valid" | "invalid" | "expired" | "wrong_host" | "unverifiable",
+    reason?: "budget" | "breaker" | "backoff" | "error"
+  ): void;
 }
 
 /**
@@ -203,6 +239,13 @@ export function createMetrics(opts?: {
     registers: [registry],
   });
 
+  const inlineHashRecomputeFailedTotal = new Counter({
+    name: "x402_facilitator_inline_hash_recompute_failed_total",
+    help: "payer-proof hash recomputes that threw, by kind: graph (the bytes carry a node graph the hasher refuses), budget (more hashing steps than a payment needs), error (our hasher could not encode the input); all refuse as signature_invalid",
+    labelNames: ["kind"] as const,
+    registers: [registry],
+  });
+
   const sendOutcomeTotal = new Counter({
     name: "x402_facilitator_send_outcome_total",
     help: "v1 Send GS-traffic outcomes by outcome: nonce cost-gate burns avoided (skipped_nonce_consumed/retry_aborted_nonce) and committed-but-zero-funds burns incurred (committed_zero_funds_burn)",
@@ -217,15 +260,32 @@ export function createMetrics(opts?: {
     registers: [registry],
   });
 
+  const scanCooldownTotal = new Counter({
+    name: "x402_facilitator_scan_cooldown_total",
+    help: "Times a Scan host answered 429 and best-effort Scan reads to it were held back for the cooldown, by host",
+    labelNames: ["host"] as const,
+    registers: [registry],
+  });
+
+  const walletReadProofTotal = new Counter({
+    name: "x402_facilitator_wallet_read_proof_total",
+    help: "Relay per-party reads by proof result (absent, valid, invalid, expired, wrong_host, unverifiable) and, for unverifiable, reason (budget, breaker, backoff, error); trusted-key requests are exempt and not counted",
+    labelNames: ["result", "reason"] as const,
+    registers: [registry],
+  });
+
   return {
     registry,
     settleTotal,
+    scanCooldownTotal,
     breakerOpenTotal,
     rateLimitRejectedTotal,
     settleDuration,
     sendOutcomeTotal,
     inlineKeyLookupTotal,
+    inlineHashRecomputeFailedTotal,
     relayErrorTotal,
+    walletReadProofTotal,
     recordSettle(result: SettleResult): void {
       settleTotal.inc({ result });
     },
@@ -238,8 +298,19 @@ export function createMetrics(opts?: {
     recordInlineKeyLookup(outcome: InlineKeyLookupOutcome): void {
       inlineKeyLookupTotal.inc({ outcome });
     },
+    recordInlineHashRecomputeFailed(kind: InlineHashRecomputeFailure): void {
+      inlineHashRecomputeFailedTotal.inc({ kind });
+    },
     recordRelayError(route: string, kind: RelayErrorKind): void {
       relayErrorTotal.inc({ route, kind });
+    },
+    recordScanCooldown(host: string): void {
+      scanCooldownTotal.inc({ host });
+    },
+    recordWalletReadProof(result, reason): void {
+      // reason is set only for unverifiable: budget (our lookup budget), breaker
+      // (lookups paused after the reader failed) or error (the lookup failed).
+      walletReadProofTotal.inc({ result, reason: reason ?? "none" });
     },
   };
 }

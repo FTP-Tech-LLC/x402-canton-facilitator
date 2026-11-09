@@ -1,5 +1,68 @@
 # @ftptech/x402-canton-core
 
+## 1.9.1
+
+### Patch Changes
+
+- 32ec950: Registry transfers: a pending TransferOffer is found by its template. A transfer that did not opt into the offer shape refuses any; one that did (a swap to a pool without a preapproval) admits one, and only if it carries the root transfer's sender, receiver, amount, instrument, deadline and meta.
+
+## 1.9.0
+
+### Minor Changes
+
+- 7f6f15b: `PreparedTransferExpectation` takes `meta`, the exact `transfer.meta.values` map, and `executeBeforeMaxMs`, the latest acceptable `transfer.executeBefore`. A caller that built the transfer pins both: the agent wallet's swap carries its slippage floor or buy token in meta.
+
+### Patch Changes
+
+- db1d351: The express and next middlewares understand the facilitator's scheme answers. A repeat of a settled payment, refused with its `updateId`, is served through the redeemed store: once, or again after a failed delivery gave the payment back. `settlement_pending`, as a 503 with its body or a 200, is retried with the same payment for about 7 s, then answered 502 "do NOT pay again", never 402. The client reads the reason from PAYMENT-RESPONSE on a 402, where a server on the official x402 SDK puts it, and stops without paying again on `settlement_pending`. A failed SettleResponse in core carries `transaction`, `network` and `payer`.
+- fb41063: `assertPreparedTransferMatches` admits an `Archive` only of an input contract the instrument admin signs, or of a contract the same transaction created earlier. A root on a relay's own template runs with the sender's authority and could otherwise archive a contract the sender signs alone, such as its own registry TransferPreapproval. Every Archive on the MainNet transfer captures is an admin-signed input; a transient created and archived in one transaction still passes. `DecodedNode.create` now carries the created `contractId`.
+- 672bf45: `assertPreparedTransferMatches` also checks who signs what a transfer creates. A create whose signatories include the sender must have the instrument admin among them too: the DSO for Canton Coin, the registrar for a registry token. A root on a relay's own template runs with the sender's authority and could otherwise create a contract the sender signs, with a choice someone else controls. When the pinned admin is the network's DSO, given as the new `dsoParty`, the transfer is Canton Coin and its root contract must also be signed by exactly that DSO, as the DSO's ExternalPartyAmuletRules is. The instrument id does not decide this, since a registry may name its token "Amulet". Measured on every MainNet transfer capture; honest transfers pass as before.
+- cddefd2: `assertPreparedTransferMatches` checks what a one-step delivery pays against the root transfer. A tree that exercises a TransferPreapproval send must carry exactly one `TransferPreapproval_SendV2`, on the receiver's preapproval, for the transfer amount; a legacy `TransferPreapproval_Send` is refused. A `TransferRule_DirectTransfer` must move the root's sender, receiver, amount and instrument. Before, only the root's argument was checked, so a root on a relay's own template could deliver another amount. `templateQualifiedName` also takes a list of templates. Measured on the MainNet captures; honest transfers pass as before.
+
+## 1.8.0
+
+### Minor Changes
+
+- `KNOWN_TRADECRAFT_PACKAGE_IDS` adds Tradecraft 1.3.17 (`cc7b9c85…`, from the
+  official DAR), newest first, so a withdrawal request in the venue's current
+  package passes verify-before-sign. `SupportedResponse` kinds may carry
+  `feePayer`, which the official `@x402/canton` server reads.
+
+## 1.7.0
+
+### Minor Changes
+
+- ebc4e5f: `assertPreparedAcceptMatches` holds a claim to the instruction's issuer, not
+  only to template names (a relay that runs the agent's participant could vet a
+  look-alike package reusing them). A registry claim: the accepted offer must be
+  an input contract signed by the registrar whose signed transfer pays the agent,
+  and every created Holding must be signed by the registrar and owned by the
+  agent (the owner field, not any mention). A Canton Coin claim, when the new
+  `dsoParty` is given: the accepted AmuletTransferInstruction must be signed by
+  the DSO and pay the agent, and the agent must get a DSO-signed Amulet. Measured
+  on the real MainNet accepts (USDCx offer, faucet CC instruction).
+
+## 1.6.0
+
+### Minor Changes
+
+- dd08e38: `assertPreparedWithdrawMatches`: verify-before-sign for a wallet withdrawing its
+  own registry offer (`TransferInstruction_Withdraw` on the registrar's
+  `TransferOffer`), for taking back an offer the receiver never took. The root
+  is pinned to the offer the wallet asked about, and that offer must be an input
+  contract signed by the registrar whose signed transfer names the agent as
+  sender, the expected registrar as admin, and an `executeBefore` already past
+  (`onlyIfExpiredAt`). Every create must be a registry `Holding` signed by the
+  registrar and owned by the agent, naming no party outside the registrar and
+  the trusted registry parties, and at least one must come back. Measured on two
+  live MainNet offers a swap venue left unaccepted (eXAG, cETH).
+
+## 1.5.0
+
+### Minor Changes
+
+- 580bff2: Add `deliversViaAmuletPreapproval`, which proves from the signed bytes that an Amulet transfer delivers one-step through the receiver's TransferPreapproval.
+
 ## 1.4.0
 
 ### Minor Changes

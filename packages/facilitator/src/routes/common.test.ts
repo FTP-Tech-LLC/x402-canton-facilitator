@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { runValidation, clientIp, type ValidationServices } from "./common.js";
+import { runValidation, clientIp, ipBucket, type ValidationServices } from "./common.js";
 import type { FastifyRequest } from "fastify";
 import type {
   FacilitatorRequest,
@@ -101,6 +101,27 @@ describe("clientIp (security: req.ip is the sole, non-forgeable source)", () => 
     // Even with an XFF header present, an empty req.ip must NOT fall through to
     // the forgeable header.
     expect(clientIp(mk("", "6.6.6.6"))).toBe("unknown");
+  });
+});
+
+describe("ipBucket: a day-long cap counts networks, not addresses", () => {
+  it("keeps an IPv4 address, plain or IPv4-mapped", () => {
+    expect(ipBucket("203.0.113.7")).toBe("203.0.113.7");
+    expect(ipBucket("::ffff:203.0.113.7")).toBe("203.0.113.7");
+  });
+
+  it("puts every address of one IPv6 /64 in the same bucket", () => {
+    const b = ipBucket("2001:db8:1:2:3:4:5:6");
+    expect(b).toBe("2001:db8:1:2::/64");
+    expect(ipBucket("2001:db8:1:2::9")).toBe(b);
+    expect(ipBucket("2001:0DB8:0001:0002::")).toBe(b);
+    expect(ipBucket("2001:db8:1:3::1")).not.toBe(b);
+  });
+
+  it("expands :: and drops a zone id", () => {
+    expect(ipBucket("2001:db8::1")).toBe("2001:db8:0:0::/64");
+    expect(ipBucket("fe80::1%eth0")).toBe("fe80:0:0:0::/64");
+    expect(ipBucket("::1")).toBe("0:0:0:0::/64");
   });
 });
 

@@ -23,6 +23,11 @@ describe("cantonErrSerializer", () => {
     );
   });
 
+  it("leaves a message passed as a string alone", () => {
+    const out = cantonErrSerializer("POST /x returned HTTP 400" as never);
+    expect(out).toBe("POST /x returned HTTP 400");
+  });
+
   it("omits the extra fields for a plain Error (serializes as before)", () => {
     const err = new Error("boom");
     const out = cantonErrSerializer(err);

@@ -1,0 +1,29 @@
+{
+  "name": "@ftptech/x402-canton-topology-reader",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Narrow, read-only boundary in front of the Canton participant admin API: resolves an external party's protocol signing keys so the facilitator can verify an inline payment signature without holding node-admin access.",
+  "license": "Apache-2.0",
+  "author": "FTP team",
+  "type": "module",
+  "main": "./dist/server.js",
+  "exports": {
+    ".": "./dist/server.js"
+  },
+  "bin": {
+    "canton-x402-topology-reader": "./dist/cli.js"
+  },
+  "files": ["dist", "proto", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "lint": "eslint src --max-warnings 0"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.5",
+    "@grpc/proto-loader": "^0.7.13",
+    "fastify": "^5.1.0"
+  }
+}

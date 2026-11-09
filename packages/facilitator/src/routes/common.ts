@@ -13,9 +13,11 @@ import type {
 } from "@ftptech/x402-canton-core";
 import type { ConsumedPaymentStore } from "../db/consumed-store.js";
 import type { FastifyRequest } from "fastify";
+import { timingSafeEqual } from "node:crypto";
 import {
   isInlineCarriage,
   validateInlineTransferPath,
+  type InlineClaim,
   type InlineValidationDeps,
 } from "./inline-transfer.js";
 
@@ -39,6 +41,39 @@ import {
  */
 export function clientIp(req: FastifyRequest): string {
   return req.ip || "unknown";
+}
+
+/**
+ * The network a caller sits in, for caps counted over a day: an IPv4 address
+ * as is, an IPv6 address as its /64, which one host gets whole and can walk
+ * through address by address.
+ */
+export function ipBucket(ip: string): string {
+  const bare = ip.replace(/%.*$/, "").toLowerCase();
+  const v4 = /^(?:::ffff:)?(\d{1,3}(?:\.\d{1,3}){3})$/.exec(bare);
+  if (v4) return v4[1] as string;
+  if (!bare.includes(":")) return bare;
+  const [head = "", tail] = bare.split("::");
+  const front = head ? head.split(":") : [];
+  const back = tail ? tail.split(":") : [];
+  const groups =
+    tail === undefined ? front : [...front, ...Array(Math.max(0, 8 - front.length - back.length)).fill("0"), ...back];
+  return `${groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, "")).join(":")}::/64`;
+}
+
+/** Constant-time string equality (length-checked first, then timingSafeEqual on
+ *  equal-length buffers). Mirrors the attribution/registry token checks. */
+export function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  return ab.length === bb.length && timingSafeEqual(ab, bb);
+}
+
+/** X-Agent-Key is one of the relay's trusted `keys`. A key, not an IP: users of
+ *  the hosted MCP can make it send any request from its IP, never with its key. */
+export function hasTrustedKey(req: FastifyRequest, keys: readonly string[] | undefined): boolean {
+  const presented = req.headers["x-agent-key"];
+  return typeof presented === "string" && (keys ?? []).some((k) => timingSafeEqualStr(presented, k));
 }
 
 export interface ValidationServices {
@@ -84,6 +119,11 @@ export interface ValidationServices {
    *  Used to reject cross-network payment claims (e.g. mainnet claim
    *  submitted to a devnet facilitator). */
   network: CantonNetwork;
+  /** Told the merchant of every SETTLED payment (/settle, funds moved): from
+   *  then on its Rule 7 lookups are the payment path in the shared Scan budget
+   *  (scan-budget.ts). Not on a valid /verify: anyone with a wallet can produce
+   *  one for any merchant that has a preapproval. Absent: nothing is told. */
+  noteServedMerchant?: ((party: string) => void) | undefined;
 }
 
 /**
@@ -125,7 +165,10 @@ export type ValidationOutcome =
 export async function runValidation(
   body: FacilitatorRequest,
   svc: ValidationServices,
-  nowMs: number
+  nowMs: number,
+  /** The inline payload of THIS body, already decoded by the caller (/verify
+   *  reads the claimed payer before its budgets), so it is not decoded twice. */
+  opts: { inlineClaim?: InlineClaim | undefined } = {}
 ): Promise<ValidationOutcome> {
   const { paymentPayload, paymentRequirements } = body;
   const payload = paymentPayload.payload;
@@ -186,7 +229,7 @@ export async function runValidation(
         payer,
       };
     }
-    outcome = await validateTransferFactoryPath(body, svc, nowMs);
+    outcome = await validateTransferFactoryPath(body, svc, nowMs, opts.inlineClaim);
   }
 
   if (outcome) {
@@ -223,7 +266,8 @@ export async function runValidation(
 async function validateTransferFactoryPath(
   body: FacilitatorRequest,
   svc: ValidationServices,
-  nowMs: number
+  nowMs: number,
+  inlineClaim?: InlineClaim
 ): Promise<ValidationOutcome> {
   const { paymentPayload, paymentRequirements } = body;
 
@@ -272,7 +316,7 @@ async function validateTransferFactoryPath(
       ...(svc.inline?.acceptedFeePayers?.length
         ? { acceptedFeePayers: svc.inline.acceptedFeePayers }
         : {}),
-    });
+    }, inlineClaim);
     if (!r.ok) {
       return {
         ok: false,

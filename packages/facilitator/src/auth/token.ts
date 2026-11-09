@@ -74,6 +74,8 @@ export interface OidcTokenProviderArgs {
   scope?: string;
   /** Refresh this many ms before expiry. Defaults to 60s. */
   refreshSkewMs?: number;
+  /** Give up on one token request after this many ms. Defaults to 10s. */
+  timeoutMs?: number;
   /** Override fetch (tests). */
   fetch?: typeof globalThis.fetch;
   /** Override the clock (tests). */
@@ -100,6 +102,12 @@ export function createOidcTokenProvider(
   const fetchFn = args.fetch ?? globalThis.fetch;
   const now = args.now ?? Date.now;
   const skew = args.refreshSkewMs ?? DEFAULT_REFRESH_SKEW_MS;
+  const timeoutMs = args.timeoutMs ?? 10_000;
+  // While a refresh runs, the cached token is answered only with at least
+  // this much life left (15 s by default), so a request does not carry a token
+  // that expires on its way to the participant. The one exception is a refresh
+  // that failed: then a still-valid cached token beats no token at all.
+  const minLeft = Math.floor(skew / 4);
 
   let cached: { token: string; expiresAt: number } | null = null;
   let inflight: Promise<string> | null = null;
@@ -112,21 +120,34 @@ export function createOidcTokenProvider(
       audience: args.audience,
       ...(args.scope ? { scope: args.scope } : {}),
     });
-    const res = await fetchFn(args.tokenEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body.toString(),
-    });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(
-        `OIDC token endpoint ${args.tokenEndpoint} returned ${res.status}: ${txt.slice(0, 400)}`
-      );
+    // BOUNDED. An IdP that accepts the connection and never answers held this
+    // request until undici's default, about 300 s, and every ledger call waited
+    // on it.
+    let json: { access_token?: string; expires_in?: number };
+    try {
+      const res = await fetchFn(args.tokenEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString(),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(
+          `OIDC token endpoint ${args.tokenEndpoint} returned ${res.status}: ${txt.slice(0, 400)}`
+        );
+      }
+      json = (await res.json()) as typeof json;
+    } catch (err) {
+      // Named, so the ledger call that fails on it does not read as the
+      // participant timing out.
+      if ((err as { name?: string })?.name === "TimeoutError") {
+        throw new Error(`OIDC token endpoint ${args.tokenEndpoint} did not answer within ${timeoutMs} ms`, {
+          cause: err,
+        });
+      }
+      throw err;
     }
-    const json = (await res.json()) as {
-      access_token?: string;
-      expires_in?: number;
-    };
     if (!json.access_token) {
       throw new Error(
         `OIDC token response missing access_token: ${JSON.stringify(json).slice(0, 200)}`
@@ -149,21 +170,25 @@ export function createOidcTokenProvider(
       inflight = fetchToken().finally(() => {
         inflight = null;
       });
+      // A refresh that fails is seen by whoever awaits it, or by the next
+      // call, never as an unhandled rejection.
+      inflight.catch(() => {});
     }
 
+    // STILL VALID, SO ANSWER NOW. Within the skew window the refresh only
+    // starts early; waiting on it made every ledger call (verify reads, the
+    // settle execute, completions, markers) as slow as the IdP while the
+    // cached token was still good, and a hung IdP held them all. The refresh
+    // finishes in the background, and a failed one is retried by the next
+    // call in the window. Near expiry, or with no token on a cold start, the
+    // call waits for the IdP, at most timeoutMs; if that refresh fails while
+    // the cached token still has life, the cached token is answered.
+    if (cached && cached.expiresAt - now() > minLeft) return cached.token;
+    const refresh = inflight;
     try {
-      return await inflight;
+      return await refresh;
     } catch (err) {
-      // Serve-stale-on-error: the refresh failed, but if we still hold a
-      // token that hasn't ACTUALLY expired we were only refreshing early
-      // (within the skew window) — a transient IdP blip must not reject
-      // otherwise-valid payments. Return the still-valid cached token and
-      // let the next call retry the refresh. Only propagate the error
-      // once the cached token is truly expired (or never existed, e.g.
-      // cold start), where there is no safe token to fall back on.
-      if (cached && cached.expiresAt - now() > 0) {
-        return cached.token;
-      }
+      if (cached && cached.expiresAt - now() > 0) return cached.token;
       throw err;
     }
   };

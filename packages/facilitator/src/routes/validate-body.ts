@@ -62,22 +62,33 @@ export function validateFacilitatorRequestShape(
     return { ok: false, error: "paymentPayload must be an object" };
   }
   const pp = raw.paymentPayload;
+  // The official x402 v2 client (@x402/core) sends scheme and network only
+  // inside `accepted`, the requirements it chose, and may omit `resource`. Our
+  // own clients send them at the top level. Accept either shape.
+  const accepted = isObject(pp.accepted) ? pp.accepted : undefined;
+  const scheme = pp.scheme ?? accepted?.scheme;
+  const network = pp.network ?? accepted?.network;
   // x402-ENVELOPE: the scheme NAME is "exact" (Canton is a network of the exact
   // scheme). It is the only accepted scheme.
-  if (pp.scheme !== "exact") {
+  if (scheme !== "exact") {
     return {
       ok: false,
       error: 'paymentPayload.scheme must be "exact"',
     };
   }
-  if (typeof pp.network !== "string" || !pp.network.startsWith("canton:")) {
+  if (typeof network !== "string" || !network.startsWith("canton:")) {
     return {
       ok: false,
       error: "paymentPayload.network must start with 'canton:'",
     };
   }
-  if (!isObject(pp.resource) || typeof pp.resource.url !== "string") {
-    return { ok: false, error: "paymentPayload.resource.url required" };
+  // Optional (nullable in the official schema), but well-formed when present.
+  if (
+    pp.resource !== undefined &&
+    pp.resource !== null &&
+    (!isObject(pp.resource) || typeof pp.resource.url !== "string")
+  ) {
+    return { ok: false, error: "paymentPayload.resource.url must be a string" };
   }
   if (!isObject(pp.payload)) {
     return { ok: false, error: "paymentPayload.payload must be an object" };

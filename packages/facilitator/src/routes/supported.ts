@@ -34,6 +34,10 @@ export async function registerSupportedRoute(
           extra: {
             transferMethods,
             synchronizerId: config.synchronizerId,
+            // The official @x402/canton server copies extra.feePayer from here
+            // into its 402s, and verify refuses a requirement without it. Same
+            // party as `signers` below.
+            feePayer: config.facilitatorParty,
             // WHAT THIS FACILITATOR CAN ACTUALLY SETTLE, said out loud.
             //
             // Both of these were previously discoverable only by reading our

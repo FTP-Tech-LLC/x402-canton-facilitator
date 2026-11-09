@@ -160,7 +160,14 @@ export type SettleResponse =
   | {
       success: false;
       errorReason: CantonErrorCode;
-      transaction: "";
+      /** "" on a refusal; the settle updateId on
+       *  `invalid_exact_canton_payment_already_settled`; the prepared
+       *  transaction's hash (lower-case hex) on `settlement_pending`. */
+      transaction: string;
+      /** Always sent by the facilitator since 2026-11; absent from older ones. */
+      network?: CantonNetwork;
+      /** The payer, when the bytes name one. */
+      payer?: string;
     };
 
 /** /supported response. */
@@ -175,6 +182,9 @@ export type SupportedResponse = {
        *  facilitator settles on. Advertised here so a 402 `extra` MAY omit
        *  `synchronizerId` and the client sources it from /supported. */
       synchronizerId?: string;
+      /** The party that relays the transfer and pays its traffic, for
+       *  `extra.feePayer`. The official @x402/canton server reads it here. */
+      feePayer?: string;
       /** Payload forms this facilitator's /settle accepts. "inline" carries the
        *  payer-signed transaction itself, so any facilitator can relay it — the
        *  only carriage the stack speaks. Optional and additive. */
@@ -301,6 +311,10 @@ export type CantonErrorCode =
   // The payment (on-ledger updateId / paymentId) was already settled —
   // single-use replay protection for the CIP-56 completed path (audit M2).
   | "invalid_exact_canton_payment_already_settled"
+  // Non-terminal: the transfer was relayed and its outcome is not known yet.
+  // `transaction` carries the prepared transaction's hash. A client must not
+  // pay again; a server retries settle with the same payment.
+  | "settlement_pending"
   // The facilitator-relayed transfer-factory ExecuteSubmission committed but did
   // not move funds to the merchant (a committed-zero-funds execute), or the
   // relay/execute itself failed. Default-bucketed by classifySettleFailure (→

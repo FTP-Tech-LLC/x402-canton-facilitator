@@ -128,3 +128,31 @@ describe("facilitator inline arm — registry token backstop wiring (real USDCx 
     expect(bad.reason).toBe("invalid_exact_canton_amount_mismatch");
   });
 });
+
+describe("facilitator inline arm: Amulet Rule 7 needs the one-step delivery in the bytes", () => {
+  // Real bytes that pass every structural check but carry no
+  // TransferPreapproval_SendV2, judged by the Amulet arm (no registry entry for
+  // this admin) while Scan reports a live, bound preapproval. That is the
+  // two-step shape: the merchant holds a preapproval the transfer does not use.
+  it("refuses with preapproval_missing even though Scan says preapproved", async () => {
+    const fetchPreapproval = vi.fn(async () => ({
+      receiver: RECEIVER,
+      dso: USDCX_ADMIN,
+      provider: RECEIVER,
+      expiresAt: new Date(NOW_MS + 365 * 864e5).toISOString(),
+    }));
+    const r = await validateInlineTransferPath(request(), {
+      facilitatorParty: FACILITATOR,
+      nowMs: NOW_MS,
+      verifySignature: async () => ({ verified: true }),
+      registryTrustedParties: TRUSTED,
+      fetchPreapproval,
+    });
+    expect(r).toMatchObject({
+      ok: false,
+      reason: "invalid_exact_canton_preapproval_missing",
+    });
+    // Refused from the bytes, before any Scan lookup.
+    expect(fetchPreapproval).not.toHaveBeenCalled();
+  });
+});

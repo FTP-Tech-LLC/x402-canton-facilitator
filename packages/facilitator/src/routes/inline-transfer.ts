@@ -26,17 +26,116 @@ import {
   decodePrepared,
   assertPreparedTransferMatches,
   extractTransfer,
+  deliversViaAmuletPreapproval,
   PreparedTransferMismatchError,
   wireAmountToLedgerDecimal,
   type CantonErrorCode,
 } from "@ftptech/x402-canton-core";
-import type { FacilitatorRequest } from "@ftptech/x402-canton-core";
+import type { DecodedInlinePayload, FacilitatorRequest } from "@ftptech/x402-canton-core";
+import { recomputeHash } from "@ftptech/x402-canton-ledger";
+import { canonicalTxHashHex } from "../canton/payer-proof.js";
+import { ScanBudgetRefusedError } from "../scan-budget.js";
 
 /** How much future an `executeBefore` must have left to be worth relaying.
  *  Settle is not instantaneous — preapproval read, submit, funds-moved confirm
  *  — so a transfer expiring inside this window would be refused by the ledger
  *  after we had already spent the traffic. */
 const EXECUTE_BEFORE_MARGIN_MS = 5_000;
+
+/**
+ * The record key a repeat of this payload would have, from the client's claim:
+ * cheap, and only a lookup key. Null when the payload carries no usable claim.
+ */
+export function claimedRepeatKey(body: FacilitatorRequest): string | null {
+  try {
+    return canonicalTxHashHex(decodeInlinePaymentPayload(body.paymentPayload.payload).claimedPreparedTxHash);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Canton Coin as the inline arm judges it: an Amulet whose admin is not a
+ * configured token registry. Its admin is then the DSO the root contract is
+ * pinned to (core `dsoParty`). One test for every caller, falsy like the
+ * registry branch, so an empty registry entry cannot drop the pin.
+ */
+function cantonCoinDso(
+  instrument: { id?: string; admin?: string },
+  tokenRegistries: Record<string, string> | undefined
+): string | undefined {
+  return instrument.id === "Amulet" && instrument.admin && !tokenRegistries?.[instrument.admin]
+    ? instrument.admin
+    : undefined;
+}
+
+/**
+ * The record key and payer of a payload whose bytes are a transfer of exactly
+ * what these requirements ask for, judged without the clock or any live read.
+ *
+ * A repeat of a payment we already settled is answered from its record, and
+ * that answer must not depend on the deadline (it has usually passed by then)
+ * or on a Scan or topology read that can fail: answering "expired" to the
+ * repeat of a settled payment told the merchant to have the payer pay again.
+ * It must still depend on the bytes being THIS route's payment. The record is
+ * keyed on the bytes alone, so a payment to one merchant replayed at another's
+ * route would otherwise be answered there as settled, and a middleware that
+ * claims that ticket would serve it unpaid.
+ *
+ * The same structural check the validator runs, with "now" set to the bytes'
+ * own preparation time, so an old payment's lapsed deadlines do not fail it.
+ * Null when the bytes do not decode or do not match.
+ */
+export async function inlineRepeatOf(
+  body: FacilitatorRequest,
+  deps: Pick<
+    InlineValidationDeps,
+    "facilitatorParty" | "acceptedFeePayers" | "registryTrustedParties" | "tokenRegistries"
+  >
+): Promise<{ key: string; payer: string } | null> {
+  try {
+    const { paymentPayload, paymentRequirements } = body;
+    const decoded = decodeInlinePaymentPayload(paymentPayload.payload);
+    const preparedB64 = decoded.preparedTransactionBytes.toString("base64");
+    const pt = decodePrepared(preparedB64);
+    if (pt.actAs.length !== 1 || !pt.actAs[0]) return null;
+    const payer = pt.actAs[0];
+    const ourParties = [deps.facilitatorParty, ...(deps.acceptedFeePayers ?? [])];
+    if (ourParties.includes(payer)) return null;
+    const extra = (paymentRequirements.extra ?? {}) as {
+      instrumentId?: { admin?: string; id?: string };
+      synchronizerId?: string;
+      feePayer?: string;
+      memo?: string;
+    };
+    if (typeof extra.feePayer !== "string" || !ourParties.includes(extra.feePayer)) return null;
+    const admin = extra.instrumentId?.admin;
+    const id = extra.instrumentId?.id;
+    if (typeof admin !== "string" || !admin || typeof id !== "string" || !id) return null;
+    if (pt.preparationTime === undefined) return null;
+    assertPreparedTransferMatches(preparedB64, {
+      sender: payer,
+      receiver: paymentRequirements.payTo,
+      amount: wireAmountToLedgerDecimal(paymentRequirements.scheme, paymentRequirements.amount),
+      instrumentId: id,
+      requireInputHoldings: true,
+      instrumentAdmin: admin,
+      // The same Canton Coin pin as the validator, so a repeat is matched
+      // against exactly what was settled.
+      ...(admin && cantonCoinDso({ id, admin }, deps.tokenRegistries) ? { dsoParty: admin } : {}),
+      ...(deps.registryTrustedParties?.[admin]
+        ? { trustedRegistryParties: new Set(deps.registryTrustedParties[admin]) }
+        : {}),
+      ...(extra.synchronizerId !== undefined ? { synchronizerId: extra.synchronizerId } : {}),
+      ...(typeof extra.memo === "string" && extra.memo.length > 0 ? { memo: extra.memo } : {}),
+      nowMs: Number(pt.preparationTime / 1000n),
+    });
+    const key = Buffer.from(await recomputeHash(preparedB64), "base64").toString("hex");
+    return { key, payer };
+  } catch {
+    return null;
+  }
+}
 
 /** True when the payload uses the inline carriage rather than a stash ref. */
 export function isInlineCarriage(payload: unknown): boolean {
@@ -46,6 +145,62 @@ export function isInlineCarriage(payload: unknown): boolean {
     typeof (payload as Record<string, unknown>)["preparedTransaction"] ===
       "string"
   );
+}
+
+/**
+ * The payer an inline payload CLAIMS: the single `act_as` of its prepared
+ * transaction, read with nothing verified. "" when the payload does not decode
+ * to exactly one.
+ *
+ * For keying a budget before the work, never for anything that decides: until
+ * Rule 3 passes this is the caller's assertion. The decode is the one Rule 2
+ * runs, inside the codec's caps (8 KiB in, 64 KiB out, one gzip member), so
+ * it costs a bounded decompress and parse. Party ids are short; anything over
+ * 256 chars is not one and folds into "", so a crafted act_as cannot turn
+ * itself into a large budget key.
+ */
+export function claimedInlinePayer(payload: unknown): string {
+  return isInlineCarriage(payload) ? budgetPayer(decodeInlineClaim(payload)) : "";
+}
+
+/** The payer of a claim, fit to key a budget (see claimedInlinePayer). */
+export function budgetPayer(claim: InlineClaim): string {
+  const payer = claim.ok ? (claim.payer ?? "") : "";
+  return payer.length <= 256 ? payer : "";
+}
+
+/**
+ * Rule 2 and Rule 8's reading of a payload, done once.
+ *
+ * `ok: false` carries Rule 2's refusal code. `ok: true` carries the decoded
+ * payload and the single `act_as` (undefined when there is not exactly one,
+ * which Rule 8 refuses as malformed). /verify decodes this before its budgets
+ * to learn the claimed payer, then hands it to the validator, so a request is
+ * decoded once and not twice.
+ */
+export type InlineClaim =
+  | { ok: false; reason: CantonErrorCode }
+  | { ok: true; decoded: DecodedInlinePayload; preparedB64: string; payer: string | undefined };
+
+export function decodeInlineClaim(payload: unknown): InlineClaim {
+  let decoded: DecodedInlinePayload;
+  try {
+    decoded = decodeInlinePaymentPayload(payload);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: err instanceof InlinePayloadError ? err.code : "invalid_exact_canton_malformed_payload",
+    };
+  }
+  const preparedB64 = decoded.preparedTransactionBytes.toString("base64");
+  let payer: string | undefined;
+  try {
+    const pt = decodePrepared(preparedB64);
+    payer = pt.actAs.length === 1 && pt.actAs[0] ? pt.actAs[0] : undefined;
+  } catch {
+    payer = undefined;
+  }
+  return { ok: true, decoded, preparedB64, payer };
 }
 
 export interface InlineValidationDeps {
@@ -239,41 +394,30 @@ function fail(reason: CantonErrorCode, payer = ""): InlineValidationResult {
  */
 export async function validateInlineTransferPath(
   body: FacilitatorRequest,
-  deps: InlineValidationDeps
+  deps: InlineValidationDeps,
+  /** Rule 2 and Rule 8 already read from THIS body's payload (decodeInlineClaim),
+   *  so it is not decoded twice. Absent: read here. */
+  claim?: InlineClaim
 ): Promise<InlineValidationResult> {
   const { paymentPayload, paymentRequirements } = body;
 
   // Rule 2 — decode within the scheme's bounds. The codec enforces single-gzip
   // -member framing and both size caps, so a bomb dies here rather than in the
   // protobuf decoder.
-  let decoded;
-  try {
-    decoded = decodeInlinePaymentPayload(paymentPayload.payload);
-  } catch (err) {
-    if (err instanceof InlinePayloadError) return fail(err.code);
-    return fail("invalid_exact_canton_malformed_payload");
-  }
-
-  const preparedB64 = decoded.preparedTransactionBytes.toString("base64");
-
+  //
   // Rule 8 — the proven payer. Read the authoritative submitter from the SIGNED
   // metadata. More than one `act_as` party is refused rather than picked from:
-  // there would be no single answer to "whose money is this".
-  let payer: string;
-  try {
-    const pt = decodePrepared(preparedB64);
-    // Redundant with the core validator's own `assertActAsIsSender`, which
-    // refuses an empty or multi-party act_as a few lines below. Kept because it
-    // is what stops `payer` from being undefined here; mutation testing cannot
-    // separate the two without a hand-built protobuf, so treat the core check
-    // as the authoritative one.
-    if (pt.actAs.length !== 1 || !pt.actAs[0]) {
-      return fail("invalid_exact_canton_malformed_payload");
-    }
-    payer = pt.actAs[0];
-  } catch {
-    return fail("invalid_exact_canton_malformed_payload");
-  }
+  // there would be no single answer to "whose money is this". The single-party
+  // check is redundant with the core validator's own `assertActAsIsSender`,
+  // which refuses an empty or multi-party act_as a few lines below. Kept because
+  // it is what stops `payer` from being undefined here; mutation testing cannot
+  // separate the two without a hand-built protobuf, so treat the core check as
+  // the authoritative one.
+  const read = claim ?? decodeInlineClaim(paymentPayload.payload);
+  if (!read.ok) return fail(read.reason);
+  const { decoded, preparedB64 } = read;
+  if (read.payer === undefined) return fail("invalid_exact_canton_malformed_payload");
+  const payer: string = read.payer;
 
   // Every identity this facilitator answers to as the relayer: its party, plus
   // a previous party still accepted during a switch.
@@ -346,6 +490,9 @@ export async function validateInlineTransferPath(
   // idempotent, no ledger read / TOCTOU), not a live probe against holdings that a
   // prior settle may have consumed.
   let registryDirectDelivery = false;
+  // Amulet delivers one-step only through TransferPreapproval_SendV2; without the
+  // preapproval in the context it creates a pending instruction the payer can withdraw.
+  let amuletDirectDelivery = false;
   try {
     // Same decode the validator uses; read AFTER it has passed, so the inputs
     // reasoned over are the ones it approved.
@@ -359,6 +506,12 @@ export async function validateInlineTransferPath(
       // Always pinned now, which ALSO arms the trusted-admin arm of the
       // foreign-party backstop rather than leaving it dormant.
       instrumentAdmin: extra.instrumentId.admin,
+      // Canton Coin as this arm judges it below: an Amulet whose admin is not
+      // a configured registry, bound to Scan's preapproval DSO by Rule 7. Core
+      // then pins the root contract to that DSO alone.
+      ...(cantonCoinDso(extra.instrumentId, deps.tokenRegistries)
+        ? { dsoParty: extra.instrumentId.admin }
+        : {}),
       // Registry tokens (USDCx, …) name the registry operator + bridge operator in
       // the signed tree; admit exactly the out-of-band-trusted infra set for THIS
       // instrument's admin so the backstop passes an honest transfer while still
@@ -400,6 +553,12 @@ export async function validateInlineTransferPath(
       (e) =>
         e.choiceId === "TransferRule_DirectTransfer" &&
         e.templateQualifiedName === "Utility.Registry.V0.Rule.Transfer:TransferRule"
+    );
+    amuletDirectDelivery = deliversViaAmuletPreapproval(
+      pt,
+      paymentRequirements.payTo,
+      extra.instrumentId.admin,
+      expectedAmount
     );
   } catch (err) {
     if (err instanceof PreparedTransferMismatchError) {
@@ -458,13 +617,19 @@ export async function validateInlineTransferPath(
     // No Amulet validFrom/expiry read: the utility's transfer-factory route
     // resolves away from "direct" once the preapproval is not currently valid.
   } else {
-    if (!deps.fetchPreapproval) {
+    // Before the Scan lookup: a live preapproval does not prove these bytes use it.
+    if (!amuletDirectDelivery || !deps.fetchPreapproval) {
       return fail("invalid_exact_canton_preapproval_missing", payer);
     }
     let pre: Awaited<ReturnType<NonNullable<InlineValidationDeps["fetchPreapproval"]>>>;
     try {
       pre = await deps.fetchPreapproval(paymentRequirements.payTo);
-    } catch {
+    } catch (err) {
+      // We chose not to ask: the shared Scan budget shed this lookup. That is
+      // no answer about the merchant, so it is not a verdict either: let the
+      // route say "busy, retry" instead of telling the payer the merchant
+      // cannot be paid. Still fail-closed — nothing past this line runs.
+      if (err instanceof ScanBudgetRefusedError) throw err;
       // A lookup that failed did not establish a live preapproval. Fail closed:
       // relaying on an unknown answer is what leaves the half-settled state.
       return fail("invalid_exact_canton_preapproval_missing", payer);
@@ -660,6 +825,10 @@ export async function validateInlineTransferPath(
  */
 export function classifyMismatch(message: string): CantonErrorCode {
   const m = message.toLowerCase();
+  // The validator's one-step delivery check. Before it existed, the same bytes
+  // passed the validator and failed deliversViaAmuletPreapproval below, so the
+  // payer was told preapproval_missing; first, so it keeps that answer.
+  if (m.includes("preapproval delivery")) return "invalid_exact_canton_preapproval_missing";
   if (m.includes("amount")) return "invalid_exact_canton_amount_mismatch";
   if (m.includes("receiver")) return "invalid_exact_canton_merchant_mismatch";
   if (m.includes("instrument"))
