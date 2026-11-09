@@ -15,6 +15,8 @@ import { encodeInlinePaymentPayload, decodePrepared } from "@ftptech/x402-canton
 import { registerSettleRoute, type SettleRouteServices } from "./settle.js";
 import { createInMemoryInlineSettleStore } from "../db/inline-settle-store.js";
 import { SubmissionOutcomeUnknownError } from "../canton/transfer-factory.js";
+import { ScanBudgetRefusedError } from "../scan-budget.js";
+import { createMetrics } from "../metrics.js";
 
 const FIXTURES = fileURLToPath(
   new URL("../../../agent-wallet/src/__fixtures__/", import.meta.url)
@@ -167,7 +169,7 @@ describe("/settle inline — a retry must not burn traffic twice", () => {
     // holdings that a second submission finds archived. But we would only learn
     // that BY SUBMITTING, and every submission spends Global-Synchronizer
     // traffic. That is the cost this record exists to avoid.
-    const h = harness();
+    const h = harness({ settleAnswers: "legacy" });
     const first = await settle(h.svc);
     expect(first.success).toBe(true);
     expect(first.transaction).toBe(UPDATE_ID);
@@ -243,7 +245,7 @@ describe("/settle inline — an unknown outcome is remembered, not re-relayed", 
     // the harness's own execute, so h.executes would stay at 0 and the
     // assertion would pass without measuring anything.
     let executes = 0;
-    const h = harness({
+    const h = harness({ settleAnswers: "legacy",
       settleDispatchMark: "enforce",
       inlineSettles: store,
       transferFactory: {
@@ -297,7 +299,7 @@ describe("/settle inline — an unknown outcome is remembered, not re-relayed", 
     // Discriminator. The 503 arm must fire only on the unresolved mark; a
     // payment we DID see must keep returning its updateId.
     const store = createInMemoryInlineSettleStore();
-    const h = harness({ settleDispatchMark: "enforce", inlineSettles: store });
+    const h = harness({ settleAnswers: "legacy", settleDispatchMark: "enforce", inlineSettles: store });
     const first = await settle(h.svc);
     expect(first.success).toBe(true);
     const second = await settle(h.svc);
@@ -340,11 +342,20 @@ describe("/settle inline — a concurrent duplicate waits for its sibling instea
     };
   }
 
-  it("enforce: answers with the sibling's result and never submits", async () => {
-    const h = harness({ settleDispatchMark: "enforce", inlineSettles: racedStore() });
+  it.each([
+    ["legacy", { success: true, transaction: "1220-sibling-settled" }],
+    [
+      "spec",
+      {
+        success: false,
+        errorReason: "invalid_exact_canton_payment_already_settled",
+        transaction: "1220-sibling-settled",
+      },
+    ],
+  ] as const)("enforce, %s: answers from the sibling's record and never submits", async (mode, expected) => {
+    const h = harness({ settleDispatchMark: "enforce", settleAnswers: mode, inlineSettles: racedStore() });
     const r = await settle(h.svc);
-    expect(r.success).toBe(true);
-    expect(r.transaction).toBe("1220-sibling-settled");
+    expect(r).toMatchObject(expected);
     expect(h.executes).toHaveLength(0);
   });
 
@@ -660,7 +671,7 @@ describe("/settle inline — an unknown outcome is RESOLVED, not just remembered
     // means the submission may still be sequencing.
     const store = createInMemoryInlineSettleStore();
     await seedMark(store);
-    const h = harness({
+    const h = harness({ settleAnswers: "legacy",
       settleDispatchMark: "enforce",
       inlineSettles: store,
       transferFactory: {
@@ -683,7 +694,7 @@ describe("/settle inline — an unknown outcome is RESOLVED, not just remembered
     // A committed submission that moved nothing must not release the goods.
     const store = createInMemoryInlineSettleStore();
     await seedMark(store);
-    const h = harness({
+    const h = harness({ settleAnswers: "legacy",
       settleDispatchMark: "enforce",
       inlineSettles: store,
       transferFactory: {
@@ -840,7 +851,7 @@ describe("the unknown-outcome guard is staged, and OFF is the default", () => {
     // not the settle-record that has always been there.
     const store = createInMemoryInlineSettleStore();
     await store.recordSettled(TRUE_HASH_HEX, "1220OLD");
-    const { h, executes } = unknownExecuteHarness({ inlineSettles: store });
+    const { h, executes } = unknownExecuteHarness({ settleAnswers: "legacy", inlineSettles: store });
     const r = await settle(h.svc);
     expect(r.success).toBe(true);
     if (r.success) expect(r.transaction).toBe("1220OLD");
@@ -866,6 +877,7 @@ describe("the unknown-outcome guard is staged, and OFF is the default", () => {
   it("ENFORCE is the only mode that refuses", async () => {
     const store = createInMemoryInlineSettleStore();
     const { h, executes } = unknownExecuteHarness({
+      settleAnswers: "legacy",
       settleDispatchMark: "enforce",
       inlineSettles: store,
     });
@@ -876,3 +888,61 @@ describe("the unknown-outcome guard is staged, and OFF is the default", () => {
     expect(executes()).toBe(1);
   });
 });
+
+describe("/settle when the shared Scan budget sheds the Rule 7 lookup", () => {
+  it("answers 503 scan_busy with Retry-After, not a preapproval verdict, and submits nothing", async () => {
+    // The lookup was never made, so nothing is known about the merchant. A
+    // success:false reason would reach the payer as a refusal; 503 makes the
+    // shipped middlewares retry the SAME payment instead.
+    const h = harness({
+      inline: {
+        verifySignature: async () => ({ verified: true, preparedTxHashHex: TRUE_HASH_HEX }),
+        fetchPreapproval: async () => {
+          throw new ScanBudgetRefusedError("budget", 4_200);
+        },
+      },
+    } as never);
+    const r = await settleRaw(h.svc);
+    expect(r.status).toBe(503);
+    expect(JSON.parse(r.body)).toMatchObject({ error: "scan_busy" });
+    expect(h.executes).toHaveLength(0);
+  });
+
+  it("is counted under its own settle_total label, not as rate_limited", async () => {
+    const metrics = createMetrics({ collectDefault: false });
+    const h = harness({
+      metrics,
+      inline: {
+        verifySignature: async () => ({ verified: true, preparedTxHashHex: TRUE_HASH_HEX }),
+        fetchPreapproval: async () => {
+          throw new ScanBudgetRefusedError("budget", 4_200);
+        },
+      },
+    } as never);
+    expect((await settleRaw(h.svc)).status).toBe(503);
+    const text = await metrics.registry.metrics();
+    expect(text).toContain('x402_facilitator_settle_total{result="scan_busy"} 1');
+    expect(text).not.toContain('x402_facilitator_settle_total{result="rate_limited"}');
+  });
+});
+
+describe("/settle is what marks a merchant as served for the Scan budget", () => {
+  it("a settled payment marks its merchant; one that moved nothing does not", async () => {
+    const noteServedMerchant = vi.fn();
+    const ok = harness({ noteServedMerchant } as never);
+    expect((await settle(ok.svc)).success).toBe(true);
+    expect(noteServedMerchant).toHaveBeenCalledWith(META.receiver);
+
+    const burned = vi.fn();
+    const zero = harness({
+      noteServedMerchant: burned,
+      transferFactory: {
+        preapprovalKind: async () => "receiver",
+        execute: async () => ({ updateId: UPDATE_ID, transferred: false, confirmInconclusive: false }),
+      },
+    } as never);
+    expect((await settle(zero.svc)).success).toBe(false);
+    expect(burned).not.toHaveBeenCalled();
+  });
+});
+

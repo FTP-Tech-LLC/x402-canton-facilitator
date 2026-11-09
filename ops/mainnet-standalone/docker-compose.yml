@@ -82,6 +82,8 @@ services:
       CANTON_X402_INLINE_MERCHANT_POLICY:
       CANTON_X402_INLINE_MERCHANT_ALLOWLIST:
       CANTON_X402_SETTLE_DISPATCH_MARK:
+      CANTON_X402_SETTLE_ANSWERS:
+      CANTON_X402_WALLET_READ_PROOF:
       # CANTON_X402_ADVERTISE_TF is still parsed but has no effect: /supported
       # always advertises transfer-factory. Not passed through.
 

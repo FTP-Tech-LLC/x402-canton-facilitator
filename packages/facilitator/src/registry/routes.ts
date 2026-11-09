@@ -4,6 +4,8 @@ import type { MerchantContractService } from "../canton/merchant-contract.js";
 import type { CantonClient, ScanClient } from "@ftptech/x402-canton-ledger";
 import type { PreapprovalService } from "../canton/preapproval.js";
 import { createSlidingWindowLimiter } from "../rate-limit.js";
+import { hasTrustedKey } from "../routes/common.js";
+import { ScanBudgetRefusedError } from "../scan-budget.js";
 
 /**
  * Merchant registration HTTP API.
@@ -34,6 +36,10 @@ export interface RegistryRouteServices {
   // `getTransferPreapprovalByParty` reads `expiresAt`, which the transfer-kind
   // resolve does not carry — see the preapproval-status route.
   scan: Pick<ScanClient, "resolveTransferKind" | "getTransferPreapprovalByParty">;
+  /** The same Scan on the best-effort class of the shared outbound budget
+   *  (scan-budget.ts), for the status check from a caller without a trusted
+   *  key. Absent: `scan` for everyone. */
+  bestEffortScan?: Pick<ScanClient, "resolveTransferKind" | "getTransferPreapprovalByParty"> | undefined;
   /** Instrument admin → DA Registry Utility base URL, for non-Amulet tokens
    *  (FacilitatorConfig.tokenRegistries). Their preapproval is a registry
    *  matter; the SV Scan answers for Canton Coin only. */
@@ -56,6 +62,9 @@ export interface RegistryRouteServices {
   preapproval: Pick<PreapprovalService, "createTransferPreapproval">;
   /** Gate for the preapproval route; OFF by default (money-path, DevNet-validate). */
   enablePreapprovalProvider: boolean;
+  /** The wallet relay's trusted X-Agent-Key values (config.walletTrustedKeys):
+   *  a request with one skips the per-IP cap on the public reads. */
+  trustedKeys?: readonly string[] | undefined;
 }
 
 interface RegisterBody {
@@ -126,10 +135,13 @@ export async function registerRegistryRoutes(
   app: FastifyInstance,
   svc: RegistryRouteServices
 ): Promise<void> {
-  // The registry preapproval check is a public GET that reads the ledger with
-  // the facilitator's rights; per caller IP and overall, so a loop of them
-  // cannot become a load on the participant.
+  // The merchant lookup and the preapproval check are public GETs that read
+  // the ledger with the facilitator's rights, or for Canton Coin ask the SV
+  // Scan (an uncached resolve on the egress settle also uses); per caller IP
+  // and overall, so a loop of them cannot become a load on either.
   const registryReadLimiter = createSlidingWindowLimiter({ maxPerPayer: 30, maxGlobal: 600, windowMs: 60_000 });
+  const readAllowed = (req: FastifyRequest): boolean =>
+    registryReadLimiter.allowKeys(hasTrustedKey(req, svc.trustedKeys) ? [] : [req.ip], Date.now());
   app.post<{ Body: RegisterBody }>(
     "/v1/merchants/register",
     async (req, reply) => {
@@ -178,6 +190,9 @@ export async function registerRegistryRoutes(
   app.get<{ Params: { party: string } }>(
     "/v1/merchants/:party",
     async (req, reply) => {
+      if (!readAllowed(req)) {
+        return reply.status(429).send({ error: "too many merchant lookups; retry in a minute" });
+      }
       let found: Awaited<ReturnType<typeof svc.merchantContract.findMerchantContract>>;
       try {
         found = await svc.merchantContract.findMerchantContract(req.params.party);
@@ -223,6 +238,9 @@ export async function registerRegistryRoutes(
           "missing ?admin=<DSO party id> (the instrument admin); ?id defaults to Amulet",
       });
     }
+    if (!readAllowed(req)) {
+      return reply.status(429).send({ error: "too many preapproval checks; retry in a minute" });
+    }
     const id = req.query.id ?? "Amulet";
     const now = Date.now();
     // A registry token (USDCx, CBTC…) is not Canton Coin: the SV Scan knows
@@ -237,9 +255,6 @@ export async function registerRegistryRoutes(
       // contract the receiver is a stakeholder of, so read it — possible for a
       // party this participant hosts (every wallet onboarded here).
       const party = req.params.party;
-      if (!registryReadLimiter.allow(req.ip, Date.now())) {
-        return reply.status(429).send({ error: "too many preapproval checks; retry in a minute" });
-      }
       try {
         const reader = svc.router ? (await svc.router.forParty(party)).client : svc.client;
         if (!reader) throw new Error("no ledger client");
@@ -311,9 +326,24 @@ export async function registerRegistryRoutes(
           "preapproval cannot be checked here. hasPreapproval null does NOT mean there is none.",
       });
     }
+    // An anonymous, uncached Scan read (600 a minute overall): best-effort in
+    // the shared Scan budget, so a few IPs looping it cannot use up the line
+    // the payment path and new merchants' first lookups sit behind.
+    //
+    // A SHED read is answered 503 scan_busy with the wait, never folded into
+    // the 200 "could not tell" below: nothing was asked, and the caller acting
+    // on this answer (the CLI's create path) must retry, not decide. A wallet
+    // that read a null as "none" would prepay a second preapproval.
+    const scan =
+      svc.bestEffortScan && !hasTrustedKey(req, svc.trustedKeys) ? svc.bestEffortScan : svc.scan;
+    const shed = (err: ScanBudgetRefusedError) =>
+      reply
+        .status(503)
+        .header("Retry-After", String(err.retryAfterSeconds))
+        .send({ error: "scan_busy", detail: "preapproval check held back to keep Scan for payments; retry" });
     let transferKind: string;
     try {
-      transferKind = await svc.scan.resolveTransferKind({
+      transferKind = await scan.resolveTransferKind({
         sender: svc.facilitatorParty,
         receiver: req.params.party,
         amount: "1.0000000000",
@@ -323,6 +353,7 @@ export async function registerRegistryRoutes(
         executeBefore: new Date(now + 3_600_000).toISOString(),
       });
     } catch (err) {
+      if (err instanceof ScanBudgetRefusedError) return shed(err);
       // UNSUPPORTED (validator flavor) / transport — cannot determine. Report
       // unknown rather than fail; the caller can retry or check via Scan.
       const msg = err instanceof Error ? err.message : String(err);
@@ -353,12 +384,13 @@ export async function registerRegistryRoutes(
     let expiryNote: string | undefined;
     if (transferKind === "direct") {
       try {
-        const pre = await svc.scan.getTransferPreapprovalByParty(req.params.party);
+        const pre = await scan.getTransferPreapprovalByParty(req.params.party);
         if (pre) {
           expiresAt = pre.expiresAt;
           expired = Date.parse(pre.expiresAt) <= now;
         }
       } catch (err) {
+        if (err instanceof ScanBudgetRefusedError) return shed(err);
         expiryNote =
           "expiresAt could not be read from Scan, so hasPreapproval reflects " +
           "routing only and may be true for an EXPIRED preapproval: " +

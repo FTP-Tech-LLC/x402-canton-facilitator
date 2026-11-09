@@ -57,6 +57,8 @@ const OPTIONAL = [
   "CANTON_X402_ONBOARD_CO_HOST_UID",
   "CANTON_GRANT_PARTY_RIGHTS",
   "CANTON_SECONDARY_GRANT_PARTY_RIGHTS",
+  "CANTON_X402_SETTLE_ANSWERS",
+  "CANTON_X402_SETTLE_DISPATCH_MARK",
 ] as const;
 
 describe("loadConfig", () => {
@@ -92,6 +94,26 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow(/CANTON_FACILITATOR_MEMBER_ID/);
     process.env.CANTON_FACILITATOR_MEMBER_ID = "PAR::ftp-validator-2::1220da86";
     expect(loadConfig().facilitatorMemberId).toBe("PAR::ftp-validator-2::1220da86");
+  });
+
+  it("settle answers: spec by default with the mark enforced; legacy keeps the mark off", () => {
+    minimal();
+    expect(loadConfig()).toMatchObject({ settleAnswers: "spec", settleDispatchMarkMode: "enforce" });
+    process.env.CANTON_X402_SETTLE_ANSWERS = "legacy";
+    expect(loadConfig()).toMatchObject({ settleAnswers: "legacy", settleDispatchMarkMode: "off" });
+    process.env.CANTON_X402_SETTLE_DISPATCH_MARK = "observe";
+    expect(loadConfig()).toMatchObject({ settleAnswers: "legacy", settleDispatchMarkMode: "observe" });
+  });
+
+  it("spec with the mark off or observe refuses to start: its pending answer needs the mark", () => {
+    minimal();
+    process.env.CANTON_X402_SETTLE_ANSWERS = "spec";
+    for (const mark of ["off", "observe"]) {
+      process.env.CANTON_X402_SETTLE_DISPATCH_MARK = mark;
+      expect(() => loadConfig(), mark).toThrow(/CANTON_X402_SETTLE_ANSWERS=spec needs CANTON_X402_SETTLE_DISPATCH_MARK=enforce/);
+    }
+    process.env.CANTON_X402_SETTLE_DISPATCH_MARK = "enforce";
+    expect(loadConfig().settleDispatchMarkMode).toBe("enforce");
   });
 
   it("without markers the member id stays optional", () => {
@@ -772,6 +794,14 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).not.toThrow();
   });
 
+  it("the Rust grant sender is off unless asked for", () => {
+    minimal();
+    expect(loadConfig().faucetRustSender).toBe(false);
+    process.env.CANTON_X402_FAUCET_RUST_SENDER = "true";
+    expect(loadConfig().faucetRustSender).toBe(true);
+    delete process.env.CANTON_X402_FAUCET_RUST_SENDER;
+  });
+
   it("the starter grant is off by default and rides on the faucet", () => {
     minimal();
     expect(loadConfig().faucetOnOnboard).toBe(false);
@@ -786,6 +816,54 @@ describe("loadConfig", () => {
     minimal();
     process.env.CANTON_X402_FAUCET_ON_ONBOARD = "true";
     expect(() => loadConfig()).toThrow(/CANTON_X402_FAUCET_ENABLED/);
+  });
+
+  it("trusted relay keys: none by default, a trimmed comma list, a short key refuses to start", () => {
+    minimal();
+    expect(loadConfig().walletTrustedKeys).toEqual([]);
+    const a = "a".repeat(32);
+    const b = "b".repeat(48);
+    process.env.CANTON_X402_WALLET_TRUSTED_KEYS = ` ${a} ,, ${b} ,`;
+    try {
+      expect(loadConfig().walletTrustedKeys).toEqual([a, b]);
+      // The error names the key's place in the list, never the key.
+      process.env.CANTON_X402_WALLET_TRUSTED_KEYS = `${a},${"c".repeat(31)}`;
+      expect(() => loadConfig()).toThrow(
+        /^CANTON_X402_WALLET_TRUSTED_KEYS: key 2 is shorter than 32 characters$/
+      );
+    } finally {
+      delete process.env.CANTON_X402_WALLET_TRUSTED_KEYS;
+    }
+  });
+
+  it("one IP's onboarding and starter-grant share defaults well below the shared budgets", () => {
+    minimal();
+    const c = loadConfig();
+    expect(c.walletOnboardRateMaxPerIp).toBe(10);
+    expect(c.walletOnboardRateMaxPerIp).toBeLessThan(c.walletOnboardRateMaxGlobal);
+    expect(c.faucetOnboardMaxPerIp).toBe(3);
+    process.env.CANTON_X402_WALLET_ONBOARD_RATE_MAX_PER_IP = "4";
+    process.env.CANTON_X402_FAUCET_ONBOARD_MAX_PER_IP = "0";
+    try {
+      expect(loadConfig().walletOnboardRateMaxPerIp).toBe(4);
+      expect(loadConfig().faucetOnboardMaxPerIp).toBe(0);
+    } finally {
+      delete process.env.CANTON_X402_WALLET_ONBOARD_RATE_MAX_PER_IP;
+      delete process.env.CANTON_X402_FAUCET_ONBOARD_MAX_PER_IP;
+    }
+  });
+
+  it("relay read caps are on by default, per IP only, the Scan tier stricter", () => {
+    minimal();
+    const c = loadConfig();
+    expect(c.walletReadRateMaxPerIp).toBe(600);
+    expect(c.walletScanReadRateMaxPerIp).toBe(120);
+    process.env.CANTON_X402_WALLET_SCAN_READ_RATE_MAX_PER_IP = "0";
+    try {
+      expect(loadConfig().walletScanReadRateMaxPerIp).toBe(0);
+    } finally {
+      delete process.env.CANTON_X402_WALLET_SCAN_READ_RATE_MAX_PER_IP;
+    }
   });
 });
 
@@ -1098,5 +1176,112 @@ describe("blanking a capped env line restores the default, never uncaps", () => 
     c = cfg();
     expect(c.settleRateMaxPerIp).toBe(100);
     expect(c.faucetMaxPerIp).toBe(5);
+  });
+});
+
+describe("relay and Scan budgets: defaults, blank lines, explicit 0", () => {
+  const KEYS = [
+    "CANTON_X402_WALLET_SUBMIT_RATE_MAX_GLOBAL",
+    "CANTON_X402_SCAN_BUDGET_PER_MIN",
+    "CANTON_X402_SCAN_COOLDOWN_MS",
+    "CANTON_X402_VERIFY_WASTE_MAX_PER_IP",
+    "CANTON_X402_VERIFY_WASTE_MAX_PER_PAYER",
+    "CANTON_X402_VERIFY_RATE_MAX_PER_PAYER",
+    "CANTON_X402_VERIFY_RATE_MAX_PER_PAYMENT",
+    "CANTON_X402_WALLET_PAY_PREPARE_RATE_MAX",
+    "CANTON_X402_WALLET_PAY_PREPARE_RATE_MAX_PER_IP",
+  ] as const;
+  let saved: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    saved = {};
+    for (const k of KEYS) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+  });
+  afterEach(() => {
+    for (const k of KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+  function cfg(): ReturnType<typeof loadConfig> {
+    process.env.CANTON_NETWORK = "canton:devnet";
+    process.env.CANTON_PARTICIPANT_URL = "http://localhost:3975";
+    process.env.CANTON_FACILITATOR_PARTY = "ftp_facilitator::1220";
+    process.env.CANTON_SYNCHRONIZER_ID = "global-domain::1220";
+    process.env.CANTON_SCAN_URL = "http://localhost:3903";
+    return loadConfig();
+  }
+
+  it("the relay submission arm is on by default, far above production's single-digit rate", () => {
+    // 20 a minute: production makes single-digit relay submissions in ten
+    // hours, and callers without a key then get 15 of our traffic, not 45.
+    expect(cfg().walletSubmitRateMaxGlobal).toBe(20);
+    process.env.CANTON_X402_WALLET_SUBMIT_RATE_MAX_GLOBAL = "";
+    expect(cfg().walletSubmitRateMaxGlobal).toBe(20);
+    process.env.CANTON_X402_WALLET_SUBMIT_RATE_MAX_GLOBAL = "abc";
+    expect(cfg().walletSubmitRateMaxGlobal).toBe(20);
+    process.env.CANTON_X402_WALLET_SUBMIT_RATE_MAX_GLOBAL = "25";
+    expect(cfg().walletSubmitRateMaxGlobal).toBe(25);
+    process.env.CANTON_X402_WALLET_SUBMIT_RATE_MAX_GLOBAL = "0";
+    expect(cfg().walletSubmitRateMaxGlobal).toBe(0);
+  });
+
+  it("the shared Scan budget is on by default; 0 turns it off, a blank line does not", () => {
+    let c = cfg();
+    expect(c.scanBudgetPerMin).toBe(300);
+    expect(c.scanCooldownMs).toBe(2000);
+    process.env.CANTON_X402_SCAN_BUDGET_PER_MIN = " ";
+    process.env.CANTON_X402_SCAN_COOLDOWN_MS = "";
+    c = cfg();
+    expect(c.scanBudgetPerMin).toBe(300);
+    expect(c.scanCooldownMs).toBe(2000);
+    process.env.CANTON_X402_SCAN_BUDGET_PER_MIN = "0";
+    process.env.CANTON_X402_SCAN_COOLDOWN_MS = "500";
+    c = cfg();
+    expect(c.scanBudgetPerMin).toBe(0);
+    expect(c.scanCooldownMs).toBe(500);
+  });
+
+  it("the /verify waste budgets are on by default, the per-caller one equal to the valid cap", () => {
+    let c = cfg();
+    expect(c.verifyWasteMaxPerIp).toBe(120);
+    expect(c.verifyWasteMaxPerPayer).toBe(20);
+    expect(c.verifyWasteMaxPerIp).toBe(c.verifyRateMaxPerIp);
+    process.env.CANTON_X402_VERIFY_WASTE_MAX_PER_IP = "";
+    process.env.CANTON_X402_VERIFY_WASTE_MAX_PER_PAYER = "x";
+    c = cfg();
+    expect(c.verifyWasteMaxPerIp).toBe(120);
+    expect(c.verifyWasteMaxPerPayer).toBe(20);
+    process.env.CANTON_X402_VERIFY_WASTE_MAX_PER_IP = "0";
+    process.env.CANTON_X402_VERIFY_WASTE_MAX_PER_PAYER = "5";
+    c = cfg();
+    expect(c.verifyWasteMaxPerIp).toBe(0);
+    expect(c.verifyWasteMaxPerPayer).toBe(5);
+  });
+
+  it("/verify valid outcomes: 90 per payer (an agent paying once a second fits), 10 per payment", () => {
+    let c = cfg();
+    expect(c.verifyRateMaxPerPayer).toBe(90);
+    expect(c.verifyRateMaxPerPayment).toBe(10);
+    expect(c.verifyRateMaxPerPayer).toBeGreaterThan(60);
+    expect(c.verifyRateMaxPerPayer).toBeLessThan(c.verifyRateMaxPerIp);
+    process.env.CANTON_X402_VERIFY_RATE_MAX_PER_PAYER = "";
+    process.env.CANTON_X402_VERIFY_RATE_MAX_PER_PAYMENT = "0";
+    c = cfg();
+    expect(c.verifyRateMaxPerPayer).toBe(90);
+    expect(c.verifyRateMaxPerPayment).toBe(0);
+  });
+
+  it("pay/prepare admissions: 60 per party and IP, 120 per IP, by default", () => {
+    let c = cfg();
+    expect(c.walletPayPrepareRateMaxPerKey).toBe(60);
+    expect(c.walletPayPrepareRateMaxPerIp).toBe(120);
+    process.env.CANTON_X402_WALLET_PAY_PREPARE_RATE_MAX = "0";
+    process.env.CANTON_X402_WALLET_PAY_PREPARE_RATE_MAX_PER_IP = "";
+    c = cfg();
+    expect(c.walletPayPrepareRateMaxPerKey).toBe(0);
+    expect(c.walletPayPrepareRateMaxPerIp).toBe(120);
   });
 });

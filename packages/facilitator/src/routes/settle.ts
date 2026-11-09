@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { SettleResponse } from "@ftptech/x402-canton-core";
 import type { ScanClient } from "@ftptech/x402-canton-ledger";
 // Value import:
@@ -20,6 +20,8 @@ import {
   type CircuitBreakerConfig,
 } from "../rate-limit.js";
 import { validateFacilitatorRequestShape } from "./validate-body.js";
+import { claimedRepeatKey, inlineRepeatOf, isInlineCarriage } from "./inline-transfer.js";
+import { ScanBudgetRefusedError } from "../scan-budget.js";
 import { createHash } from "node:crypto";
 
 /**
@@ -115,6 +117,9 @@ export interface SettleRouteServices extends ValidationServices {
    *   enforce  an unresolved mark is resolved, and stays 503 if it cannot be.
    */
   settleDispatchMark?: "off" | "observe" | "enforce" | undefined;
+  /** How a repeat of a settled payment and an unknown outcome are answered
+   *  (config.settleAnswers): "spec" (default) or "legacy". */
+  settleAnswers?: "spec" | "legacy" | undefined;
   /** transfer-factory master switch (config.tfEnabled). When false/absent a
    *  transfer-factory /settle is rejected fail-closed with
    *  invalid_exact_canton_transfer_factory_disabled BEFORE any ledger work
@@ -199,6 +204,8 @@ export async function registerSettleRoute(
   const metrics = svc.metrics;
   /** Rollout stage for the unknown-outcome guard; see SettleRouteServices. */
   const markMode = svc.settleDispatchMark ?? "off";
+  /** How repeats and unknown outcomes are answered; see answerSettledRecord. */
+  const answers = svc.settleAnswers ?? "spec";
   app.post(
     "/settle",
     async (req, reply): Promise<SettleResponse | { error: string }> => {
@@ -283,8 +290,78 @@ export async function registerSettleRoute(
         return reply.code(429).send({ error: "rate_limited" });
       }
 
+      // 0. A REPEAT IS ANSWERED FROM ITS RECORD, BEFORE ANYTHING THAT READS THE
+      //    CLOCK OR LIVE STATE.
+      //
+      // The record used to be read only after the full validation, whose rules
+      // read the clock (expired at executeBefore - 5 s) and live Scan and
+      // topology state. A repeat of a payment we had settled therefore came
+      // back `invalid_exact_canton_expired` once its deadline passed (120 s by
+      // default), or `preapproval_missing` when Scan stumbled, and a merchant
+      // told the payer to pay again for a payment that had gone through.
+      // Looked up here by the client's claimed hash, which costs one read and
+      // no hashing when there is no record (every first settle); answered only
+      // when the bytes hash to that key and are a transfer of exactly what this
+      // route asks for (inlineRepeatOf).
+      //
+      // Under "spec" only, where the answer is a refusal carrying the updateId.
+      // Under "legacy" it is a success, and giving it past the deadline would
+      // let a merchant that keeps no record of its own serve the payment for as
+      // long as the record lives (24 h); legacy reads the record after
+      // validation, as before. A dispatched record is answered here only where
+      // the mark is trusted (enforce); observe counts it once, further down.
+      if (
+        answers === "spec" &&
+        svc.inlineSettles &&
+        svc.tfEnabled !== false &&
+        body.paymentRequirements.network === svc.network &&
+        isInlineCarriage(body.paymentPayload?.payload)
+      ) {
+        const claimed = claimedRepeatKey(body);
+        const known = claimed ? await readRecord(claimed) : null;
+        if (claimed && known && (known.state === "settled" || markMode === "enforce")) {
+          const repeat = await inlineRepeatOf(body, {
+            facilitatorParty: svc.facilitatorParty,
+            ...(svc.inline?.acceptedFeePayers?.length ? { acceptedFeePayers: svc.inline.acceptedFeePayers } : {}),
+            ...(svc.inline?.registryTrustedParties ? { registryTrustedParties: svc.inline.registryTrustedParties } : {}),
+            ...(svc.inline?.tokenRegistries ? { tokenRegistries: svc.inline.tokenRegistries } : {}),
+          });
+          if (repeat && repeat.key === claimed) {
+            const answer = await answerRecord(req, reply, claimed, {
+              payer: repeat.payer,
+              merchant: body.paymentRequirements.payTo,
+              instrumentAdmin: body.paymentRequirements.extra?.instrumentId?.admin ?? "",
+            });
+            if (answer) return answer;
+          }
+        }
+      }
+
       // 1. Re-verify (defense in depth).
-      const v = await runValidation(body, svc, Date.now());
+      let v: Awaited<ReturnType<typeof runValidation>>;
+      try {
+        v = await runValidation(body, svc, Date.now());
+      } catch (err) {
+        // The shared Scan budget shed the Rule 7 lookup (an unserved merchant
+        // while Scan is busy). Nothing was decided and nothing submitted. 503,
+        // not success:false, because a refusal becomes a 402 and the shipped
+        // client then pays again. Express and next answer a non-2xx /settle
+        // that is not the pending answer with 502 "do NOT pay again; retry the
+        // same payment", and the shipped client re-sends that same payment on a
+        // 5xx, twice by default, never a new one; a 5xx still there after that
+        // is PAYMENT_UNCONFIRMED. Rare by construction: /verify read the same
+        // record moments before, so it is usually cached.
+        if (err instanceof ScanBudgetRefusedError) {
+          req.log.warn({ reason: err.reason }, "settle: Rule 7 lookup shed by the Scan budget");
+          metrics?.recordRateLimited("scan");
+          metrics?.recordSettle("scan_busy");
+          return reply
+            .code(503)
+            .header("Retry-After", String(err.retryAfterSeconds))
+            .send({ error: "scan_busy" });
+        }
+        throw err;
+      }
       if (!v.ok) {
         // A validation reject was previously SILENT — a whole class of rejects
         // (counter_not_ready, merchant_not_registered, transfer_command_not_found,
@@ -301,6 +378,8 @@ export async function registerSettleRoute(
           },
           "settle validation failed"
         );
+        // No payer in the answer: a refusal names one only once it is proven,
+        // and these can come before the signature check.
         return failed(v.reason);
       }
 
@@ -341,110 +420,12 @@ export async function registerSettleRoute(
         // us relay the same transaction twice.
         const idemKey = v.preparedTxHashHex;
         if (idemKey && svc.inlineSettles) {
-          const record =
-            markMode === "off"
-              ? await svc.inlineSettles.getRecord(idemKey).then((r) =>
-                  // With the mark off, a dispatched row from a previous
-                  // enforce/observe run must read as "never seen", or turning
-                  // the flag back off would not actually restore the old
-                  // behaviour. Settled records still answer, as they always did.
-                  r?.state === "settled" ? r : null
-                )
-              : await svc.inlineSettles.getRecord(idemKey);
-          if (record?.state === "settled") {
-            req.log.info(
-              { payer: v.payer, merchant: v.merchant, updateId: record.updateId },
-              "/settle: inline retry answered from the idempotency record (no relay, no traffic burned)"
-            );
-            metrics?.recordSettle("ok");
-            return {
-              success: true,
-              payer: v.payer,
-              transaction: record.updateId,
-              network: svc.network,
-            };
-          }
-          if (record?.state === "dispatched" && markMode === "observe") {
-            // Measurement only. Counted and named, then straight on to the
-            // normal path — the caller sees exactly what it sees today.
-            metrics?.recordSettle("outcome_unknown_observed");
-            req.log.warn(
-              { payer: v.payer, merchant: v.merchant, idemKey },
-              "/settle: [observe] this transaction was already dispatched with no recorded " +
-                "outcome — enforce would answer 503 here; proceeding as today"
-            );
-          } else if (record?.state === "dispatched") {
-            // GO AND LOOK BEFORE SAYING "I DO NOT KNOW".
-            //
-            // The mark carries the submissionId and the ledger offset from just
-            // before the submit, so the completion for it is a READ away — no
-            // second submission, no traffic. Resolving turns the honest-but-
-            // useless 503 into the real answer, which is what the payer and the
-            // merchant actually need.
-            // `resolveDispatched` is optional on the service on purpose: an
-            // older wiring, or a test double, may not have it. Missing it means
-            // we cannot resolve — which is "unknown", not a crash. Without this
-            // the enforce path threw a TypeError and the caller got a 500,
-            // turning a careful "I do not know" into an opaque server error.
-            const resolved =
-              typeof tfSvc.resolveDispatched === "function" &&
-              record.submissionId !== undefined &&
-              record.beginExclusive !== undefined
-                ? await tfSvc.resolveDispatched({
-                    payer: v.payer,
-                    submissionId: record.submissionId,
-                    beginExclusive: record.beginExclusive,
-                    ...(record.participant !== undefined ? { participant: record.participant } : {}),
-                    instrumentAdmin: v.instrumentAdmin,
-                  })
-                : { state: "unknown" as const };
-            if (resolved.state === "settled" && resolved.transferred) {
-              req.log.info(
-                { payer: v.payer, merchant: v.merchant, updateId: resolved.updateId },
-                "/settle: resolved a previously unknown inline outcome — it had settled; recording and answering success"
-              );
-              if (idemKey && svc.inlineSettles) {
-                await svc.inlineSettles.recordSettled(idemKey, resolved.updateId);
-              }
-              metrics?.recordSettle("ok");
-              return {
-                success: true,
-                payer: v.payer,
-                transaction: resolved.updateId,
-                network: svc.network,
-              };
-            }
-            if (resolved.state === "rejected") {
-              // The participant refused it: nothing moved, and the payer is
-              // free to try again. Clear the mark so they can.
-              req.log.info(
-                { payer: v.payer, merchant: v.merchant, reason: resolved.message },
-                "/settle: resolved a previously unknown inline outcome — the participant had rejected it; nothing moved"
-              );
-              if (idemKey && svc.inlineSettles) {
-                await svc.inlineSettles.clearDispatched(idemKey);
-              }
-              return failed("invalid_exact_canton_execute_failed");
-            }
-            // WE ALREADY HANDED THIS TO THE PARTICIPANT AND NEVER SAW THE
-            // ANSWER. Relaying again is the one thing we must not do: the
-            // submission names input holdings that may already be archived, so
-            // the second attempt comes back as `input_contention` — which this
-            // route reports as "nothing moved, retryable", and the caller acts
-            // on that by minting a FRESH transfer. One purchase, two payments,
-            // the second recorded nowhere.
-            //
-            // The truth is that we do not know, and 503 is how this route says
-            // that (see `inconclusive`): the shipped middlewares refuse to turn
-            // a non-2xx settle into a 402, so the caller retries the SAME
-            // envelope instead of paying again.
-            req.log.error(
-              { payer: v.payer, merchant: v.merchant, idemKey },
-              "/settle: this transaction was already dispatched and its outcome was never " +
-                "recorded — refusing to relay it a second time; answering 503 (may be settled on-ledger)"
-            );
-            return inconclusive(reply);
-          }
+          const answer = await answerRecord(req, reply, idemKey, {
+            payer: v.payer,
+            merchant: v.merchant,
+            instrumentAdmin: v.instrumentAdmin,
+          });
+          if (answer) return answer;
         }
 
         // `signedBy` is the payer's own NAMESPACE fingerprint, and deliberately
@@ -578,13 +559,9 @@ export async function registerSettleRoute(
                 { payer: v.payer, merchant: v.merchant, updateId: settled },
                 `/settle: concurrent duplicate answered from the sibling's record (${how})`
               );
-              metrics?.recordSettle("ok");
-              return {
-                success: true,
-                payer: v.payer,
-                transaction: settled,
-                network: svc.network,
-              };
+              // The sibling relayed it and answers success; this duplicate is a
+              // repeat of a settled payment.
+              return answerSettledRecord(settled, v.payer);
             }
           }
           // The sibling has not finished within the window. Report something
@@ -593,16 +570,21 @@ export async function registerSettleRoute(
           // paying again would be the wrong response.
           req.log.warn(
             { payer: v.payer, merchant: v.merchant },
-            "/settle: concurrent duplicate still in flight after waiting; outcome UNKNOWN, answering 503"
+            "/settle: concurrent duplicate still in flight after waiting; outcome UNKNOWN"
           );
-          return inconclusive(reply);
+          return inconclusive(reply, { hash: idemKey ?? "", payer: v.payer });
         };
+        // Whether a mark guards a retry of this submission. Without one (off,
+        // or a write that failed) an unknown outcome keeps its answer from
+        // before the guard: telling the caller to retry would relay again.
+        let markGuards = false;
         if (idemKey && svc.inlineSettles && markMode !== "off") {
           const first = await svc.inlineSettles.recordDispatched(idemKey, {
             submissionId: inlineSubmissionId,
             ...(inlineBegin !== undefined ? { beginExclusive: inlineBegin } : {}),
             ...(inlineParticipant !== undefined ? { participant: inlineParticipant } : {}),
           });
+          markGuards = first !== "unrecorded";
           if (!first) {
             // A concurrent settle recorded these bytes between our read and
             // our write, and is relaying them now. A second relay is harmless
@@ -689,7 +671,7 @@ export async function registerSettleRoute(
           // So off and observe do not answer from here at all: they fall through
           // to the classification below, which IS the pre-guard code. Identical
           // by construction rather than by my reading of it.
-          if (markMode !== "off" && answerNeverArrived(e)) {
+          if (markMode !== "off" && markGuards && answerNeverArrived(e)) {
             if (markMode === "observe") {
               // Counted and named, then straight on. The breaker is NOT fed
               // here — the fall-through feeds it, and feeding it twice would
@@ -704,9 +686,9 @@ export async function registerSettleRoute(
               if (isTrafficError(e)) breaker.recordTrafficFailure(Date.now());
               req.log.error(
                 { payer: v.payer, merchant: v.merchant, err: e },
-                "/settle: inline submit threw without proving nothing committed; outcome UNKNOWN, answering 503"
+                "/settle: inline submit threw without proving nothing committed; outcome UNKNOWN"
               );
-              return inconclusive(reply);
+              return inconclusive(reply, { hash: idemKey ?? "", payer: v.payer });
             }
           }
           const transient = isTrafficError(e);
@@ -820,14 +802,20 @@ export async function registerSettleRoute(
         // Success is recorded only AFTER the funds-moved gate, so a commit that
         // moved nothing can never look like a healthy settle to the breaker.
         breaker.recordSuccess(Date.now());
+        // ...and only a payment that moved funds makes its merchant one we
+        // serve: its Rule 7 lookups become the payment path in the shared Scan
+        // budget. A valid /verify cannot, since anyone can produce one.
+        svc.noteServedMerchant?.(v.merchant);
 
         // Record for idempotency. Best-effort by construction: the funds have
         // already moved, so a store failure must never turn a completed payment
-        // into an error response.
+        // into an error response. False means a concurrent repeat resolved this
+        // same commit and recorded it first, and it was answered success.
+        let firstAnswer = true;
         if (idemKey && svc.inlineSettles) {
-          await svc.inlineSettles
+          firstAnswer = await svc.inlineSettles
             .recordSettled(idemKey, ex.updateId)
-            .catch(() => undefined);
+            .catch(() => true);
         }
 
         // Attribution — same shape and same fail-open semantics as the legacy
@@ -862,6 +850,7 @@ export async function registerSettleRoute(
           })().catch(() => {});
         }
 
+        if (!firstAnswer) return answerSettledRecord(ex.updateId, v.payer);
         metrics?.recordSettle("ok");
         return {
           success: true,
@@ -924,6 +913,145 @@ export async function registerSettleRoute(
     return !isTrafficError(err);
   }
 
+  /** The idempotency record for `key`, as this mark mode lets it be read. */
+  async function readRecord(key: string) {
+    if (!svc.inlineSettles) return null;
+    return markMode === "off"
+      ? svc.inlineSettles.getRecord(key).then((r) =>
+          // With the mark off, a dispatched row from a previous enforce/observe
+          // run must read as "never seen", or turning the flag back off would
+          // not actually restore the old behaviour. Settled records still
+          // answer, as they always did.
+          r?.state === "settled" ? r : null
+        )
+      : svc.inlineSettles.getRecord(key);
+  }
+
+  /**
+   * The answer the record for `idemKey` gives, or null to go on and relay.
+   *
+   * IDEMPOTENCY. The ledger already makes a replay harmless — the signed
+   * transfer names specific input holdings, so a second submission finds them
+   * archived and is rejected. But we only learn that BY SUBMITTING, and every
+   * submission burns Global-Synchronizer traffic. So a settle we already
+   * completed is answered from the record instead of paying to be told
+   * "already spent". Keyed on the RECOMPUTED hash the verifier proved against
+   * the bytes, never on the client's claimed hash alone: the claim is accepted
+   * in two spellings, so a caller could re-spell it into a fresh bucket.
+   */
+  async function answerRecord(
+    req: FastifyRequest,
+    reply: FastifyReply,
+    idemKey: string,
+    who: { payer: string; merchant: string; instrumentAdmin: string }
+  ): Promise<SettleResponse | { error: string } | null> {
+    const record = await readRecord(idemKey);
+    if (record?.state === "settled") {
+      req.log.info(
+        { payer: who.payer, merchant: who.merchant, updateId: record.updateId, answers },
+        "/settle: repeat of a settled payment answered from the idempotency record (no relay, no traffic burned)"
+      );
+      return answerSettledRecord(record.updateId, who.payer);
+    }
+    if (record?.state === "dispatched" && markMode === "observe") {
+      // Measurement only. Counted and named, then straight on to the normal
+      // path — the caller sees exactly what it sees today.
+      metrics?.recordSettle("outcome_unknown_observed");
+      req.log.warn(
+        { payer: who.payer, merchant: who.merchant, idemKey },
+        "/settle: [observe] this transaction was already dispatched with no recorded " +
+          "outcome — enforce would not relay it again; proceeding as today"
+      );
+      return null;
+    }
+    if (record?.state === "dispatched") {
+      // GO AND LOOK BEFORE SAYING "I DO NOT KNOW".
+      //
+      // The mark carries the submissionId and the ledger offset from just
+      // before the submit, so the completion for it is a READ away — no second
+      // submission, no traffic. `resolveDispatched` is optional on the service
+      // on purpose: an older wiring, or a test double, may not have it, which
+      // is "unknown", not a crash.
+      const tfSvc = svc.transferFactory;
+      const resolved =
+        tfSvc &&
+        typeof tfSvc.resolveDispatched === "function" &&
+        record.submissionId !== undefined &&
+        record.beginExclusive !== undefined
+          ? await tfSvc.resolveDispatched({
+              payer: who.payer,
+              submissionId: record.submissionId,
+              beginExclusive: record.beginExclusive,
+              ...(record.participant !== undefined ? { participant: record.participant } : {}),
+              instrumentAdmin: who.instrumentAdmin,
+            })
+          : { state: "unknown" as const };
+      if (resolved.state === "settled" && resolved.transferred) {
+        // Answered with success once, as the scheme says, then recorded: a
+        // later repeat meets the settled record, and so does a concurrent one
+        // that recorded it a moment after this.
+        req.log.info(
+          { payer: who.payer, merchant: who.merchant, updateId: resolved.updateId },
+          "/settle: resolved a previously unknown inline outcome — it had settled; recording and answering success"
+        );
+        svc.noteServedMerchant?.(who.merchant);
+        const first = (await svc.inlineSettles?.recordSettled(idemKey, resolved.updateId)) ?? true;
+        if (!first) return answerSettledRecord(resolved.updateId, who.payer);
+        metrics?.recordSettle("ok");
+        return { success: true, payer: who.payer, transaction: resolved.updateId, network: svc.network };
+      }
+      if (resolved.state === "rejected") {
+        // The participant refused it: nothing moved, and the payer is free to
+        // try again. Clear the mark so they can.
+        req.log.info(
+          { payer: who.payer, merchant: who.merchant, reason: resolved.message },
+          "/settle: resolved a previously unknown inline outcome — the participant had rejected it; nothing moved"
+        );
+        await svc.inlineSettles?.clearDispatched(idemKey);
+        return failed("invalid_exact_canton_execute_failed", who.payer);
+      }
+      // WE ALREADY HANDED THIS TO THE PARTICIPANT AND NEVER SAW THE ANSWER.
+      // Relaying again is the one thing we must not do: the submission names
+      // input holdings that may already be archived, so the second attempt
+      // comes back as `input_contention` — "nothing moved, retryable" — and the
+      // caller would mint a FRESH transfer. One purchase, two payments.
+      req.log.error(
+        { payer: who.payer, merchant: who.merchant, idemKey },
+        "/settle: this transaction was already dispatched and its outcome was never " +
+          "recorded — refusing to relay it a second time (may be settled on-ledger)"
+      );
+      return inconclusive(reply, { hash: idemKey, payer: who.payer });
+    }
+    return null;
+  }
+
+  /**
+   * A repeat of a payment that settled.
+   *
+   * The scheme says a facilitator MUST NOT answer a settle from a remembered
+   * commit: a merchant on the official SDK keeps no record of its own, and the
+   * success from our record served the same payment on every repeat until its
+   * deadline. "spec" answers a refusal that still carries the updateId, which
+   * our middlewares treat as the payment's ticket (served once, again only if
+   * the delivery failed). "legacy" keeps the success, for middleware older than
+   * express 0.2.9 / next 0.2.8, whose retry of the same payment after a failed
+   * delivery depends on it.
+   */
+  function answerSettledRecord(updateId: string, payer: string): SettleResponse {
+    if (answers === "legacy") {
+      metrics?.recordSettle("ok");
+      return { success: true, payer, transaction: updateId, network: svc.network };
+    }
+    metrics?.recordSettle("already_settled");
+    return {
+      success: false,
+      errorReason: "invalid_exact_canton_payment_already_settled",
+      transaction: updateId,
+      network: svc.network,
+      payer,
+    };
+  }
+
   /**
    * The outcome is UNKNOWN — we cannot say the payment failed, and saying so is
    * the one answer that costs the payer money.
@@ -944,8 +1072,30 @@ export async function registerSettleRoute(
    * envelope, never a signal to mint a new payment.
    */
   function inconclusive(
-    reply: FastifyReply
+    reply: FastifyReply,
+    pending?: { hash: string; payer: string }
   ): { error: string } | SettleResponse {
+    // THE SCHEME'S ANSWER (settleAnswers "spec", mark enforced):
+    // `settlement_pending` with the prepared transaction's hash, which a server
+    // retries with the same payment and a client does not pay again over.
+    // Only under enforce, where the retry looks the submission up: without the
+    // mark it would relay again, could meet its own consumed inputs as
+    // contention ("nothing moved"), and the payer would be told to pay again.
+    // Sent as 503 with the body: the official TS and Go servers read the body
+    // of a failed settle and retry it, and our middlewares older than express
+    // 0.2.9 / next 0.2.8 answer any non-2xx settle "do NOT pay again", where
+    // they would turn a 200 refusal into a 402.
+    if (answers === "spec" && markMode === "enforce") {
+      metrics?.recordSettle("outcome_unknown");
+      void reply.code(503).header("Retry-After", "3");
+      return {
+        success: false,
+        errorReason: "settlement_pending",
+        transaction: pending?.hash ?? "",
+        network: svc.network,
+        ...(pending?.payer ? { payer: pending.payer } : {}),
+      };
+    }
     // WHAT THIS HELPER MAY AND MAY NOT SPEAK FOR.
     //
     // Reachable from four places, and they do NOT share a pre-guard answer:
@@ -982,14 +1132,23 @@ export async function registerSettleRoute(
       ? T extends { ok: false; reason: infer R }
         ? R
         : never
-      : never
+      : never,
+    payer?: string
   ): SettleResponse {
     // Single recorder for every `failed()` return so settle_total{result} is
     // attributed without sprinkling .inc() across the handler. The breaker /
     // rate-limit / malformed-body refusals return via reply.send() (not
     // failed()) and are counted at their own sites, so there is no double-count.
     metrics?.recordSettle(classifySettleFailure(reason));
-    return { success: false, errorReason: reason, transaction: "" };
+    // `network` is required in a SettlementResponse: the official clients reject
+    // a refusal without it as malformed, and the reason never reached the payer.
+    return {
+      success: false,
+      errorReason: reason,
+      transaction: "",
+      network: svc.network,
+      ...(payer ? { payer } : {}),
+    };
   }
 }
 

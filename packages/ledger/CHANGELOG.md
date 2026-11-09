@@ -1,5 +1,26 @@
 # @ftptech/x402-canton-ledger
 
+## 0.6.5
+
+### Patch Changes
+
+- d418335: `recomputeHash` refuses a transaction that takes more than 100,000 hashing steps (strings, list and record elements, parts of dotted names, identifiers) or nests deeper than 1,024 object levels, with `PreparedTransactionBudgetError`, which is also a `PreparedTransactionGraphError`. The hasher blocks the event loop for about 2 to 5 µs a step, so a transaction stuffed with dotted names could hold it for seconds. It also refuses more node seeds than nodes. Real transactions take at most about 8,000 steps and 45 levels. Pass `{ maxSteps }` to set another budget.
+
+## 0.6.4
+
+### Patch Changes
+
+- fb3fec7: `recomputeHash` checks the node graph before hashing. It throws the new `PreparedTransactionGraphError` when a node is reached twice, a child is missing, a node id repeats, or the transaction is over `MAX_HASHED_NODES` (10,000 nodes) or `MAX_HASHED_NODE_DEPTH` (100 levels). A cycle used to send the hasher into endless recursion, and a shared child made it hash a subtree once per path. The limits match `@canton-network/core-tx-hashing`.
+
+## 0.6.3
+
+### Patch Changes
+
+- `CantonClient.getUpdatesPage` reads one bounded page of `/v2/updates` in the
+  ledger-effects shape and refuses any row or event it cannot read, so a
+  caller's cursor never moves past one. `CreatedEvent` and the new
+  `LedgerExercisedEvent` carry the participant's `acsDelta`.
+
 ## 0.6.2
 
 ### Patch Changes

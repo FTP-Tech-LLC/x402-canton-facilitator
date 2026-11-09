@@ -883,6 +883,9 @@ export interface DecodedNode {
         /** Create.signatories / stakeholders (also folded into partyMeta). */
         signatories?: string[] | undefined;
         stakeholders?: string[] | undefined;
+        /** Create.contract_id: what a later node of the same transaction (an
+         *  Archive of a transient) refers to it by. */
+        contractId?: string | undefined;
       }
     | undefined;
   /** node_id references this node declares as its children (Exercise.children /
@@ -1107,6 +1110,7 @@ function decodeV1Node(v1Body: Uint8Array): {
     // consequence Create's key (a position the V3 hash signs) surfaces.
     const cKey = lenFieldUnique(cFields, CREATE_KEY, "Create.key");
     if (cKey !== undefined) collectGlobalKeyWithMaintainersParties(cKey, partyMeta, 0);
+    const cCid = lenFieldUnique(cFields, CREATE_CONTRACT_ID, "Create.contract_id");
     return {
       kind: "create",
       // Capture the created template + argument so an arm can pin a NUMERIC
@@ -1118,6 +1122,7 @@ function decodeV1Node(v1Body: Uint8Array): {
         argument: arg,
         signatories: stringFields(cFields, CREATE_SIGNATORIES),
         stakeholders: stringFields(cFields, CREATE_STAKEHOLDERS),
+        contractId: cCid !== undefined ? utf8(cCid) : undefined,
       },
       children: [],
       values: arg !== undefined ? [arg] : [],
@@ -1681,11 +1686,12 @@ function assertTimingPlausible(decoded: DecodedPrepared, nowMs: number): void {
  * and ARGUMENT are pinned elsewhere; this closes the template/contract-confusion
  * surface by additionally requiring the exercised template's `module:entity`
  * qualified name to equal caller intent (the package id is intentionally not
- * pinned — it changes across upgrades). No pin ⇒ unchanged behaviour.
+ * pinned — it changes across upgrades). A list admits any one of its names.
+ * No pin ⇒ unchanged behaviour.
  */
 function assertTemplateMatches(
   ex: DecodedExercise,
-  expected: string | undefined
+  expected: string | readonly string[] | undefined
 ): void {
   if (expected === undefined) return;
   if (ex.templateQualifiedName === undefined) {
@@ -1694,7 +1700,8 @@ function assertTemplateMatches(
         `${JSON.stringify(expected)} — refusing to sign`
     );
   }
-  if (ex.templateQualifiedName !== expected) {
+  const admitted = typeof expected === "string" ? [expected] : expected;
+  if (!admitted.includes(ex.templateQualifiedName)) {
     throw new PreparedTransferMismatchError(
       `relay-prepared exercise runs against template ${JSON.stringify(ex.templateQualifiedName)} — ` +
         `expected ${JSON.stringify(expected)} — refusing to sign (template/contract confusion)`
@@ -2188,6 +2195,61 @@ function matchPreapprovalProvider(
 }
 
 /**
+ * True when the signed bytes deliver this Amulet transfer one-step: exactly one
+ * receiver preapproval input (rules 1-4 above, self-provider allowed) and exactly
+ * one TransferPreapproval_SendV2 on it for `amount`. Without the preapproval the
+ * factory creates a pending instruction the sender can withdraw. Never throws.
+ */
+export function deliversViaAmuletPreapproval(
+  decoded: DecodedPrepared,
+  receiver: string,
+  instrumentAdmin: string,
+  amount: string
+): boolean {
+  const candidates = decoded.inputContracts.filter(
+    (ic) => ic.templateQualifiedName === PREAPPROVAL_TEMPLATE
+  );
+  if (candidates.length !== 1) return false;
+  const ic = candidates[0]!;
+  if (ic.argument === undefined || ic.contractId === undefined) return false;
+  let pre: ExtractedTransferPreapproval | undefined;
+  try {
+    // A label/position divergence throws here.
+    pre = extractTransferPreapproval(ic.argument);
+  } catch {
+    return false;
+  }
+  if (pre === undefined || pre.receiver !== receiver || pre.dso !== instrumentAdmin) {
+    return false;
+  }
+  const want = new Set([pre.dso, pre.receiver, pre.provider]);
+  const sigs = new Set(ic.signatories);
+  if (sigs.size !== want.size || [...want].some((p) => !sigs.has(p))) return false;
+
+  const sends = decoded.nodes.filter(
+    (n) => n.exercise !== undefined && PREAPPROVAL_SEND_CHOICES.has(n.exercise.choiceId)
+  );
+  if (sends.length !== 1) return false;
+  const ex = sends[0]!.exercise!;
+  if (
+    ex.choiceId !== "TransferPreapproval_SendV2" ||
+    ex.templateQualifiedName !== PREAPPROVAL_TEMPLATE ||
+    ex.contractId !== ic.contractId
+  ) {
+    return false;
+  }
+  // TransferPreapproval_SendV2 declaration order:
+  // [0] context [1] inputs [2] amount [3] sender [4] description [5] meta
+  try {
+    const amountE = entryByDeclOrder(recordEntries(ex.chosenValue), 2, "amount");
+    const got = amountE ? leafOf(amountE.value) : undefined;
+    return got?.kind === "numeric" && canonicalAmount(got.value) === canonicalAmount(amount);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Cross-check the authoritative submitter (Metadata.submitter_info.act_as):
  * REQUIRE a non-empty act_as whose only party is the sender. The non-empty
  * requirement closes GAP A3 (an empty act_as previously skipped this check
@@ -2341,6 +2403,41 @@ function readMemo(value: Uint8Array): string | undefined {
     found = leaf.value;
   }
   return found;
+}
+
+/**
+ * Read every `transfer.meta.values` entry of a TransferFactory_Transfer choice
+ * argument, for a caller that pins the whole map. Undefined when the transfer
+ * has no meta or its values are not a TextMap. A key carried twice is refused
+ * for the same reason as a doubled `x402.memo`.
+ */
+function readTransferMeta(chosenValue: Uint8Array): Map<string, string> | undefined {
+  const transferVal = entryByDeclOrder(recordEntries(chosenValue), 1, "transfer")?.value;
+  if (!transferVal) return undefined;
+  const t = recordEntries(transferVal);
+  const metaE = t.length > 7 ? entryByDeclOrder(t, 7, "meta") : undefined;
+  if (!metaE) return undefined;
+  const valuesE = entryByDeclOrder(recordEntries(metaE.value), 0, "values");
+  if (!valuesE) return undefined;
+  assertSingleValueMember(valuesE.value);
+  const tm = lenFieldUnique(decodeMessage(valuesE.value), V_TEXT_MAP, "Value.text_map");
+  if (tm === undefined) return undefined;
+  const out = new Map<string, string>();
+  for (const entry of lenFields(decodeMessage(tm), TEXT_MAP_ENTRIES)) {
+    const ef = decodeMessage(entry);
+    const key = lenFieldUnique(ef, TM_KEY, "TextMap.Entry.key");
+    const v = lenFieldUnique(ef, TM_VALUE, "TextMap.Entry.value");
+    const leaf = v !== undefined ? leafOf(v) : undefined;
+    if (key === undefined || !leaf || leaf.kind !== "text") {
+      throw new PreparedDecodeError("transfer.meta carries an entry that is not text");
+    }
+    const k = utf8(key);
+    if (out.has(k)) {
+      throw new PreparedDecodeError(`transfer.meta carries ${JSON.stringify(k)} twice — refusing to pick one`);
+    }
+    out.set(k, leaf.value);
+  }
+  return out;
 }
 
 /**
@@ -2499,7 +2596,15 @@ export function extractTransfer(chosenValue: Uint8Array): ExtractedTransfer {
   // checks below and we refuse to sign rather than search elsewhere.
   const transferVal = entryByDeclOrder(top, 1, "transfer")?.value;
   if (!transferVal) throw new PreparedDecodeError("could not locate transfer record in choice argument");
+  return readTransferRecord(transferVal);
+}
 
+/**
+ * Read a token-standard `Transfer` record: the root's `transfer` and the one a
+ * DA Registry Utility `TransferRule_DirectTransfer` consequence carries are
+ * the same type, so both go through here.
+ */
+function readTransferRecord(transferVal: Uint8Array): ExtractedTransfer {
   const t = recordEntries(transferVal);
 
   // Read each money-critical field at its DAML DECLARATION-ORDER POSITION (what
@@ -2509,18 +2614,12 @@ export function extractTransfer(chosenValue: Uint8Array): ExtractedTransfer {
   // (trailing requestedAt/executeBefore/inputHoldingCids/meta are not money-
   // critical here; party leaves in them are still covered by the backstop).
   //
-  // MEMO (merchant memo enforcement): the relay stamps the merchant-required memo
-  // into transfer.meta as `x402.memo` — a TextMap *string* value. It is
-  // deliberately NOT pinned by verify-before-sign: extractTransfer reads only
-  // positions 0–3, and the foreign-party backstop (collectPartyLeaves →
-  // assertNoForeignParties) scans PARTY leaves only, so a text memo value is
-  // tolerated and does not alter the transaction STRUCTURE (the meta TextMap is
-  // always present — empty today — so this only adds an entry inside it). This is
-  // safe by design: the memo is not money-critical, so a relay that alters or
-  // drops it can at worst make the MERCHANT's server-side /verify reject the
-  // payment (invalid_exact_canton_memo_mismatch) — it can never redirect funds.
-  // Pinning it here would only trade that harmless reject for a client-side
-  // refuse-to-sign, so we leave the fail-closed money scanner unchanged.
+  // META is read here only for `x402.memo`; the foreign-party backstop scans
+  // PARTY leaves only, so text values in the map never trip it. Pinning meta is
+  // the caller's call: the facilitator pins the merchant's memo (Rule 12), and
+  // a caller that built the whole map (a swap: its floor or buy token) pins all
+  // of it via `meta`. A relay-altered x402.memo on a payment can at worst make
+  // the merchant's /verify refuse it; it cannot redirect funds.
   const senderE = entryByDeclOrder(t, 0, "sender");
   const receiverE = entryByDeclOrder(t, 1, "receiver");
   const amountE = entryByDeclOrder(t, 2, "amount");
@@ -2605,8 +2704,27 @@ export interface PreparedTransferExpectation {
   /** Optional, caller-intent template `module:entity` qualified name of the
    *  TransferFactory the choice runs against (e.g. the token-standard transfer
    *  factory). When supplied, the exercise's template_id is pinned, closing the
-   *  template/contract-confusion surface. */
-  templateQualifiedName?: string;
+   *  template/contract-confusion surface. A list admits any one of them: a DA
+   *  Registry Utility transfer roots on the receiver's TransferPreapproval when
+   *  it settles direct and on the AllocationFactory otherwise. */
+  templateQualifiedName?: string | readonly string[];
+  /** Optional, caller-intent `transfer.meta.values`. When supplied, the signed
+   *  map must carry exactly these keys with exactly these values: nothing
+   *  added, dropped or changed. A venue reads its swap terms from this map
+   *  (Tradecraft the slippage floor, Cantex the token to buy), so a caller
+   *  that built it pins it. */
+  meta?: Readonly<Record<string, string>>;
+  /** Optional, the network's DSO, known out of band. When the pinned
+   *  `instrumentAdmin` is this party the transfer is Canton Coin, and its root
+   *  contract must be signed by the DSO alone (the DSO's ExternalPartyAmuletRules).
+   *  The instrument id does not decide that: a registry may name its token
+   *  "Amulet". Omitted, the root's signatories are not pinned. */
+  dsoParty?: string;
+  /** Optional, caller-intent latest `transfer.executeBefore`, epoch ms. When
+   *  supplied, the signed deadline must be present and not later. Until it
+   *  passes, a transfer nobody took keeps its input locked and stays
+   *  collectable; an earlier one costs only liveness. */
+  executeBeforeMaxMs?: number;
   /** Optional, caller-intent contract id of the factory the exercise targets.
    *  When supplied, Exercise.contract_id is pinned by exact equality (fail-closed
    *  on divergence) — defense-in-depth closing the resolve→prepare TOCTOU. No-op
@@ -2997,6 +3115,32 @@ export function assertPreparedTransferMatches(
   assertSynchronizerMatches(decoded.synchronizerId, expect.synchronizerId);
   assertTimingPlausible(decoded, expect.nowMs ?? Date.now());
 
+  // The rest of the terms a caller built into its own command. A swap's terms
+  // live in meta (Tradecraft reads the slippage floor there, Cantex the token
+  // to buy), and executeBefore is how long an input nobody takes stays locked.
+  // Measured: a relay that dropped the floor, changed the buy token or moved
+  // the deadline to 2100 kept sender, receiver and amount intact and was signed.
+  if (expect.meta !== undefined) {
+    const got = readTransferMeta(ex.chosenValue);
+    const want = Object.entries(expect.meta);
+    if (got === undefined || got.size !== want.length || want.some(([k, v]) => got.get(k) !== v)) {
+      throw new PreparedTransferMismatchError(
+        `transfer meta ${got === undefined ? "(absent)" : JSON.stringify(Object.fromEntries(got))} — ` +
+          `intended ${JSON.stringify(expect.meta)} — refusing to sign (a venue reads its terms from it)`
+      );
+    }
+  }
+  if (expect.executeBeforeMaxMs !== undefined) {
+    const eb = t.executeBeforeMs;
+    if (eb === undefined || !(eb <= expect.executeBeforeMaxMs)) {
+      throw new PreparedTransferMismatchError(
+        `transfer executeBefore ${eb === undefined ? "(absent)" : isoOrMs(eb)} — intended no later ` +
+          `than ${isoOrMs(expect.executeBeforeMaxMs)} — refusing to sign (until then the input stays ` +
+          `locked and the transfer collectable)`
+      );
+    }
+  }
+
   // Cross-check the authoritative submitter: REQUIRE a non-empty act_as whose
   // only party is the sender (closes GAP A3 — an empty act_as no longer skips
   // this). Placed after the field comparison so a consistent-attacker tx
@@ -3032,6 +3176,188 @@ export function assertPreparedTransferMatches(
     preapprovalProvider,
     expect.trustedRegistryParties ?? new Set()
   );
+
+  assertDeliveryMatchesRoot(decoded, t, expect);
+  assertCreatesAndRootSigned(decoded, ex, t, expect);
+}
+
+/**
+ * WHO SIGNS WHAT THE TRANSFER CREATES, AND WHO SIGNED ITS ROOT.
+ *
+ * The root choice's controller is the sender, so a root on a look-alike
+ * template runs its own code with the sender's authority. Beside an honest
+ * delivery of the root amount it can create a contract the sender signs, with
+ * a choice the merchant controls; exercised later, that choice acts with the
+ * sender's authority. Measured (review of PR #279): such a create signed by the
+ * sender alone, added to the captured CC and USDCx payments and under a USDCx
+ * root on another package id, passed every check above.
+ *
+ * Every honest create the sender signs is co-signed by the instrument admin,
+ * whose authority a look-alike root cannot obtain. On the MainNet captures:
+ * Amulet [DSO, owner], registry Holding [registrar, owner], TransferOffer
+ * [sender, registrar]. In the Splice source also LockedAmulet (lock holders and
+ * the amulet's DSO and owner) and AmuletTransferInstruction [admin, sender].
+ *
+ * Canton Coin's factory is the DSO's ExternalPartyAmuletRules, signed by the
+ * DSO alone on every capture, so for CC the root contract is pinned to exactly
+ * that signatory. CC is told by the pinned admin being the caller's trusted DSO
+ * (`dsoParty`), not by the instrument id, which a registry could also name
+ * "Amulet". A registry root has no such pin: the receiver alone signs a
+ * registry TransferPreapproval.
+ */
+function assertCreatesAndRootSigned(
+  decoded: DecodedPrepared,
+  ex: DecodedExercise,
+  t: ExtractedTransfer,
+  expect: PreparedTransferExpectation
+): void {
+  // Unpinned, the admin outside the root is already foreign to the backstop.
+  const admin = expect.instrumentAdmin ?? t.instrumentAdmin;
+  for (const node of decoded.nodes) {
+    const c = node.create;
+    const sigs = c?.signatories ?? [];
+    if (c === undefined || !sigs.includes(expect.sender)) continue;
+    if (!sigs.includes(admin)) {
+      throw new PreparedTransferMismatchError(
+        `relay-prepared transfer creates ${JSON.stringify(c.templateQualifiedName ?? null)} signed by the ` +
+          `sender but not by the token's issuer ${JSON.stringify(admin)} — refusing to sign (a contract the ` +
+          `sender signs without the issuer hands the sender's authority to whoever controls its choices)`
+      );
+    }
+  }
+  if (expect.dsoParty !== undefined && expect.instrumentAdmin === expect.dsoParty) {
+    const roots = decoded.inputContracts.filter(
+      (c) => ex.contractId !== undefined && c.contractId === ex.contractId
+    );
+    const sigs = new Set(roots[0]?.signatories ?? []);
+    if (roots.length !== 1 || sigs.size !== 1 || !sigs.has(expect.instrumentAdmin)) {
+      throw new PreparedTransferMismatchError(
+        `relay-prepared Canton Coin transfer roots on a contract ` +
+          (roots.length === 1
+            ? `signed by ${JSON.stringify([...sigs])}`
+            : `listed ${roots.length} times among the input contracts`) +
+          `, not by the DSO alone — refusing to sign (the factory is the DSO's ExternalPartyAmuletRules)`
+      );
+    }
+  }
+  assertArchivesBound(decoded, admin);
+}
+
+/**
+ * WHAT THE TRANSFER MAY CONSUME. `Archive` is admitted by name on any template,
+ * and a root on a look-alike template has the sender's authority, so it could
+ * archive any contract the sender signs alone, inputs or not: measured (review
+ * of PR #282), an Archive of the agent's own registry TransferPreapproval
+ * (signed by its receiver alone) passed under a look-alike USDCx root. An
+ * Archive is admitted only of
+ *  (a) a declared input contract signed by the instrument admin, which a
+ *      look-alike root cannot archive without that admin's authority: on all
+ *      8 MainNet transfer captures every Archive is such an input, a spent
+ *      Amulet or Holding; or
+ *  (b) a contract created earlier in the same transaction, a transient, as the
+ *      accept, fee-paying self-preapproval and Tradecraft fund trees carry, so
+ *      a Splice update that adds one to a transfer does not stop payments.
+ * "Earlier" is execution order: pre-order from the root, children in order.
+ */
+function assertArchivesBound(decoded: DecodedPrepared, admin: string): void {
+  const byId = new Map(decoded.nodes.map((n) => [n.nodeId, n]));
+  const created = new Set<string>();
+  const seen = new Set<string>();
+  const stack = [...decoded.roots].reverse();
+  while (stack.length > 0) {
+    const id = stack.pop() as string;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const node = byId.get(id);
+    if (node === undefined) continue;
+    if (node.create?.contractId !== undefined) created.add(node.create.contractId);
+    const ex = node.exercise;
+    if (ex !== undefined && ex.choiceId === "Archive") {
+      const cid = ex.contractId;
+      const inputs = decoded.inputContracts.filter((c) => cid !== undefined && c.contractId === cid);
+      const signedInput = inputs.length === 1 && inputs[0]!.signatories.includes(admin);
+      if (!signedInput && !(cid !== undefined && created.has(cid))) {
+        throw new PreparedTransferMismatchError(
+          `relay-prepared transfer archives ${JSON.stringify(cid ?? null)} ` +
+            `(${JSON.stringify(ex.templateQualifiedName ?? null)}), which is neither an input contract the ` +
+            `token's issuer signs nor a contract this transaction created earlier — refusing to sign`
+        );
+      }
+    }
+    for (let i = node.children.length - 1; i >= 0; i--) stack.push(node.children[i]!);
+  }
+}
+
+/**
+ * THE AMOUNT THAT IS DELIVERED, not only the one the root names.
+ *
+ * `TransferFactory_Transfer` is an interface choice. A relay that can put its
+ * own package on the participant could root the transfer on a template it
+ * wrote (a template pin by name does not stop a look-alike), keep the root's
+ * argument honest, and have its body exercise the receiver's preapproval for
+ * another amount. Such bytes passed every check above, measured on the MainNet
+ * captures: a root at 0.01 CC over a TransferPreapproval_SendV2 of 9.99 CC,
+ * and a USDCx root over an inflated TransferRule_DirectTransfer (whether a
+ * ledger commits them was not tested). An honest delivery repeats the root's
+ * terms, so each one-step delivery is bound to them:
+ *  - Canton Coin: exactly one TransferPreapproval_SendV2, on the receiver's
+ *    preapproval input, for the root amount (`deliversViaAmuletPreapproval`,
+ *    which the facilitator already requires). The legacy `_Send` is not what
+ *    the factory exercises and is refused with it.
+ *  - DA Registry Utility: at most one TransferRule_DirectTransfer, whose
+ *    `transfer` (its position 0, measured on the USDCx capture) has the root's
+ *    sender, receiver, amount and instrument.
+ * A tree with neither (the two-step shapes, a self-merge) is unchanged.
+ */
+function assertDeliveryMatchesRoot(
+  decoded: DecodedPrepared,
+  t: ExtractedTransfer,
+  expect: PreparedTransferExpectation
+): void {
+  if (
+    decoded.exercises.some((e) => PREAPPROVAL_SEND_CHOICES.has(e.choiceId)) &&
+    !deliversViaAmuletPreapproval(decoded, expect.receiver, t.instrumentAdmin, expect.amount)
+  ) {
+    // Worded without "amount"/"receiver": the facilitator classifies by
+    // keyword, and this is a missing one-step delivery (preapproval_missing),
+    // which is what it answered before this check existed.
+    throw new PreparedTransferMismatchError(
+      "relay-prepared transfer's preapproval delivery is not exactly one TransferPreapproval_SendV2 " +
+        "of the root's value on the payee's preapproval — refusing to sign"
+    );
+  }
+  const direct = decoded.exercises.filter(
+    (e) => e.choiceId === REGISTRY_UTILITY_DIRECT_TRANSFER.choiceId
+  );
+  if (direct.length > 1) {
+    throw new PreparedTransferMismatchError(
+      `relay-prepared transfer delivers through ${direct.length} TransferRule_DirectTransfer ` +
+        `exercises — refusing to sign (one transfer pays once)`
+    );
+  }
+  for (const e of direct) {
+    const inner = entryByDeclOrder(recordEntries(e.chosenValue), 0, "transfer")?.value;
+    const d = inner !== undefined ? readTransferRecord(inner) : undefined;
+    if (
+      d === undefined ||
+      d.sender !== t.sender ||
+      d.receiver !== t.receiver ||
+      canonicalAmount(d.amount) !== canonicalAmount(t.amount) ||
+      d.instrumentId !== t.instrumentId ||
+      d.instrumentAdmin !== t.instrumentAdmin
+    ) {
+      throw new PreparedTransferMismatchError(
+        "relay-prepared transfer delivers through a TransferRule_DirectTransfer that does not move " +
+          "the root's sender, receiver, amount and instrument — refusing to sign"
+      );
+    }
+  }
+}
+
+/** ISO form of epoch ms for a message; the raw number when out of range. */
+function isoOrMs(ms: number): string {
+  const d = new Date(ms);
+  return Number.isFinite(d.getTime()) ? d.toISOString() : String(ms);
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -3125,6 +3451,64 @@ export interface PreparedAcceptExpectation {
    *  in a created holding next to the agent and the registrar. Anything else
    *  in a created holding is a redirected recipient → refused. */
   trustedRegistryParties?: ReadonlySet<string>;
+  /** The network's DSO, out of band. For a Canton Coin claim it is what makes
+   *  the instruction checkable: when set, the accepted instruction must be an
+   *  AmuletTransferInstruction signed by the DSO that names the agent as
+   *  receiver, and the agent must get an Amulet the DSO signs. */
+  dsoParty?: string;
+}
+
+/** `module:entity` of the Splice Canton Coin transfer instruction. */
+const AMULET_TRANSFER_INSTRUCTION_TEMPLATE = "Splice.AmuletTransferInstruction:AmuletTransferInstruction";
+/** Daml declaration order, measured on the fixtures: AmuletTransferInstruction
+ *  {lockedAmulet, transfer}; registry TransferOffer {operator, provider,
+ *  transfer}; the token-standard Transfer {sender, receiver, amount,
+ *  instrumentId {admin, id}, …}; Amulet {dso, owner, amount}. */
+const AMULET_TI_TRANSFER_POS = 1;
+const REGISTRY_OFFER_TRANSFER_POS = 2;
+const TRANSFER_RECEIVER_POS = 1;
+const AMULET_OWNER_POS = 1;
+
+/** A labelled field at its declaration-order position; absent ⇒ refuse. */
+function acceptField(entries: RecordEntry[], position: number, label: string, what: string): Uint8Array {
+  const e = entryByDeclOrder(entries, position, label);
+  if (e === undefined) {
+    throw new PreparedTransferMismatchError(
+      `accept: ${what} has no field ${JSON.stringify(label)} at position ${position} — refusing to sign`
+    );
+  }
+  return e.value;
+}
+
+function acceptParty(value: Uint8Array, what: string): string {
+  const leaf = leafOf(value);
+  if (!leaf || leaf.kind !== "party") {
+    throw new PreparedTransferMismatchError(`accept: ${what} is not a party — refusing to sign`);
+  }
+  return leaf.value;
+}
+
+/** The accepted instruction as the participant will authenticate it: exactly
+ *  one input contract under the root's contract id, of the expected template.
+ *  Its signatories and its signed transfer are what a relay cannot forge. */
+function acceptedInstruction(
+  decoded: DecodedPrepared,
+  root: DecodedExercise,
+  template: string,
+  transferPos: number,
+  what: string
+): { signatories: string[]; transfer: RecordEntry[] } {
+  const inputs = decoded.inputContracts.filter((c) => root.contractId !== undefined && c.contractId === root.contractId);
+  if (inputs.length !== 1 || inputs[0]!.templateQualifiedName !== template || inputs[0]!.argument === undefined) {
+    throw new PreparedTransferMismatchError(
+      `${what}: the accepted instruction is not among the input contracts exactly once as ${template} — refusing to sign`
+    );
+  }
+  const ti = inputs[0]!;
+  return {
+    signatories: ti.signatories,
+    transfer: recordEntries(acceptField(recordEntries(ti.argument!), transferPos, "transfer", "the instruction")),
+  };
 }
 
 /**
@@ -3149,6 +3533,52 @@ export function assertPreparedAcceptMatches(
     ACCEPT_CHOICE,
     registryIntent ? REGISTRY_ACCEPT_CONSEQUENCE_CHOICES : ACCEPT_CONSEQUENCE_CHOICES
   );
+
+  // WHOSE instruction it is. Template names alone prove nothing when the relay
+  // may run the agent's participant (a look-alike package can reuse them); the
+  // issuer's signature on the accepted instruction is what it cannot forge, and
+  // that instruction's signed transfer must pay the agent. A registry claim is
+  // held to its registrar; a Canton Coin claim to the DSO, when one is known.
+  if (registryIntent) {
+    const ti = acceptedInstruction(decoded, root, REGISTRY_TRANSFER_OFFER_TEMPLATE, REGISTRY_OFFER_TRANSFER_POS, "registry accept");
+    if (!ti.signatories.includes(expect.instrumentAdmin!)) {
+      throw new PreparedTransferMismatchError(
+        `registry accept: the offer is not signed by the registrar ${JSON.stringify(expect.instrumentAdmin)} — refusing to sign`
+      );
+    }
+    const receiver = acceptParty(acceptField(ti.transfer, TRANSFER_RECEIVER_POS, "receiver", "the offer's transfer"), "the offer's receiver");
+    if (receiver !== expect.selfParty) {
+      throw new PreparedTransferMismatchError(
+        `registry accept: the offer pays ${JSON.stringify(receiver)}, not the agent — refusing to sign`
+      );
+    }
+  } else if (expect.dsoParty !== undefined) {
+    const ti = acceptedInstruction(decoded, root, AMULET_TRANSFER_INSTRUCTION_TEMPLATE, AMULET_TI_TRANSFER_POS, "Canton Coin accept");
+    if (!ti.signatories.includes(expect.dsoParty)) {
+      throw new PreparedTransferMismatchError(
+        `Canton Coin accept: the instruction is not signed by the DSO ${JSON.stringify(expect.dsoParty)} — refusing to sign ` +
+          `(the DSO the wallet trusts; a CANTON_AGENT_DSO_PARTY that is set must be this network's)`
+      );
+    }
+    const receiver = acceptParty(acceptField(ti.transfer, TRANSFER_RECEIVER_POS, "receiver", "the instruction's transfer"), "the instruction's receiver");
+    if (receiver !== expect.selfParty) {
+      throw new PreparedTransferMismatchError(
+        `Canton Coin accept: the instruction pays ${JSON.stringify(receiver)}, not the agent — refusing to sign`
+      );
+    }
+    // The real accept creates the agent's Amulet (and the sender's change), all
+    // DSO-signed; at least one must be the agent's.
+    const mine = decoded.nodes.filter((n) => {
+      if (n.create?.templateQualifiedName !== AMULET_TEMPLATE || n.create.argument === undefined) return false;
+      if (!(n.create.signatories ?? []).includes(expect.dsoParty!)) return false;
+      return acceptParty(acceptField(recordEntries(n.create.argument), AMULET_OWNER_POS, "owner", "a created Amulet"), "an Amulet owner") === expect.selfParty;
+    });
+    if (mine.length === 0) {
+      throw new PreparedTransferMismatchError(
+        "Canton Coin accept creates no DSO-signed Amulet owned by the agent — refusing to sign (the value must land on the agent)"
+      );
+    }
+  }
 
   // Registry accept shape (see REGISTRY_ACCEPT_CONSEQUENCE_CHOICES). The
   // accept arm pins no amount and no receiver — the agent is accepting what
@@ -3205,6 +3635,20 @@ export function assertPreparedAcceptMatches(
           "registry accept creates a holding whose argument could not be decoded — refusing to sign"
         );
       }
+      if (!(node.create.signatories ?? []).includes(expect.instrumentAdmin!)) {
+        throw new PreparedTransferMismatchError(
+          "registry accept creates a holding the registrar does not sign — refusing to sign (not a registry holding)"
+        );
+      }
+      const holdingOwner = acceptParty(
+        acceptField(recordEntries(node.create.argument), HOLDING_OWNER_POS, "owner", "a created holding"),
+        "a created holding's owner"
+      );
+      if (holdingOwner !== expect.selfParty) {
+        throw new PreparedTransferMismatchError(
+          `registry accept creates a holding owned by ${JSON.stringify(holdingOwner)}, not the agent — refusing to sign`
+        );
+      }
       const leaves: string[] = [];
       collectPartyLeaves(node.create.argument, leaves, 0);
       const foreign = leaves.filter((p) => !admitted(p));
@@ -3222,6 +3666,231 @@ export function assertPreparedAcceptMatches(
         );
       }
     }
+  }
+
+  assertTimingPlausible(decoded, expect.nowMs ?? Date.now());
+
+  assertActAsIsSender(decoded.actAs, expect.selfParty);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * reclaim path — verify-before-sign for `TransferInstruction_Withdraw` on the
+ * agent's OWN pending registry offer: one the receiver never took (a swap
+ * venue that left a token sell unaccepted), whose input stays locked until the
+ * sender withdraws it.
+ *
+ * THREAT MODEL as for the claim path: the relay is MALICIOUS, and may run the
+ * agent's participant (so it could vet a look-alike package carrying the same
+ * module and entity names). Template names alone therefore prove nothing; what
+ * the relay cannot forge is the registrar's signature. So:
+ *   - the single root is the withdraw, on exactly the offer the agent asked
+ *     about, whose input contract is a TransferOffer SIGNED BY THE REGISTRAR —
+ *     the registrar signs only its own registry package, so the choice body
+ *     that runs is the registry's — and that offer's signed transfer names the
+ *     agent as sender and the expected registrar as admin, and an executeBefore
+ *     already past: the receiver can no longer accept;
+ *   - every create is a registry Holding signed by the registrar whose owner
+ *     is the agent and which names no party outside {agent, registrar, trusted
+ *     registry parties}; at least one comes back.
+ *
+ * MEASURED on two live MainNet offers a venue left unaccepted (eXAG and cETH,
+ * prepared only, agent-wallet/src/__fixtures__/mainnet-registry-withdraw-*):
+ * root TransferInstruction_Withdraw on TransferOffer → a Fetch, one create (the
+ * agent's unlocked Holding), EventLog_HoldingsChange, and the Archive of the
+ * locked Holding. Nothing else.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+const WITHDRAW_CHOICE = "TransferInstruction_Withdraw";
+const WITHDRAW_CONSEQUENCE_CHOICES = ["Archive", EVENT_LOG_HOLDINGS_CHANGE] as const;
+/** Daml declaration order, measured on the fixtures: TransferOffer
+ *  {operator, provider, transfer, …}; its transfer {sender, receiver, amount,
+ *  instrumentId {admin, id}, requestedAt, executeBefore, …}; Holding
+ *  {operator, provider, registrar, owner, instrument, label, amount}. */
+const OFFER_TRANSFER_POS = 2;
+const TRANSFER_SENDER_POS = 0;
+const TRANSFER_INSTRUMENT_POS = 3;
+const INSTRUMENT_ADMIN_POS = 0;
+const TRANSFER_EXECUTE_BEFORE_POS = 5;
+const HOLDING_REGISTRAR_POS = 2;
+const HOLDING_OWNER_POS = 3;
+
+/** Caller-intent expectation for a `TransferInstruction_Withdraw` (reclaim) prepare. */
+export interface PreparedWithdrawExpectation {
+  selfParty: string;
+  /** The offer being withdrawn, as the relay listed it: the root is pinned to it,
+   *  so a relay cannot point the withdraw at some other contract. */
+  instructionCid: string;
+  /** The offer's instrument admin (registrar). Registry offers only. */
+  instrumentAdmin: string;
+  /** Independently-trusted registry parties (operator/bridge) that may appear
+   *  in the returned holding next to the agent and the registrar. */
+  trustedRegistryParties?: ReadonlySet<string>;
+  /** Epoch ms: the offer's SIGNED executeBefore must be at or before it, so only
+   *  an offer the receiver can no longer accept is withdrawn. Required, so no
+   *  caller can drop the expiry check by leaving it out. */
+  onlyIfExpiredAt: number;
+  nowMs?: number;
+}
+
+/** A labelled field at its declaration-order position; absent ⇒ refuse. */
+function withdrawField(entries: RecordEntry[], position: number, label: string, what: string): Uint8Array {
+  const e = entryByDeclOrder(entries, position, label);
+  if (e === undefined) {
+    throw new PreparedTransferMismatchError(
+      `withdraw: ${what} has no field ${JSON.stringify(label)} at position ${position} — refusing to sign`
+    );
+  }
+  return e.value;
+}
+
+function withdrawLeaf(value: Uint8Array, kind: Leaf["kind"], what: string): string {
+  const leaf = leafOf(value);
+  if (!leaf || leaf.kind !== kind) {
+    throw new PreparedTransferMismatchError(`withdraw: ${what} is not a ${kind} — refusing to sign`);
+  }
+  return leaf.value;
+}
+
+/**
+ * Assert the relay-returned `preparedTransaction` for the reclaim path encodes
+ * EXACTLY the agent withdrawing its own registry offer, with the value coming
+ * back to the agent. Throws `PreparedTransferMismatchError` on any mismatch and
+ * `PreparedDecodeError` if the bytes do not decode. Call BEFORE signing.
+ */
+export function assertPreparedWithdrawMatches(
+  preparedTransactionB64: string,
+  expect: PreparedWithdrawExpectation
+): void {
+  const decoded = decodePrepared(preparedTransactionB64);
+  const { exercise: root } = assertSingleAllowedRootExercise(
+    decoded,
+    WITHDRAW_CHOICE,
+    WITHDRAW_CHOICE,
+    WITHDRAW_CONSEQUENCE_CHOICES
+  );
+  if (root.templateQualifiedName !== REGISTRY_TRANSFER_OFFER_TEMPLATE) {
+    throw new PreparedTransferMismatchError(
+      `withdraw is rooted on ${JSON.stringify(root.templateQualifiedName)} — refusing to sign ` +
+        `(a registry offer is withdrawn on ${REGISTRY_TRANSFER_OFFER_TEMPLATE})`
+    );
+  }
+  if (root.contractId !== expect.instructionCid) {
+    throw new PreparedTransferMismatchError(
+      `withdraw targets ${JSON.stringify(root.contractId)}, not the offer ${JSON.stringify(expect.instructionCid)} ` +
+        `— refusing to sign`
+    );
+  }
+
+  // The offer itself, as the participant will authenticate it.
+  // Exactly one entry: a duplicate could make the contract checked here differ
+  // from the one the participant exercises.
+  const offers = decoded.inputContracts.filter((c) => c.contractId === expect.instructionCid);
+  if (offers.length > 1) {
+    throw new PreparedTransferMismatchError(
+      `withdraw: the offer appears ${offers.length} times among the input contracts — refusing to sign`
+    );
+  }
+  const offer = offers[0];
+  if (offer === undefined || offer.templateQualifiedName !== REGISTRY_TRANSFER_OFFER_TEMPLATE) {
+    throw new PreparedTransferMismatchError(
+      "withdraw: the offer is not among the transaction's input contracts as a TransferOffer — refusing to sign"
+    );
+  }
+  if (!offer.signatories.includes(expect.instrumentAdmin)) {
+    throw new PreparedTransferMismatchError(
+      `withdraw: the offer is not signed by the registrar ${JSON.stringify(expect.instrumentAdmin)} — refusing to sign ` +
+        `(only the registrar's own registry contract runs the registry's withdraw)`
+    );
+  }
+  if (offer.argument === undefined) {
+    throw new PreparedTransferMismatchError("withdraw: the offer's argument could not be decoded — refusing to sign");
+  }
+  const transfer = recordEntries(withdrawField(recordEntries(offer.argument), OFFER_TRANSFER_POS, "transfer", "the offer"));
+  const sender = withdrawLeaf(withdrawField(transfer, TRANSFER_SENDER_POS, "sender", "the offer's transfer"), "party", "the offer's sender");
+  if (sender !== expect.selfParty) {
+    throw new PreparedTransferMismatchError(
+      `withdraw: the offer was sent by ${JSON.stringify(sender)}, not by the agent — refusing to sign`
+    );
+  }
+  const instrument = recordEntries(withdrawField(transfer, TRANSFER_INSTRUMENT_POS, "instrumentId", "the offer's transfer"));
+  const admin = withdrawLeaf(withdrawField(instrument, INSTRUMENT_ADMIN_POS, "admin", "the offer's instrumentId"), "party", "the offer's instrument admin");
+  if (admin !== expect.instrumentAdmin) {
+    throw new PreparedTransferMismatchError(
+      `withdraw: the offer is for an instrument of ${JSON.stringify(admin)}, not ${JSON.stringify(expect.instrumentAdmin)} ` +
+        `— refusing to sign`
+    );
+  }
+  if (!Number.isFinite(expect.onlyIfExpiredAt)) {
+    throw new PreparedTransferMismatchError("withdraw: no expiry instant to check the offer against — refusing to sign");
+  }
+  const executeBeforeMicros = BigInt(
+    withdrawLeaf(withdrawField(transfer, TRANSFER_EXECUTE_BEFORE_POS, "executeBefore", "the offer's transfer"), "timestamp", "the offer's executeBefore")
+  );
+  if (executeBeforeMicros > BigInt(Math.floor(expect.onlyIfExpiredAt)) * 1000n) {
+    throw new PreparedTransferMismatchError(
+      `withdraw: the offer's executeBefore ${new Date(Number(executeBeforeMicros / 1000n)).toISOString()} has not passed ` +
+        `— refusing to sign (the receiver could still accept it)`
+    );
+  }
+
+  const allowed = new Set<string>([
+    expect.selfParty,
+    expect.instrumentAdmin,
+    ...(expect.trustedRegistryParties ?? []),
+  ]);
+  // Same-namespace registry infra (the registrar's validator/provider) is
+  // co-controlled by the admin's key, as in the registry accept.
+  const adminNamespace = partyNamespace(expect.instrumentAdmin);
+  const admitted = (p: string): boolean =>
+    allowed.has(p) || (adminNamespace !== undefined && partyNamespace(p) === adminNamespace);
+  let returned = 0;
+  for (const node of decoded.nodes) {
+    if (node.create === undefined) continue;
+    if (node.create.templateQualifiedName !== REGISTRY_HOLDING_TEMPLATE) {
+      throw new PreparedTransferMismatchError(
+        `withdraw creates ${JSON.stringify(node.create.templateQualifiedName)} — refusing to sign ` +
+          `(a withdraw may only create the agent's ${REGISTRY_HOLDING_TEMPLATE})`
+      );
+    }
+    if (!(node.create.signatories ?? []).includes(expect.instrumentAdmin)) {
+      throw new PreparedTransferMismatchError(
+        "withdraw creates a holding the registrar does not sign — refusing to sign (not a registry holding)"
+      );
+    }
+    if (node.create.argument === undefined) {
+      throw new PreparedTransferMismatchError(
+        "withdraw creates a holding whose argument could not be decoded — refusing to sign"
+      );
+    }
+    const holding = recordEntries(node.create.argument);
+    const owner = withdrawLeaf(withdrawField(holding, HOLDING_OWNER_POS, "owner", "the returned holding"), "party", "the holding's owner");
+    if (owner !== expect.selfParty) {
+      throw new PreparedTransferMismatchError(
+        `withdraw creates a holding owned by ${JSON.stringify(owner)}, not the agent — refusing to sign ` +
+          `(the withdrawn value must come back to the agent)`
+      );
+    }
+    const registrar = withdrawLeaf(withdrawField(holding, HOLDING_REGISTRAR_POS, "registrar", "the returned holding"), "party", "the holding's registrar");
+    if (registrar !== expect.instrumentAdmin) {
+      throw new PreparedTransferMismatchError(
+        `withdraw creates a holding of registrar ${JSON.stringify(registrar)}, not ${JSON.stringify(expect.instrumentAdmin)} — refusing to sign`
+      );
+    }
+    const leaves: string[] = [];
+    collectPartyLeaves(node.create.argument, leaves, 0);
+    const foreign = leaves.filter((p) => !admitted(p));
+    if (foreign.length > 0) {
+      throw new PreparedTransferMismatchError(
+        `withdraw creates a holding that names ${JSON.stringify([...new Set(foreign)])} — refusing to sign ` +
+          `(the returned holding may name only the agent, the registrar and the trusted registry parties)`
+      );
+    }
+    returned += 1;
+  }
+  if (returned === 0) {
+    throw new PreparedTransferMismatchError(
+      "withdraw returns no holding to the agent — refusing to sign (the offer's value must come back)"
+    );
   }
 
   assertTimingPlausible(decoded, expect.nowMs ?? Date.now());
@@ -4357,9 +5026,13 @@ export function assertPreparedTcCancelOrder(
 // ── 4. Settlement withdrawal request ───────────────────────────────────────
 
 /** Tradecraft package ids that define `SettlementWithdrawalRequest` (added in
- *  DAR 1.3.12). MEASURED on MainNet, 2026-10-17. A later Tradecraft release
- *  must be added here (or passed by the caller) before its requests sign. */
+ *  DAR 1.3.12), newest first. A later Tradecraft release must be added here (or
+ *  passed by the caller) before its requests sign.
+ *  - 1.3.17: from the official DAR (sha256 6e27cc48…b009, SDK 3.5.1); the
+ *    venue's AMMRules disclosure moved to it by 2026-11-03.
+ *  - 1.3.12: measured on MainNet, 2026-10-17. */
 export const KNOWN_TRADECRAFT_PACKAGE_IDS: readonly string[] = [
+  "cc7b9c858ede67e7fbde2b7e557da1e63dfccee56bdd7ce63734ee2d3e9a7dfe", // canton-swap-amm-vault 1.3.17
   "97571dd8610f5d98ec99ebd5bee9edb09d44a7a025b9d088517bde0bfb3bc2dc", // canton-swap-amm-vault 1.3.12
 ];
 

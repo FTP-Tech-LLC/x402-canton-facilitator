@@ -3,6 +3,7 @@
  * for DevNet, TestNet, and MainNet by changing CANTON_NETWORK +
  * CANTON_PARTICIPANT_URL.
  */
+import { parseReadProofMode, type ReadProofMode } from "./routes/read-proof.js";
 import { participantId } from "./participant-router.js";
 
 export interface FacilitatorConfig {
@@ -173,6 +174,14 @@ export interface FacilitatorConfig {
    *  identical to the pre-guard build) | observe (record + metric, response
    *  unchanged) | enforce (503 on an unresolved mark). */
   settleDispatchMarkMode: "off" | "observe" | "enforce";
+  /** How /settle answers a repeat of a settled payment and an unknown outcome:
+   *  "spec" (default) as the scheme requires, a refusal carrying the updateId
+   *  and, with the dispatch mark enforced, 503 `settlement_pending`; "legacy"
+   *  the success from the record within the deadline and 503
+   *  `settle_outcome_unknown`, for merchants on middleware older than express
+   *  0.2.9 / next 0.2.8, whose retry of the same payment depends on them.
+   *  CANTON_X402_SETTLE_ANSWERS. */
+  settleAnswers: "spec" | "legacy";
   /** Max relay submit/execute calls per (party, caller IP) per minute. Each is
    *  a real ledger submission that spends Global Synchronizer traffic. */
   walletSubmitRateMaxPerKey: number;
@@ -181,6 +190,39 @@ export interface FacilitatorConfig {
    *  fresh well-formed party per request mints a fresh bucket. Default 4x the
    *  per-key cap, so an honest host running several agents is unaffected. */
   walletSubmitRateMaxPerIp: number;
+  /**
+   * Facilitator-wide ceiling on relay SUBMISSIONS per minute (submit/execute
+   * and preapproval/self/commit together), charged just before the participant
+   * executes. The per-key and per-IP caps are admission control and cannot
+   * bound our Global Synchronizer traffic, which every accepted submission
+   * spends: four funded wallets on one IP already reach the per-IP cap of 240,
+   * twice the whole /settle ceiling. Callers without a trusted key may use
+   * three quarters of it, one network a third of that (refused without a
+   * strike: honest agents behind one NAT share it). Default 20: production
+   * makes single-digit relay submissions in ten hours, and callers without a
+   * key then get 15 a minute of our traffic (one network 5), not 45. A whale
+   * merge, the one honest burst, paces itself on the 429s (agent-wallet merge
+   * waits out Retry-After). A submission the participant refuses outright
+   * gives its slot back. `0` disables. CANTON_X402_WALLET_SUBMIT_RATE_MAX_GLOBAL.
+   * The same two routes also get a traffic breaker with the /settle breaker's
+   * settings (CANTON_X402_SETTLE_BREAKER_*), as their own instance. It opens
+   * only on a 5xx traffic answer, and how exhaustion really arrives is not on
+   * record (routes/wallet.ts), so this quota is the bound that is proven.
+   */
+  walletSubmitRateMaxGlobal: number;
+  /** pay/prepare admissions per minute for a caller without a trusted key, per
+   *  (party, caller IP) and per caller IP, charged before the participant read
+   *  and the Scan resolve. Without them a successful prepare was unlimited, and
+   *  each was a priority Scan read the shared budget never refuses (500 from one
+   *  IP filled its window); that read is now priority only for a receiver on the
+   *  payment path, best-effort for any other. Defaults 60 and 120: production makes about 3 a day
+   *  per IP (1148 from 398 IPs in 10 h), an agent paying once a second makes
+   *  60, and an address holding two of them 120. "IP" is the network: an IPv4
+   *  address or an IPv6 /64, so rotating addresses inside one /64 does not
+   *  reset the caps. No abuse strike. `0` disables each.
+   *  CANTON_X402_WALLET_PAY_PREPARE_RATE_MAX(_PER_IP). */
+  walletPayPrepareRateMaxPerKey: number;
+  walletPayPrepareRateMaxPerIp: number;
   /**
    * Ceiling on external-party ALLOCATIONS per minute across the whole
    * facilitator, regardless of who asks. 0 disables it.
@@ -211,6 +253,67 @@ export interface FacilitatorConfig {
    * to 24h, which is no protection at all.
    */
   walletOnboardDailyMax: number;
+  /** Part of walletOnboardDailyMax for callers without a trusted key, so the
+   *  rest stays for the hosted MCP and pay-proxy users. Default: three quarters
+   *  of walletOnboardDailyMax. `0` disables. */
+  walletOnboardDailyMaxAnonymous: number;
+  /** Allocations per 24h for one network (an IPv4 address, an IPv6 /64)
+   *  without a trusted key. Default 20. `0` disables. */
+  walletOnboardDailyMaxPerIp: number;
+  /** Part of walletOnboardDailyMax for callers with a trusted key, so accounts
+   *  gathered on the hosted MCP cannot take the whole day either. Default:
+   *  three quarters of walletOnboardDailyMax. `0` disables. */
+  walletOnboardDailyMaxTrusted: number;
+  /** Per-CALLER ceiling on onboard/prepare and onboard/finalize per minute,
+   *  each. Kept well below the global minute cap so one IP cannot take the
+   *  whole facilitator-wide budget without ever being refused for its own
+   *  share. Default 10: one wallet takes one prepare and one finalize, so an
+   *  honest user has room for several retries a minute. `0` disables. */
+  walletOnboardRateMaxPerIp: number;
+  /** X-Agent-Key values of the services that call the relay for many users from
+   *  one IP (the hosted MCP, the pay-proxy): a request with one skips the per-IP
+   *  caps and abuse bans. Comma-separated. CANTON_X402_WALLET_TRUSTED_KEYS. */
+  walletTrustedKeys: string[];
+  /**
+   * Relay READ routes (balance, holdings, pending, tx-amulets, contracts), per
+   * caller IP per minute. Each costs a participant read and is anonymous in
+   * production. Default 600: far above a wallet's own polling (20/min while
+   * it waits for a starter grant). No facilitator-wide arm: these reads are
+   * on the payment path, and a global cap would let a few IPs refuse every
+   * wallet. The hosted MCP skips it with a key in `walletTrustedKeys`.
+   * `0` disables.
+   */
+  walletReadRateMaxPerIp: number;
+  /**
+   * Relay reads that fetch from the SV Scan or a registry (resolve/*,
+   * holdings-scan), per caller IP per minute. Stricter: they spend the Scan
+   * egress settle depends on. Default 120; every resolve a wallet makes sits
+   * next to a ledger submission. holdings-scan carries its own tighter caps,
+   * including the only global one. `0` disables.
+   */
+  walletScanReadRateMaxPerIp: number;
+  /**
+   * The shared outbound SV Scan budget (scan-budget.ts): requests per minute,
+   * every class counted, at or above which BEST-EFFORT reads are refused.
+   *
+   * All our Scan reads leave from one address that DA meters, and the payment
+   * path (Rule 7 on /verify and /settle, the CC pay/prepare resolve) reads the
+   * same Scan. Best-effort = what an anonymous caller can multiply: relay Scan
+   * reads without a trusted key, and Rule 7 lookups for a merchant no payment
+   * has validated for yet. Those stop at this line, are refused for
+   * `scanCooldownMs` after any 429 from Scan, and never retry a 429. Payment
+   * reads and our own background reads are never refused here; they count, so
+   * they come first. Default 300 (5 a second): every relay resolve sits next
+   * to a submission, production runs single-digit relay submissions per ten
+   * hours, and the payment path's preapproval reads are cached per merchant.
+   * `0` turns the budget off (every read as before). CANTON_X402_SCAN_BUDGET_PER_MIN.
+   */
+  scanBudgetPerMin: number;
+  /** After any 429 from Scan, best-effort reads are refused for this long
+   *  (ms), so priority retries land on a refilled budget alone. Default 2000:
+   *  DA's refusals cleared within a 400-1600 ms backoff when measured. `0`: no
+   *  cooldown. CANTON_X402_SCAN_COOLDOWN_MS. */
+  scanCooldownMs: number;
   /**
    * Escalating cooldown for repeat abusers (the ToS "temporary suspension"
    * clause). A caller (by IP) that keeps getting refused on agent-side money
@@ -265,12 +368,53 @@ export interface FacilitatorConfig {
    *  drives Scan/ACS reads under the facilitator's OIDC identity, so an
    *  unthrottled /verify is a read-amplification + DoS surface (confirmed live:
    *  a 15-request burst was never limited). Sliding-window cap keyed by CLIENT
-   *  IP over `verifyRateWindowMs`. A SEPARATE limiter instance from /settle so
-   *  /verify throttling never consumes the settle traffic budget. A cap of 0
-   *  disables it. Per-IP only (no global cap) — a global /verify cap would let
-   *  one noisy IP deny verification to everyone. */
+   *  IP over `verifyRateWindowMs`, counting VALID outcomes only: invalid ones
+   *  have their own budgets below, so junk a stranger pushes through a merchant
+   *  cannot fill the bucket its honest payers need (routes/verify.ts). A
+   *  SEPARATE limiter instance from /settle so /verify throttling never consumes
+   *  the settle traffic budget. Per-IP only (no global cap) — a global /verify
+   *  cap would let one noisy IP deny verification to everyone.
+   *
+   *  `0` disables THIS cap only, and with it the cap on admissions while the
+   *  caller sheds. It used to turn all /verify limiting off; the other /verify
+   *  budgets now have their own switches (verifyRateMaxPerPayer,
+   *  verifyRateMaxPerPayment, verifyWasteMaxPerIp, verifyWasteMaxPerPayer), so
+   *  turning /verify limiting off means setting all five to 0. */
   verifyRateMaxPerIp: number;
   verifyRateWindowMs: number;
+  /** INVALID /verify outcomes per caller IP per window. Past it the caller
+   *  sheds: only payers that validated through it before are admitted, at most
+   *  `verifyRateMaxPerIp` a window, until the window drains. Default 120, the
+   *  valid cap: refusing even a first-time payer then takes as much junk as
+   *  refusing everyone took before. `0` disables.
+   *  CANTON_X402_VERIFY_WASTE_MAX_PER_IP. */
+  verifyWasteMaxPerIp: number;
+  /** INVALID /verify outcomes per (caller IP, claimed payer) per window; past
+   *  it that pair is refused before the work. For a FIRST-TIME payer that
+   *  means a stuck client, or junk quoting one party, refuses nobody else. It
+   *  does not apply to a payer that has validated through that caller: anyone
+   *  can quote its public party, so the cap would let them refuse it. A stuck
+   *  RETURNING payer is therefore held only by the caller's waste share
+   *  (verifyWasteMaxPerIp): past it the caller sheds, and its first-time payers
+   *  wait for the window to drain while returning payers keep paying, up to
+   *  the valid cap. Default 20. `0` disables.
+   *  CANTON_X402_VERIFY_WASTE_MAX_PER_PAYER. */
+  verifyWasteMaxPerPayer: number;
+  /** VALID /verify outcomes per (caller IP, proven payer) per window, below the
+   *  per-caller valid cap so one payer alone cannot fill it. Default 90: an
+   *  honest agent paying one merchant once a second makes 60 payments a minute,
+   *  one valid verify each, and 90 leaves it half as much again. `0` disables.
+   *  CANTON_X402_VERIFY_RATE_MAX_PER_PAYER. */
+  verifyRateMaxPerPayer: number;
+  /** VALID /verify outcomes per (caller IP, payment) per window, the payment
+   *  keyed by its transaction hash. A payment that validated once can be
+   *  replayed to /verify without end; before this, 120 replays of one payment
+   *  filled a merchant's whole valid cap. Per caller, because anyone who saw
+   *  the payment's bytes can send them: keyed on the payment alone, their
+   *  replays used up the merchant's own budget for it. Default 10: one verify per payment, plus retries of the same payment
+   *  after a transient error, which is what the middleware asks the payer to
+   *  do. `0` disables. CANTON_X402_VERIFY_RATE_MAX_PER_PAYMENT. */
+  verifyRateMaxPerPayment: number;
   jwtIssuer: "unsafe-hmac" | "oidc"; // unsafe-hmac for LocalNet only
   jwtSecret: string | undefined;     // for unsafe-hmac
   oidcTokenEndpoint: string | undefined;
@@ -358,6 +502,17 @@ export interface FacilitatorConfig {
   /** Exact template / interface ids (`#package-name:Module:Entity`) the relay's
    *  `GET /v1/wallet/:party/contracts` may list. Empty (default) = route off. */
   walletReadIds: readonly string[];
+  /** Signed relay reads (CANTON_X402_WALLET_READ_PROOF): off | observe | enforce. Default observe. */
+  walletReadProofMode: ReadProofMode;
+  /** Uncached signing-key lookups per minute for relay read proofs, all sources
+   *  together (CANTON_X402_WALLET_READ_PROOF_LOOKUPS_PER_MIN). */
+  walletReadProofLookupsPerMin: number;
+  /** The same, per source: an IPv4 address or IPv6 /64 (..._LOOKUPS_PER_SOURCE_PER_MIN). */
+  walletReadProofLookupsPerSourcePerMin: number;
+  /** Pause of read-proof lookups after the breaker opens, ms (..._BREAKER_MS). */
+  walletReadProofBreakerMs: number;
+  /** Distinct parties whose lookups must fail to open that breaker (..._BREAKER_PARTIES). */
+  walletReadProofBreakerParties: number;
   /** Agent CC faucet (out-of-box e2e). OFF by default on EVERY network incl.
    *  mainnet; the caps below are the guardrail when enabled. The faucet sends a
    *  tiny one-time CC seed from the facilitator's OWN party to an agent party
@@ -412,10 +567,18 @@ export interface FacilitatorConfig {
   /** Pay every newly onboarded wallet one faucet grant (`faucetAmountCc`) right
    *  after its party is allocated, so an agent's new wallet starts funded. Same
    *  guards as the faucet route: once per party, the daily budget, the lifetime
-   *  cap. New parties are themselves capped by the onboarding daily limit, so
-   *  the worst case per day is min(that limit, the daily budget) grants. Needs
+   *  cap, the per-IP cap, the burst cap and `faucetIpExempt`, plus
+   *  `faucetOnboardMaxPerIp`. A refused grant never fails the onboarding. Needs
    *  the faucet enabled. CANTON_X402_FAUCET_ON_ONBOARD=true. */
   faucetOnOnboard: boolean;
+  /** Max starter grants per client IP within faucetWindowMs. Parties are free
+   *  to mint, so the per-party-once guard alone lets one host take the whole
+   *  daily budget. Default 3; `0` disables. CANTON_X402_FAUCET_ONBOARD_MAX_PER_IP. */
+  faucetOnboardMaxPerIp: number;
+  /** Send faucet grants through packages/grant-sender (the Canton Rust SDK)
+   *  instead of the ledger client. Same transaction, token and limits.
+   *  CANTON_X402_FAUCET_RUST_SENDER=true. */
+  faucetRustSender: boolean;
   /** Bearer token required for merchant-registry MUTATIONS
    *  (POST /v1/merchants/register and /:cid/accept). These make the
    *  facilitator party submit on-ledger writes, so they must not be
@@ -427,7 +590,8 @@ export interface FacilitatorConfig {
    *  Empty → attribution disabled even when DATABASE_URL is set.
    *  Always used with flavor:"sv". */
   attributionScanUrls: string[];
-  /** Pass OIDC token to attribution ScanClients (RBAC-gated mainnet SVs). */
+  /** Default false. The ledger token is never sent to an attribution Scan;
+   *  true only logs a boot warning. */
   attributionScanAuth: boolean;
   /** When true, /settle returns error if attribution.record() fails.
    *  buildServices throws on startup if required but DB or scan URLs absent. */
@@ -623,6 +787,19 @@ function numericEnv(raw: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
+/** A positive integer from the environment; empty means the default. Zero is
+ *  refused rather than read as "off": for the read-proof lookup budgets 0 would
+ *  make every proof unverifiable, and a breaker of 0 parties or 0 ms is
+ *  meaningless. Turning read proofs off is CANTON_X402_WALLET_READ_PROOF=off. */
+function positiveIntEnv(name: string, raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`${name} must be a positive integer (got "${raw}"); use CANTON_X402_WALLET_READ_PROOF=off to turn read proofs off`);
+  }
+  return n;
+}
+
 export function loadConfig(): FacilitatorConfig {
   const network = required("CANTON_NETWORK");
   if (
@@ -681,6 +858,15 @@ export function loadConfig(): FacilitatorConfig {
   const faucetDailyBudgetCc = process.env.CANTON_X402_FAUCET_DAILY_BUDGET_CC ?? "1";
   const faucetLifetimeCapCc =
     process.env.CANTON_X402_FAUCET_LIFETIME_CAP_CC ?? "25";
+  const walletTrustedKeys = (process.env.CANTON_X402_WALLET_TRUSTED_KEYS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const shortKey = walletTrustedKeys.findIndex((k) => k.length < 32);
+  if (shortKey !== -1) {
+    // Each key lifts the per-IP caps for whoever sends it, so it must not be guessable.
+    throw new Error(`CANTON_X402_WALLET_TRUSTED_KEYS: key ${shortKey + 1} is shorter than 32 characters`);
+  }
   const secondaryUrl = process.env.CANTON_SECONDARY_PARTICIPANT_URL || undefined;
   const coHostUid = process.env.CANTON_X402_ONBOARD_CO_HOST_UID || undefined;
   if (coHostUid && !secondaryUrl) {
@@ -793,6 +979,42 @@ export function loadConfig(): FacilitatorConfig {
       );
     }
   }
+
+  // HOW /settle ANSWERS REPEATS AND UNKNOWN OUTCOMES. "spec" answers an
+  // unknown outcome `settlement_pending`, and its retry is safe only when the
+  // dispatch mark lets the retry look the submission up instead of relaying it
+  // again. So under spec the mark defaults to enforce, and spec with an
+  // explicit off or observe refuses to start. legacy keeps its own default.
+  const settleAnswers = (() => {
+    const raw = process.env.CANTON_X402_SETTLE_ANSWERS;
+    if (raw === undefined || raw.trim() === "") return "spec" as const;
+    const v = raw.trim();
+    if (v !== "spec" && v !== "legacy") {
+      throw new Error(`CANTON_X402_SETTLE_ANSWERS must be spec or legacy, got ${JSON.stringify(v)}`);
+    }
+    return v;
+  })();
+  const settleDispatchMarkMode = (() => {
+    const raw = process.env.CANTON_X402_SETTLE_DISPATCH_MARK;
+    if (raw === undefined || raw.trim() === "") {
+      return settleAnswers === "spec" ? ("enforce" as const) : ("off" as const);
+    }
+    const v = raw.trim();
+    if (v !== "off" && v !== "observe" && v !== "enforce") {
+      throw new Error(
+        `CANTON_X402_SETTLE_DISPATCH_MARK must be one of off|observe|enforce, ` +
+          `got ${JSON.stringify(v)}`
+      );
+    }
+    if (settleAnswers === "spec" && v !== "enforce") {
+      throw new Error(
+        `CANTON_X402_SETTLE_ANSWERS=spec needs CANTON_X402_SETTLE_DISPATCH_MARK=enforce, got ${v}: ` +
+          `without the mark, the retry a pending answer asks for relays the payment again. ` +
+          `Set the mark to enforce, or the answers to legacy.`
+      );
+    }
+    return v;
+  })();
 
   return {
     port: Number(process.env.PORT ?? 4022),
@@ -980,6 +1202,30 @@ export function loadConfig(): FacilitatorConfig {
       process.env.CANTON_X402_WALLET_ONBOARD_DAILY_MAX,
       200
     ),
+    walletOnboardDailyMaxAnonymous: numericEnv(
+      process.env.CANTON_X402_WALLET_ONBOARD_DAILY_MAX_ANONYMOUS,
+      Math.floor(numericEnv(process.env.CANTON_X402_WALLET_ONBOARD_DAILY_MAX, 200) * 0.75)
+    ),
+    walletOnboardDailyMaxPerIp: numericEnv(
+      process.env.CANTON_X402_WALLET_ONBOARD_DAILY_MAX_PER_IP,
+      20
+    ),
+    walletOnboardDailyMaxTrusted: numericEnv(
+      process.env.CANTON_X402_WALLET_ONBOARD_DAILY_MAX_TRUSTED,
+      Math.floor(numericEnv(process.env.CANTON_X402_WALLET_ONBOARD_DAILY_MAX, 200) * 0.75)
+    ),
+    walletTrustedKeys,
+    walletOnboardRateMaxPerIp: numericEnv(
+      process.env.CANTON_X402_WALLET_ONBOARD_RATE_MAX_PER_IP,
+      10
+    ),
+    walletReadRateMaxPerIp: numericEnv(process.env.CANTON_X402_WALLET_READ_RATE_MAX_PER_IP, 600),
+    walletScanReadRateMaxPerIp: numericEnv(
+      process.env.CANTON_X402_WALLET_SCAN_READ_RATE_MAX_PER_IP,
+      120
+    ),
+    scanBudgetPerMin: numericEnv(process.env.CANTON_X402_SCAN_BUDGET_PER_MIN, 300),
+    scanCooldownMs: numericEnv(process.env.CANTON_X402_SCAN_COOLDOWN_MS, 2_000),
     abuseStrikesToBan: numericEnv(
       process.env.CANTON_X402_ABUSE_STRIKES_TO_BAN,
       5
@@ -1008,6 +1254,12 @@ export function loadConfig(): FacilitatorConfig {
       process.env.CANTON_X402_WALLET_SUBMIT_RATE_MAX_PER_IP,
       240
     ),
+    walletSubmitRateMaxGlobal: numericEnv(
+      process.env.CANTON_X402_WALLET_SUBMIT_RATE_MAX_GLOBAL,
+      20
+    ),
+    walletPayPrepareRateMaxPerKey: numericEnv(process.env.CANTON_X402_WALLET_PAY_PREPARE_RATE_MAX, 60),
+    walletPayPrepareRateMaxPerIp: numericEnv(process.env.CANTON_X402_WALLET_PAY_PREPARE_RATE_MAX_PER_IP, 120),
     walletPrepareWasteMax: numericEnv(
       process.env.CANTON_X402_WALLET_PREPARE_WASTE_MAX,
       10
@@ -1033,24 +1285,16 @@ export function loadConfig(): FacilitatorConfig {
     // Then that number decides, and deciding is one environment variable, no
     // rebuild.
     //
-    //   off      (default) nothing is written, nothing is read. Identical to
-    //            the build running today.
+    //   off      (default with legacy answers) nothing is written, nothing is
+    //            read. Identical to the build before the guard.
     //   observe  mark + metric, response unchanged, no resolve.
-    //   enforce  an unresolved mark answers 503 settle_outcome_unknown.
+    //   enforce  (default with spec answers) an unresolved mark answers 503:
+    //            settle_outcome_unknown, or under spec settlement_pending.
     //
-    // A staged-rollout knob: off (default) → observe → enforce.
-    settleDispatchMarkMode: (() => {
-      const raw = process.env.CANTON_X402_SETTLE_DISPATCH_MARK;
-      if (raw === undefined || raw.trim() === "") return "off" as const;
-      const v = raw.trim();
-      if (v !== "off" && v !== "observe" && v !== "enforce") {
-        throw new Error(
-          `CANTON_X402_SETTLE_DISPATCH_MARK must be one of off|observe|enforce, ` +
-            `got ${JSON.stringify(v)}`
-        );
-      }
-      return v;
-    })(),
+    // A staged-rollout knob: off → observe → enforce. Parsed above, with the
+    // answers it has to agree with.
+    settleAnswers,
+    settleDispatchMarkMode,
     inlineMerchantAllowlist: (
       process.env.CANTON_X402_INLINE_MERCHANT_ALLOWLIST ?? ""
     )
@@ -1068,7 +1312,9 @@ export function loadConfig(): FacilitatorConfig {
     // 120 (was 60): /verify is also keyed on the MERCHANT IP, so a merchant
     // fronting many agents shares one /verify bucket. Raised to match the
     // settle per-IP cap so /verify does not become the new bottleneck once the
-    // settle IP cap is lifted. Each settle is preceded by one verify.
+    // settle IP cap is lifted. Each settle is preceded by one verify. It now
+    // counts valid outcomes only, so the same number admits at least as much
+    // honest traffic as before.
     verifyRateMaxPerIp: numericEnv(
       process.env.CANTON_X402_VERIFY_RATE_MAX_PER_IP,
       120
@@ -1078,6 +1324,10 @@ export function loadConfig(): FacilitatorConfig {
         process.env.CANTON_X402_SETTLE_RATE_WINDOW_MS,
       60000
     ),
+    verifyWasteMaxPerIp: numericEnv(process.env.CANTON_X402_VERIFY_WASTE_MAX_PER_IP, 120),
+    verifyWasteMaxPerPayer: numericEnv(process.env.CANTON_X402_VERIFY_WASTE_MAX_PER_PAYER, 20),
+    verifyRateMaxPerPayer: numericEnv(process.env.CANTON_X402_VERIFY_RATE_MAX_PER_PAYER, 90),
+    verifyRateMaxPerPayment: numericEnv(process.env.CANTON_X402_VERIFY_RATE_MAX_PER_PAYMENT, 10),
     jwtIssuer,
     jwtSecret: process.env.JWT_SECRET,
     oidcTokenEndpoint: process.env.OIDC_TOKEN_ENDPOINT,
@@ -1110,10 +1360,12 @@ export function loadConfig(): FacilitatorConfig {
     walletSubmitChoiceAllowlist: (() => {
       const raw = process.env.CANTON_X402_WALLET_SUBMIT_CHOICES;
       if (raw === undefined || raw.trim() === "") {
-        // agent-wallet's prepareSignExecute has exactly one call site, and it
-        // builds exactly these two. Anything else has never been part of the
-        // documented path.
-        return ["TransferFactory_Transfer", "TransferInstruction_Accept"] as const;
+        // What agent-wallet's prepareSignExecute builds outside Tradecraft: a
+        // transfer, the accept of an incoming offer (claim), and the withdraw
+        // of the wallet's own offer the receiver never took (reclaim). Each is
+        // verified wallet-side before signing. Anything else has never been
+        // part of the documented path.
+        return ["TransferFactory_Transfer", "TransferInstruction_Accept", "TransferInstruction_Withdraw"] as const;
       }
       return Object.freeze(
         raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0)
@@ -1124,6 +1376,11 @@ export function loadConfig(): FacilitatorConfig {
       if (raw === undefined || raw.trim() === "") return Object.freeze([] as string[]);
       return Object.freeze(raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0));
     })(),
+    walletReadProofMode: parseReadProofMode(process.env.CANTON_X402_WALLET_READ_PROOF),
+    walletReadProofLookupsPerMin: positiveIntEnv("CANTON_X402_WALLET_READ_PROOF_LOOKUPS_PER_MIN", process.env.CANTON_X402_WALLET_READ_PROOF_LOOKUPS_PER_MIN, 120),
+    walletReadProofLookupsPerSourcePerMin: positiveIntEnv("CANTON_X402_WALLET_READ_PROOF_LOOKUPS_PER_SOURCE_PER_MIN", process.env.CANTON_X402_WALLET_READ_PROOF_LOOKUPS_PER_SOURCE_PER_MIN, 10),
+    walletReadProofBreakerMs: positiveIntEnv("CANTON_X402_WALLET_READ_PROOF_BREAKER_MS", process.env.CANTON_X402_WALLET_READ_PROOF_BREAKER_MS, 10_000),
+    walletReadProofBreakerParties: positiveIntEnv("CANTON_X402_WALLET_READ_PROOF_BREAKER_PARTIES", process.env.CANTON_X402_WALLET_READ_PROOF_BREAKER_PARTIES, 3),
     walletReadIds: (() => {
       const raw = process.env.CANTON_X402_WALLET_READ_IDS;
       if (raw === undefined || raw.trim() === "") return Object.freeze([] as string[]);
@@ -1155,6 +1412,8 @@ export function loadConfig(): FacilitatorConfig {
       .map((s) => s.trim())
       .filter(Boolean),
     faucetOnOnboard: process.env.CANTON_X402_FAUCET_ON_ONBOARD === "true",
+    faucetOnboardMaxPerIp: numericEnv(process.env.CANTON_X402_FAUCET_ONBOARD_MAX_PER_IP, 3),
+    faucetRustSender: process.env.CANTON_X402_FAUCET_RUST_SENDER === "true",
     operatorToken: process.env.CANTON_X402_OPERATOR_TOKEN,
     attributionScanUrls: (process.env.CANTON_ATTRIBUTION_SCAN_URLS ?? "")
       .split(",")

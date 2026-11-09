@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import Fastify from "fastify";
 import { registerRegistryRoutes } from "./routes.js";
 import type { RegistryRouteServices } from "./routes.js";
+import { ScanBudgetRefusedError } from "../scan-budget.js";
 
 const OPERATOR_TOKEN = "test-operator-token";
 const AUTH = { authorization: `Bearer ${OPERATOR_TOKEN}` };
@@ -81,6 +82,18 @@ describe("registerRegistryRoutes", () => {
       url: "/v1/merchants/merchant::1220",
     });
     expect(res.statusCode).toBe(404);
+  });
+
+  it("GET /v1/merchants/:party is rate-limited per caller before it reads the ledger", async () => {
+    const svc = makeServices();
+    const app = Fastify();
+    await registerRegistryRoutes(app, svc);
+    const lookup = (remoteAddress: string) =>
+      app.inject({ method: "GET", url: "/v1/merchants/merchant::1220", remoteAddress });
+    for (let i = 0; i < 30; i++) expect((await lookup("203.0.113.60")).statusCode).toBe(404);
+    expect((await lookup("203.0.113.60")).statusCode).toBe(429);
+    expect(svc.merchantContract.findMerchantContract).toHaveBeenCalledTimes(30);
+    expect((await lookup("203.0.113.61")).statusCode).toBe(404);
   });
 
   it("POST /v1/merchants/:proposalCid/accept exercises AcceptRegistration (authenticated)", async () => {
@@ -326,6 +339,114 @@ describe("registerRegistryRoutes", () => {
       const j = res.json() as { hasPreapproval: boolean; guidance?: string };
       expect(j.hasPreapproval).toBe(false);
       expect(j.guidance).toMatch(/TransferPreapproval/);
+    });
+
+    it("the Canton Coin check is rate-limited per caller before it asks the Scan", async () => {
+      const resolveTransferKind = vi.fn(async () => "offer");
+      const app = Fastify();
+      await registerRegistryRoutes(
+        app,
+        makeServices({ scan: { resolveTransferKind } as unknown as RegistryRouteServices["scan"] })
+      );
+      const check = (remoteAddress: string) =>
+        app.inject({
+          method: "GET",
+          url: "/v1/merchants/merchant::1220m/preapproval-status?admin=dso::1220",
+          remoteAddress,
+        });
+      for (let i = 0; i < 30; i++) expect((await check("203.0.113.50")).statusCode).toBe(200);
+      const over = await check("203.0.113.50");
+      expect(over.statusCode).toBe(429);
+      expect(resolveTransferKind).toHaveBeenCalledTimes(30);
+      expect((await check("203.0.113.51")).statusCode).toBe(200);
+    });
+
+    it("a trusted relay key skips the per-caller cap, not the overall one", async () => {
+      // The hosted MCP checks preapprovals for all its users from one IP, and
+      // they can make it send unkeyed requests from there too.
+      const KEY = "trusted-relay-key-for-tests-only-000000";
+      const app = Fastify();
+      await registerRegistryRoutes(
+        app,
+        makeServices({
+          trustedKeys: [KEY],
+          scan: { resolveTransferKind: vi.fn(async () => "offer") } as unknown as RegistryRouteServices["scan"],
+        })
+      );
+      const check = (remoteAddress: string, headers: Record<string, string> = {}) =>
+        app.inject({
+          method: "GET",
+          url: "/v1/merchants/merchant::1220m/preapproval-status?admin=dso::1220",
+          remoteAddress,
+          headers,
+        });
+      for (let i = 0; i < 30; i++) expect((await check("203.0.113.52")).statusCode).toBe(200);
+      expect((await check("203.0.113.52")).statusCode).toBe(429);
+      for (let i = 0; i < 5; i++) expect((await check("203.0.113.52", { "x-agent-key": KEY })).statusCode).toBe(200);
+      expect((await check("203.0.113.52", { "x-agent-key": `${KEY}0` })).statusCode).toBe(429);
+      // 35 of the 600 a minute are spent; other callers spend the rest.
+      for (let i = 0; i < 565; i++) {
+        expect((await check(`198.51.100.${Math.floor(i / 30) + 1}`)).statusCode).toBe(200);
+      }
+      expect((await check("203.0.113.52", { "x-agent-key": KEY })).statusCode).toBe(429);
+    });
+
+    it("a caller without a trusted key reads Scan on the best-effort class of the shared budget", async () => {
+      // Anonymous and uncached (resolveTransferKind), at 600 a minute overall:
+      // on the priority client a handful of IPs could fill the shared Scan line
+      // and shed every best-effort read, new merchants' Rule 7 lookups included.
+      const KEY = "trusted-relay-key-for-tests-only-000000";
+      const priority = { resolveTransferKind: vi.fn(async () => "direct"), getTransferPreapprovalByParty: vi.fn(async () => null) };
+      const bestEffort = {
+        resolveTransferKind: vi.fn(async () => {
+          throw new ScanBudgetRefusedError("budget", 5_000);
+        }),
+        getTransferPreapprovalByParty: vi.fn(async () => null),
+      };
+      const app = Fastify();
+      await registerRegistryRoutes(
+        app,
+        makeServices({
+          trustedKeys: [KEY],
+          scan: priority as unknown as RegistryRouteServices["scan"],
+          bestEffortScan: bestEffort as unknown as RegistryRouteServices["scan"],
+        })
+      );
+      const url = "/v1/merchants/merchant::1220m/preapproval-status?admin=dso::1220";
+      const anon = await app.inject({ method: "GET", url, remoteAddress: "203.0.113.60" });
+      // Shed, not answered: 503 with the wait. A 200 hasPreapproval:null reads
+      // to the CLI as "no preapproval" on older wallets, and it then prepays a
+      // second one.
+      expect(anon.statusCode).toBe(503);
+      expect(anon.json()).toMatchObject({ error: "scan_busy" });
+      expect(anon.headers["retry-after"]).toBe("5");
+      expect(bestEffort.resolveTransferKind).toHaveBeenCalledTimes(1);
+      expect(priority.resolveTransferKind).not.toHaveBeenCalled();
+      const keyed = await app.inject({ method: "GET", url, remoteAddress: "203.0.113.60", headers: { "x-agent-key": KEY } });
+      expect(keyed.json()).toMatchObject({ transferKind: "direct", hasPreapproval: true });
+      expect(priority.resolveTransferKind).toHaveBeenCalledTimes(1);
+    });
+
+    it("a shed expiry read is also 503, not a routing-only true", async () => {
+      const bestEffort = {
+        resolveTransferKind: vi.fn(async () => "direct"),
+        getTransferPreapprovalByParty: vi.fn(async () => {
+          throw new ScanBudgetRefusedError("cooldown", 1_200);
+        }),
+      };
+      const app = Fastify();
+      await registerRegistryRoutes(
+        app,
+        makeServices({ bestEffortScan: bestEffort as unknown as RegistryRouteServices["scan"] })
+      );
+      const r = await app.inject({
+        method: "GET",
+        url: "/v1/merchants/merchant::1220m/preapproval-status?admin=dso::1220",
+        remoteAddress: "203.0.113.61",
+      });
+      expect(r.statusCode).toBe(503);
+      expect(r.json()).toMatchObject({ error: "scan_busy" });
+      expect(r.headers["retry-after"]).toBe("2");
     });
 
     it("400 when ?admin is missing", async () => {

@@ -2,8 +2,19 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { generateKeyPairSync, sign as cryptoSign } from "node:crypto";
-import { recomputeHash } from "@ftptech/x402-canton-ledger";
-import { createPayerProofVerifier, digestBytes } from "./payer-proof.js";
+import {
+  recomputeHash,
+  PreparedTransactionBudgetError,
+  PreparedTransactionGraphError,
+} from "@ftptech/x402-canton-ledger";
+import { createPayerProofVerifier, digestBytes, recomputeFailureKind } from "./payer-proof.js";
+import {
+  addSpareNodes,
+  exerciseChildren,
+  libraryHashHex,
+  mutated,
+  nodeBody,
+} from "../../../ledger/src/_graph-fixture.js";
 
 const RAW = Buffer.from(
   readFileSync(
@@ -94,6 +105,104 @@ describe("payer proof — half A, hash binding against REAL MainNet bytes", () =
     for (const bad of ["", "zz".repeat(32), "abc", "1220" + "zz".repeat(32)]) {
       expect((await verify(input({ claimedPreparedTxHash: bad }))).verified).toBe(false);
     }
+  });
+
+  it("refuses a node graph the hasher cannot walk and reports it as a graph error", async () => {
+    // Unsigned bytes from anyone reach this check: a root that is its own
+    // child used to send the hash recompute into endless recursion.
+    const errors: unknown[] = [];
+    let lookups = 0;
+    const verify = createPayerProofVerifier({
+      fetchPayerSigningKey: async () => {
+        lookups++;
+        return [];
+      },
+      onRecomputeError: (err) => errors.push(err),
+    });
+    const cyclic = mutated((p) => exerciseChildren(p, "0").push("0"));
+    const result = await verify(
+      input({
+        preparedTransactionBytes: Buffer.from(cyclic, "base64"),
+        claimedPreparedTxHash: "ab".repeat(32),
+      })
+    );
+    expect(result.verified).toBe(false);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(PreparedTransactionGraphError);
+    expect(lookups).toBe(0);
+  });
+
+  it("stops a shared child before the key lookup, even with the hash the library would compute", async () => {
+    // Unguarded, the library hashes this graph (each shared subtree once per
+    // path), so a claim of that hash would match and reach the key lookup.
+    const shared = mutated((p) => {
+      exerciseChildren(p, "4").push("1");
+      addSpareNodes(p, 1);
+    });
+    const libraryClaim = await libraryHashHex(shared);
+    const errors: unknown[] = [];
+    let lookups = 0;
+    const verify = createPayerProofVerifier({
+      fetchPayerSigningKey: async () => {
+        lookups++;
+        return [];
+      },
+      onRecomputeError: (err) => errors.push(err),
+    });
+    const result = await verify(
+      input({
+        preparedTransactionBytes: Buffer.from(shared, "base64"),
+        claimedPreparedTxHash: libraryClaim,
+      })
+    );
+    expect(result.verified).toBe(false);
+    expect(lookups).toBe(0);
+    expect(errors[0]).toBeInstanceOf(PreparedTransactionGraphError);
+  });
+
+  it("refuses a payment past its hashing budget before the key lookup, as a budget error", async () => {
+    // The hasher awaits once per part of a dotted name: 38,000 dots fit in the
+    // inline carriage's 64 KB and took over 100 ms to hash.
+    const errors: unknown[] = [];
+    let lookups = 0;
+    const verify = createPayerProofVerifier({
+      fetchPayerSigningKey: async () => {
+        lookups++;
+        return [];
+      },
+      onRecomputeError: (err) => errors.push(err),
+    });
+    const dotted = mutated((p) => (nodeBody(p, "3").templateId!.moduleName = ".".repeat(38_000)));
+    const result = await verify(
+      input({
+        preparedTransactionBytes: Buffer.from(dotted, "base64"),
+        claimedPreparedTxHash: "ab".repeat(32),
+      })
+    );
+    expect(result.verified).toBe(false);
+    expect(lookups).toBe(0);
+    expect(errors[0]).toBeInstanceOf(PreparedTransactionBudgetError);
+  });
+
+  it("labels a budget refusal budget, before graph, and anything else error", () => {
+    expect(recomputeFailureKind(new PreparedTransactionBudgetError("over"))).toBe("budget");
+    expect(recomputeFailureKind(new PreparedTransactionGraphError("cycle"))).toBe("graph");
+    expect(recomputeFailureKind(new Error("encode"))).toBe("error");
+    expect(recomputeFailureKind("not an error")).toBe("error");
+  });
+
+  it("reports any other recompute failure as is", async () => {
+    const errors: unknown[] = [];
+    const verify = createPayerProofVerifier({ onRecomputeError: (err) => errors.push(err) });
+    const result = await verify(
+      input({
+        preparedTransactionBytes: Buffer.from([0xff, 0xff, 0xff]),
+        claimedPreparedTxHash: "ab".repeat(32),
+      })
+    );
+    expect(result.verified).toBe(false);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).not.toBeInstanceOf(PreparedTransactionGraphError);
   });
 });
 

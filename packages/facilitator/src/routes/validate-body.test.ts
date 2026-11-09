@@ -442,8 +442,7 @@ describe("validate-body extra field edge cases", () => {
   });
 
 
-  it("paymentPayload with null resource → 400", () => {
-    // resource must be an object with a string url field.
+  it("paymentPayload with null resource → accepted (nullable in the official v2 schema)", () => {
     const body = {
       ...VALID,
       paymentPayload: {
@@ -451,7 +450,49 @@ describe("validate-body extra field edge cases", () => {
         resource: null,
       },
     };
-    expect(validateFacilitatorRequestShape(body).ok).toBe(false);
+    expect(validateFacilitatorRequestShape(body).ok).toBe(true);
+  });
+
+  describe("official x402 v2 PaymentPayload (scheme and network only in `accepted`)", () => {
+    const { scheme: _s, network: _n, resource: _r, ...rest } = VALID.paymentPayload;
+    const official = {
+      ...VALID,
+      paymentPayload: {
+        ...rest,
+        accepted: { ...VALID.paymentRequirements },
+      },
+    };
+
+    it("is accepted without top-level scheme, network or resource", () => {
+      expect(validateFacilitatorRequestShape(official).ok).toBe(true);
+    });
+
+    it("still refuses a non-exact scheme in `accepted`", () => {
+      const bad = {
+        ...official,
+        paymentPayload: {
+          ...official.paymentPayload,
+          accepted: { ...official.paymentPayload.accepted, scheme: "upto" },
+        },
+      };
+      expect(validateFacilitatorRequestShape(bad).ok).toBe(false);
+    });
+
+    it("still refuses a non-canton network in `accepted`", () => {
+      const bad = {
+        ...official,
+        paymentPayload: {
+          ...official.paymentPayload,
+          accepted: { ...official.paymentPayload.accepted, network: "eip155:8453" },
+        },
+      };
+      expect(validateFacilitatorRequestShape(bad).ok).toBe(false);
+    });
+
+    it("refuses when neither the top level nor `accepted` names the scheme", () => {
+      const bad = { ...official, paymentPayload: { ...official.paymentPayload, accepted: {} } };
+      expect(validateFacilitatorRequestShape(bad).ok).toBe(false);
+    });
   });
 
   it("paymentPayload.resource.url = '' → accepted (body validator only checks typeof string, not length)", () => {

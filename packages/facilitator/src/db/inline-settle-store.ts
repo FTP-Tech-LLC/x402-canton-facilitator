@@ -74,12 +74,13 @@ export interface InlineSettleStore {
    * Write the INTENT to submit, BEFORE handing anything to the participant.
    * Returns false when a record already existed (a concurrent settle won the
    * race, or this is a retry) — the caller must then read it and act on what it
-   * says rather than dispatching.
+   * says rather than dispatching. "unrecorded" when the write failed: the
+   * caller dispatches anyway, but no mark guards a retry of this submission.
    */
   recordDispatched(
     txHashHex: string,
     meta?: { submissionId?: string; beginExclusive?: number; participant?: string }
-  ): Promise<boolean>;
+  ): Promise<boolean | "unrecorded">;
   /**
    * Record `updateId` against `txHashHex`, promoting a "dispatched" row to
    * "settled". Returns false only when a DIFFERENT updateId was already
@@ -307,7 +308,7 @@ export function createPostgresInlineSettleStore(
         // into a refusal of honest payments. We lose the marker for this one
         // request and behave as we did before.
         onError("recordDispatched", err);
-        return true;
+        return "unrecorded";
       }
     },
     async recordSettled(txHashHex, updateId) {

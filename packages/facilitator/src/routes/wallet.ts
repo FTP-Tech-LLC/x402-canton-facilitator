@@ -27,18 +27,33 @@ import {
   isAcsLimitExceeded,
   queryActiveContractsBounded,
 } from "@ftptech/x402-canton-ledger";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  createCircuitBreaker,
   createSlidingWindowLimiter,
   createPenaltyBox,
   provesNothingCommitted,
+  type CircuitBreakerConfig,
 } from "../rate-limit.js";
-import { clientIp } from "./common.js";
-import { FaucetService, FaucetPreSubmitError } from "../canton/faucet.js";
+import { clientIp, hasTrustedKey, ipBucket, timingSafeEqualStr } from "./common.js";
+import {
+  linkSettlementsWithLookback,
+  parseTradecraftUpdatesQuery,
+  summarizeTradecraftPage,
+  tradecraftReadIds,
+  tradecraftUpdatesFilter,
+} from "./tradecraft-updates.js";
+import { FaucetService, FaucetPreSubmitError, type FaucetSubmit } from "../canton/faucet.js";
 import { UnfundedFeePartyError } from "../canton/preapproval.js";
 import { SubmissionOutcomeUnknownError } from "../canton/transfer-factory.js";
 import type { FaucetClaimStore } from "../db/faucet-store.js";
 import type { FacilitatorMetrics } from "../metrics.js";
+import type { ReadProofGuard } from "./read-proof.js";
+import { COOLDOWN_WAIT_SLACK_MS, ScanBudgetRefusedError, type ScanBudget } from "../scan-budget.js";
+
+/** Longest Scan cooldown a pay/prepare read off the payment path waits out once
+ *  (the same as Rule 7's). */
+const PAY_PREPARE_COOLDOWN_WAIT_MS = 2_000;
 
 /** Extra attempts for a starter grant to a party allocated moments ago (2.5 s
  *  apart, ~20 s in all): long enough for a new party to reach the synchronizer. */
@@ -54,14 +69,6 @@ function isUnknownInformees(err: unknown): boolean {
   );
 }
 
-/** Constant-time string equality (length-checked first, then timingSafeEqual on
- *  equal-length buffers). Mirrors the attribution/registry token checks. */
-function timingSafeEqualStr(a: string, b: string): boolean {
-  const ab = Buffer.from(a, "utf8");
-  const bb = Buffer.from(b, "utf8");
-  return ab.length === bb.length && timingSafeEqual(ab, bb);
-}
-
 export interface WalletRelayServices {
   /** DAML choices `/v1/wallet/submit/prepare` will build. See
    *  {@link deniedChoice} and FacilitatorConfig.walletSubmitChoiceAllowlist. */
@@ -72,6 +79,9 @@ export interface WalletRelayServices {
   /** Exact template/interface ids `GET /v1/wallet/:party/contracts` may list;
    *  empty or absent = that route answers 404. */
   walletReadIds?: readonly string[];
+  /** Signed-read check for `GET /v1/wallet/:party/...` (see read-proof.ts).
+   *  Absent = reads are not checked at all (same as mode `off`). */
+  readProofGuard?: ReadProofGuard;
   /** Prometheus metrics surface (same instance as /settle). When present, relay
    *  route failures are counted on `relay_error_total{route,kind}` — the signal
    *  the CC-payment blind spot (pay/prepare failing while /settle looked healthy)
@@ -83,6 +93,23 @@ export interface WalletRelayServices {
   /** Per-CALLER ceiling; the per-key cap contains a caller-asserted party and
    *  therefore cannot bound a caller who varies it. */
   submitRateMaxPerIp?: number;
+  /** pay/prepare admissions per minute for a caller without a trusted key: per
+   *  (party, caller IP) and per caller IP. `<= 0` or absent disables each. */
+  payPrepareRateMaxPerKey?: number;
+  payPrepareRateMaxPerIp?: number;
+  /** Is `party` a merchant on the payment path right now (paid through us, or
+   *  listed by the operator)? pay/prepare's Canton Coin factory read for a
+   *  caller without a trusted key is priority only for such a receiver, and
+   *  best-effort for any other. Absent: every pay/prepare read is priority. */
+  isPaymentPathMerchant?: (party: string, now: number) => boolean;
+  /** Facilitator-wide ceiling on relay SUBMISSIONS per minute: submit/execute
+   *  and preapproval/self/commit together, the two routes that spend our
+   *  Global Synchronizer traffic on caller bytes. Callers without a trusted
+   *  key may use three quarters of it. `<= 0` or absent disables. */
+  submitRateMaxGlobal?: number;
+  /** Traffic breaker for the same two routes, the /settle pattern. Absent (or
+   *  threshold `<= 0`) means no breaker. */
+  submitBreaker?: CircuitBreakerConfig;
   /** Facilitator-wide ceiling on external-party allocations per minute. The
    *  per-IP caps are admission control and cannot bound a resource that is
    *  shared by everyone: a permanent party, our Global Synchronizer traffic,
@@ -93,6 +120,30 @@ export interface WalletRelayServices {
    *  pacing under the minute cap cannot exhaust the participant's user-rights
    *  slots over a day and lock onboarding for everyone. `<= 0` disables. */
   onboardDailyMax?: number;
+  /** Part of `onboardDailyMax` callers without a trusted key may use per 24h,
+   *  so the rest stays for the hosted MCP and pay-proxy users. Absent: three
+   *  quarters of `onboardDailyMax`. `<= 0` disables. */
+  onboardDailyMaxAnonymous?: number;
+  /** Part of `onboardDailyMax` callers with a trusted key may use per 24h, so
+   *  accounts gathered on the hosted MCP cannot take the whole day either.
+   *  Absent: three quarters of `onboardDailyMax`. `<= 0` disables. */
+  onboardDailyMaxTrusted?: number;
+  /** Allocations per 24h for one network (an IPv4 address, an IPv6 /64)
+   *  without a trusted key. Absent: 20. `<= 0` disables. */
+  onboardDailyMaxPerIp?: number;
+  /** Per-caller cap on onboard/prepare and onboard/finalize per minute, each.
+   *  Absent: `submitRateMaxPerKey`, as before. `<= 0` disables. */
+  onboardRateMaxPerIp?: number;
+  /** X-Agent-Key values of the services that call for many users from one IP
+   *  (the hosted MCP, the pay-proxy). A request carrying one skips the per-IP
+   *  caps, abuse strikes and bans; per-party and global caps still apply. */
+  trustedKeys?: readonly string[];
+  /** Read routes (balance, holdings, pending, tx-amulets, contracts): per
+   *  caller IP, per minute. `<= 0` disables. */
+  readRateMaxPerIp?: number;
+  /** Reads that fetch from the SV Scan or a registry (resolve/*,
+   *  holdings-scan): per caller IP, per minute. `<= 0` disables. */
+  scanReadRateMaxPerIp?: number;
   /** Escalating-cooldown (penalty box) for repeat abusers on agent-side money
    *  routes. Optional so route tests can omit it; `abuseStrikesToBan <= 0`
    *  disables the mechanism. */
@@ -153,7 +204,7 @@ export interface WalletRelayServices {
     // a holding's HoldingV1 view by contract id for the ones a narrowed read
     // finds beyond it (readHoldingsSlice). Optional: a client without them
     // keeps the plain read and its 413.
-    Partial<Pick<CantonClient, "queryActiveContractsSlice" | "getEventsByContractId">>;
+    Partial<Pick<CantonClient, "queryActiveContractsSlice" | "getEventsByContractId" | "getUpdatesPage">>;
   synchronizerId: string;
   /** Relay's ledger user (validator m2m). Granted CanActAs on each onboarded
    * agent party so the relay can PREPARE (never sign) for it. */
@@ -163,7 +214,8 @@ export interface WalletRelayServices {
    *  every call goes to `client` as `userId`, exactly as before. */
   router?:
     | {
-        forParty(party: string): Promise<{ client: WalletRelayServices["client"]; userId: string }>;
+        /** `id`: the participant's stable identity (see participant-router.ts). */
+        forParty(party: string): Promise<{ client: WalletRelayServices["client"]; userId: string; id?: string }>;
         hosts(party: string): Promise<boolean | undefined>;
       }
     | undefined;
@@ -190,6 +242,10 @@ export interface WalletRelayServices {
    *  transient 5xx/429 on the primary (see FacilitatorConfig.scanFallbackUrls).
    *  OPTIONAL — absent/empty means no failover (tests, default). */
   scanFallbackUrls?: string[];
+  /** The process-wide outbound Scan budget (scan-budget.ts), shared with the
+   *  payment path. Relay Scan reads from callers without a trusted key are its
+   *  best-effort class. Absent: every read is sent and retried as before. */
+  scanBudget?: ScanBudget | undefined;
   /** Non-Amulet CIP-56 instrument registries: instrument admin party →
    *  DA Registry Utility base URL (see FacilitatorConfig.tokenRegistries).
    *  When `resolve/transfer-factory` is asked for an instrument whose admin is
@@ -241,9 +297,15 @@ export interface WalletRelayServices {
         ipExempt?: readonly string[] | undefined;
         /** Pay each newly onboarded party one grant right after allocation. */
         onOnboard?: boolean | undefined;
+        /** Max starter grants per client IP within `windowMs` (default 3), on
+         *  top of `maxPerIp`, which they share with the claim route. `0`
+         *  disables this one. */
+        onboardMaxPerIp?: number | undefined;
         /** Gap between starter-grant attempts while a new party propagates
          *  (default 2.5 s; tests shorten it). */
         propagationRetryMs?: number | undefined;
+        /** The Rust sender (canton/rust-submit.ts). Unset: the ledger client. */
+        submit?: FaucetSubmit | undefined;
       }
     | undefined;
   /** transfer-factory ("V3") relay-pay surface. undefined → POST
@@ -451,10 +513,13 @@ export async function registerWalletRoutes(
     );
   }
 
+  const isTrusted = (req: FastifyRequest): boolean => hasTrustedKey(req, svc.trustedKeys);
+
   // Shared API-key gate. Returns true if the request may proceed.
   const authed = (req: FastifyRequest, reply: FastifyReply): boolean => {
     if (!svc.agentWalletApiKey) return true;
     if (req.headers["x-agent-key"] === svc.agentWalletApiKey) return true;
+    if (isTrusted(req)) return true;
     reply.code(401).send({ error: "missing or invalid X-Agent-Key" });
     return false;
   };
@@ -473,12 +538,14 @@ export async function registerWalletRoutes(
     strikeSpacingMs: svc.abuseStrikeSpacingMs ?? 60_000,
   });
   /** True (and replies 429) when the caller IP is under an active ban. Call at
-   *  the top of an agent-side handler, before any work. */
+   *  the top of an agent-side handler, before any work. Never for a trusted
+   *  request: a ban on the IP it shares must not refuse its own calls. */
   const penaltyBlocked = (
     req: FastifyRequest,
     reply: FastifyReply,
     where: string
   ): boolean => {
+    if (isTrusted(req)) return false;
     const now = Date.now();
     const until = penaltyBox.bannedUntil(clientIp(req), now);
     if (!until) return false;
@@ -491,10 +558,59 @@ export async function registerWalletRoutes(
     return true;
   };
   /** Record one abuse strike for the caller IP. Call where an agent-side route
-   *  refuses the caller for its OWN per-IP cap (repeated refusals escalate). */
+   *  refuses the caller for its OWN per-IP cap (repeated refusals escalate).
+   *  A trusted request is never struck. */
   const strikeAbuse = (req: FastifyRequest): void => {
+    if (isTrusted(req)) return;
     penaltyBox.strike(clientIp(req), Date.now());
   };
+  /** IP-keyed budgets count a trusted request apart from the unkeyed requests
+   *  its users can make it send from the same IP: no per-IP cap (0), and
+   *  "trusted" in place of the IP in a per-party key. */
+  const ipCap = (req: FastifyRequest, cap: number): number => (isTrusted(req) ? 0 : cap);
+  const ipOrTrusted = (req: FastifyRequest): string => (isTrusted(req) ? "trusted" : clientIp(req));
+
+  /** No global cap per tier: these reads are on the payment path and a refusal
+   *  earns no strike, so a few IPs at their cap could refuse every wallet. */
+  const readLimiter = createSlidingWindowLimiter({ maxPerPayer: 0, maxGlobal: 0, windowMs: 60_000 });
+  const readAllowed = (
+    req: FastifyRequest,
+    reply: FastifyReply,
+    where: string,
+    tier: "ledger" | "scan" = "ledger",
+    own?: { key: string; maxPerIp: number; maxGlobal: number }
+  ): boolean => {
+    if (penaltyBlocked(req, reply, where)) return false;
+    const ip = clientIp(req);
+    const keys: { key: string; max: number }[] = [];
+    if (!isTrusted(req)) {
+      keys.push({
+        key: `${tier}:ip:${ip}`,
+        max: tier === "scan" ? (svc.scanReadRateMaxPerIp ?? 120) : (svc.readRateMaxPerIp ?? 600),
+      });
+      if (own) keys.push({ key: `${own.key}:ip:${ip}`, max: own.maxPerIp });
+    }
+    if (own) keys.push({ key: own.key, max: own.maxGlobal });
+    const ok = readLimiter.allowKeys(keys, Date.now());
+    if (ok) return true;
+    req.log.warn({ where, ip }, "wallet relay: read rate-limited");
+    reply
+      .code(429)
+      .header("Retry-After", "60")
+      .send({ error: "too many wallet reads; retry in a minute" });
+    return false;
+  };
+  /** Signed-read check for the per-party reads; true = go on. Trusted keys are exempt. */
+  const readProven = async (req: FastifyRequest, reply: FastifyReply): Promise<boolean> =>
+    svc.readProofGuard
+      ? svc.readProofGuard(req, reply, isTrusted(req), {
+          key: ipBucket(clientIp(req)),
+        })
+      : true;
+  /** One more ledger read inside a request already allowed, charged to the
+   *  same per-IP budget. A refusal sends nothing: the caller drops the extra. */
+  const readBudget = (req: FastifyRequest): boolean =>
+    isTrusted(req) || readLimiter.allowKeys([{ key: `ledger:ip:${clientIp(req)}`, max: svc.readRateMaxPerIp ?? 600 }], Date.now());
 
   /**
    * Distinct parties WE HOST that the participant has refused to read for us
@@ -617,6 +733,23 @@ export async function registerWalletRoutes(
      *  refusal can be traced to a merchant without a packet capture. */
     ctx: Record<string, unknown> = {}
   ) => {
+    // SHED BY THE SHARED SCAN BUDGET: not our outage and not the caller's
+    // fault, so neither a 502 nor a relay_error. 503 with the wait: nothing was
+    // done, and the same request can simply come back.
+    if (err instanceof ScanBudgetRefusedError) {
+      reply.log.warn(
+        { where, ...ctx, reason: err.reason, retryAfterSeconds: err.retryAfterSeconds },
+        "wallet relay: best-effort Scan read shed to keep the Scan budget for payments"
+      );
+      svc.metrics?.recordRateLimited("scan");
+      return reply
+        .code(503)
+        .header("Retry-After", String(err.retryAfterSeconds))
+        .send({
+          error: "scan_busy",
+          detail: `the relay is holding Scan reads back for payments; nothing was done, retry in ${err.retryAfterSeconds}s`,
+        });
+    }
     let detail = err instanceof Error ? err.message : String(err);
     // Surface the upstream Canton error code/cause (e.g. TOO_MANY_USER_RIGHTS)
     // instead of a bare "HTTP 400": the participant body carries the real reason,
@@ -741,6 +874,21 @@ export async function registerWalletRoutes(
     "/v1/wallet/preapproval/self/prepare",
     async (req, reply) => {
       if (!authed(req, reply)) return;
+      // BOUNDED LIKE EVERY OTHER PREPARE ROUTE. This one had no limiter and no
+      // penalty box: each call is a participant prepare plus an ACS read of
+      // whatever party the body names (our relay user can read any party on
+      // the node), so one anonymous IP could loop it without end (the
+      // 2026-11-07 audit, against dist: 500 calls from one address, 500
+      // participant prepares, not one 429), and an IP banned on onboarding
+      // went on calling it. The
+      // same per-IP admission cap as submit/prepare, keyed on the caller
+      // because the party in the body is caller-asserted; a trusted key skips
+      // it as it does there. Refusals here earn strikes like any other.
+      if (
+        !onboardAllowed(req, reply, "preapproval/self/prepare", ipCap(req, svc.submitRateMaxPerKey ?? 60))
+      ) {
+        return;
+      }
       if (!svc.selfPreapproval) {
         return reply.code(503).send({ error: "self-preapproval disabled" });
       }
@@ -830,11 +978,11 @@ export async function registerWalletRoutes(
     // abuse, not theft. That is what the budget was always for.
     const submitParty = FAUCET_PARTY_RE.test(party) ? party : "unknown";
     const submitCap = svc.submitRateMaxPerKey ?? 60;
-    const submitIpCap = svc.submitRateMaxPerIp ?? submitCap * 4;
+    const submitIpCap = ipCap(req, svc.submitRateMaxPerIp ?? submitCap * 4);
     const submitKeys: Array<{ key: string; max: number }> = [];
     if (submitCap > 0) {
       submitKeys.push({
-        key: `submit:${submitParty}|${clientIp(req)}`,
+        key: `submit:${submitParty}|${ipOrTrusted(req)}`,
         max: submitCap,
       });
     }
@@ -865,14 +1013,25 @@ export async function registerWalletRoutes(
         .header("Retry-After", "60")
         .send({ error: "too many submissions" });
     }
+    // The same spend line as /submit/execute: same act, same shared minute,
+    // same breaker.
+    const giveBack = submitSpend(req, reply, "preapproval/self/commit");
+    if (!giveBack) return;
     try {
-      const r = await svc.selfPreapproval.executeSelfPreapproval({
-        party,
-        preparedTransaction,
-        hashingSchemeVersion:
-          req.body?.hashingSchemeVersion ?? "HASHING_SCHEME_VERSION_V2",
-        partySignatures,
-      });
+      let r: { updateId: string };
+      try {
+        r = await svc.selfPreapproval.executeSelfPreapproval({
+          party,
+          preparedTransaction,
+          hashingSchemeVersion:
+            req.body?.hashingSchemeVersion ?? "HASHING_SCHEME_VERSION_V2",
+          partySignatures,
+        });
+      } catch (err) {
+        noteSubmitFailure(err, giveBack, [party, ...signingParties(partySignatures)]);
+        throw err;
+      }
+      submitBreaker.recordSuccess(Date.now());
       return reply.send(r);
     } catch (err) {
       // Accepted-but-unreadable is not "it failed" — same distinction the
@@ -909,6 +1068,19 @@ export async function registerWalletRoutes(
     Body: { party?: string; instrumentId?: { admin?: string; id?: string } };
   }>("/v1/wallet/preapproval/registry/self/prepare", async (req, reply) => {
     if (!authed(req, reply)) return;
+    // Same bound as preapproval/self/prepare, for the same reason: every call
+    // is a participant prepare and a GET to the registry operator, and the
+    // route had neither a cap nor the penalty box.
+    if (
+      !onboardAllowed(
+        req,
+        reply,
+        "preapproval/registry/self/prepare",
+        ipCap(req, svc.submitRateMaxPerKey ?? 60)
+      )
+    ) {
+      return;
+    }
     const party = req.body?.party?.trim();
     const admin = req.body?.instrumentId?.admin?.trim();
     const id = req.body?.instrumentId?.id?.trim();
@@ -979,7 +1151,7 @@ export async function registerWalletRoutes(
     };
   }>("/v1/wallet/onboard/prepare", async (req, reply) => {
     if (!authed(req, reply)) return;
-    if (!onboardAllowed(req, reply, "onboard/prepare")) return;
+    if (!onboardAllowed(req, reply, "onboard/prepare", onboardIpCap(req))) return;
     const { publicKey, partyHint } = req.body ?? ({} as never);
     if (!publicKey?.keyData || !partyHint) {
       return reply.code(400).send({ error: "publicKey and partyHint required" });
@@ -996,6 +1168,10 @@ export async function registerWalletRoutes(
           ? { otherConfirmingParticipantUids: [svc.onboardCoHost.participantUid], confirmationThreshold: 1 }
           : { confirmationThreshold: 0 }),
       });
+      // The relay just built this party for this key (the namespace IS the
+      // key's fingerprint). Remember it for read proofs; trusted only once the
+      // party is really allocated (finalize).
+      svc.readProofGuard?.stageKey(r.partyId, Buffer.from(publicKey.keyData, "base64"));
       return reply.send({
         party: r.partyId,
         publicKeyFingerprint: r.publicKeyFingerprint,
@@ -1029,17 +1205,33 @@ export async function registerWalletRoutes(
     // faucet/claim, preapproval/self/commit) already carries a
     // limiter; these three did not, so the cheapest way to make us pay was the
     // one door with no lock on it.
-    if (!onboardAllowed(req, reply, "onboard/finalize")) return;
+    if (!onboardAllowed(req, reply, "onboard/finalize", onboardIpCap(req))) return;
     const { onboardingTransactions, multiHashSignatures } =
       req.body ?? ({} as never);
-    if (!onboardingTransactions?.length || !multiHashSignatures?.length) {
+    // The shape is checked before anything is charged: a body that fails here
+    // must not hold a budget slot, and one that passes reaches the participant.
+    const isObject = (x: unknown): boolean => typeof x === "object" && x !== null && !Array.isArray(x);
+    if (
+      !Array.isArray(onboardingTransactions) ||
+      onboardingTransactions.length === 0 ||
+      !onboardingTransactions.every((t) => typeof t === "string" && t.length > 0) ||
+      !Array.isArray(multiHashSignatures) ||
+      multiHashSignatures.length === 0 ||
+      !multiHashSignatures.every(isObject)
+    ) {
       return reply
         .code(400)
         .send({ error: "onboardingTransactions and multiHashSignatures required" });
     }
     // THE LINE PAST WHICH WE SPEND. Everything above is cheap and refusable;
     // below, a permanent party exists and our traffic is gone.
-    if (!onboardSpendAllowed(req, reply)) return;
+    const refund = onboardSpendAllowed(req, reply);
+    if (!refund) return;
+    // `contacted` is set just before a participant is called, `written` once
+    // the first one has allocated: from then on nothing charged above comes
+    // back.
+    let contacted = false;
+    let written = false;
     try {
       const allocation = {
         synchronizer: svc.synchronizerId,
@@ -1053,9 +1245,13 @@ export async function registerWalletRoutes(
       // is allocated on both; it becomes active only once both have. The
       // co-host goes first: if it refuses, nothing was done on the primary.
       if (svc.onboardCoHost) {
+        contacted = true;
         await svc.onboardCoHost.client.allocateExternalParty(allocation);
+        written = true;
       }
+      contacted = true;
       const r = await svc.client.allocateExternalParty(allocation);
+      written = true;
       if (svc.onboardCoHost && svc.onboardCoHost.grantPartyRights !== false) {
         // The co-host learns that the party is active from the synchronizer, on
         // its own clock, so the first grant can come too early: retry briefly.
@@ -1103,26 +1299,26 @@ export async function registerWalletRoutes(
         }
       }
       // A NEW WALLET STARTS FUNDED. The grant is reserved here, before the
-      // answer (party-once + daily budget + lifetime cap, one statement), so
-      // "scheduled" is only ever said about a grant that will be paid; the
-      // transfer itself runs in the background, because the party is seconds
-      // old and may need a few retries before the synchronizer knows it. A
-      // refusal or a store error is logged and never fails the onboarding:
-      // the wallet itself was created.
+      // answer (the caller's faucet caps, then party-once + daily budget +
+      // lifetime cap in one statement), so "scheduled" is only ever said
+      // about a grant that will be paid; the transfer itself runs in the
+      // background, because the party is seconds old and may need a few
+      // retries before the synchronizer knows it. A refusal or a store error
+      // is logged and never fails the onboarding: the wallet itself was
+      // created.
+      svc.readProofGuard?.seedKey(r.partyId);
       let grant = false;
       if (faucetCfg?.onOnboard === true && faucetSvc !== undefined) {
         const party = r.partyId;
         try {
-          const reason = await reserveFaucetGrant(party, req.ip);
+          const reason = starterGrantCapped(req) ?? (await reserveFaucetGrant(party, req.ip));
           if (reason === "ok") {
+            chargeStarterGrant(req);
             grant = true;
             void payReservedFaucetGrant(party, req.ip, req.log, STARTER_GRANT_PROPAGATION_RETRIES).then(
               (out) => {
                 if (out.kind === "failed") {
-                  req.log.warn(
-                    { party, err: out.err instanceof Error ? out.err.message : String(out.err) },
-                    "starter grant failed"
-                  );
+                  req.log.warn({ party, err: out.err }, "starter grant failed");
                 }
               }
             );
@@ -1143,6 +1339,14 @@ export async function registerWalletRoutes(
           : {}),
       });
     } catch (err) {
+      // Failed before anything was written. The day's slots go back, within
+      // the refund budget: a participant outage or a refused body must not
+      // spend the day, and an allocation that did happen behind a timeout is
+      // undercounted by at most that budget. The minute's slot goes back when
+      // no participant was called or one refused (a 4xx), so junk does not
+      // hold the minute shared with trusted callers, while retries against a
+      // struggling participant stay paced.
+      if (!written) refund({ minute: !contacted || provesNothingCommitted(err) });
       return relayError(reply, "onboard/finalize", err);
     }
   });
@@ -1152,7 +1356,7 @@ export async function registerWalletRoutes(
     "/v1/wallet/submit/prepare",
     async (req, reply) => {
       if (!authed(req, reply)) return;
-      if (!onboardAllowed(req, reply, "submit/prepare")) return;
+      if (!onboardAllowed(req, reply, "submit/prepare", ipCap(req, svc.submitRateMaxPerKey ?? 60))) return;
       const body = req.body;
       if (!body?.commands?.length || !body?.actAs?.length) {
         return reply.code(400).send({ error: "commands and actAs required" });
@@ -1238,11 +1442,11 @@ export async function registerWalletRoutes(
       // stays because it is what keeps one agent's traffic from spending
       // another's budget behind a shared NAT.
       const submitCap = svc.submitRateMaxPerKey ?? 60;
-      const submitIpCap = svc.submitRateMaxPerIp ?? submitCap * 4;
+      const submitIpCap = ipCap(req, svc.submitRateMaxPerIp ?? submitCap * 4);
       const submitKeys: Array<{ key: string; max: number }> = [];
       if (submitCap > 0) {
         submitKeys.push({
-          key: `submit:${submitParty}|${clientIp(req)}`,
+          key: `submit:${submitParty}|${ipOrTrusted(req)}`,
           max: submitCap,
         });
       }
@@ -1278,7 +1482,17 @@ export async function registerWalletRoutes(
         // signing party: the offset and the completion stream are local to it.
         const ledger = submitParty !== "unknown" ? await ledgerFor(submitParty) : { client: svc.client, userId: svc.userId };
         const offset0 = (await ledger.client.getLedgerEnd()).offset;
-        const r = await ledger.client.interactiveSubmissionExecute({ ...body, submissionId });
+        // Breaker and global arm, here and not at admission: this is the line
+        // past which the caller's bytes spend our traffic.
+        const giveBack = submitSpend(req, reply, "submit/execute");
+        if (!giveBack) return;
+        let r: Awaited<ReturnType<typeof ledger.client.interactiveSubmissionExecute>>;
+        try {
+          r = await ledger.client.interactiveSubmissionExecute({ ...body, submissionId });
+        } catch (err) {
+          noteSubmitFailure(err, giveBack, [submissionId, ...signingParties(body.partySignatures)]);
+          throw err;
+        }
         // THE EXECUTE POST HAS RETURNED 200. The submission is accepted and will
         // be sequenced; /execute is async and normally answers `{}` with the
         // updateId arriving on the completion stream. Everything below READS the
@@ -1325,6 +1539,8 @@ export async function registerWalletRoutes(
             return outcomeUnknown(reply, "submit/execute", submissionId);
           }
         }
+        // Committed: the traffic was there. The breaker's rate arm counts it.
+        submitBreaker.recordSuccess(Date.now());
         return reply.send({ updateId });
       } catch (err) {
         return relayError(reply, "submit/execute", err);
@@ -1365,6 +1581,8 @@ export async function registerWalletRoutes(
     "/v1/wallet/:party/holdings",
     async (req, reply) => {
       if (!authed(req, reply)) return;
+      if (!readAllowed(req, reply, "holdings")) return;
+      if (!(await readProven(req, reply))) return;
       const party = req.params.party;
       const { admin, id } = req.query;
       if ((admin && !id) || (!admin && id)) {
@@ -1422,6 +1640,8 @@ export async function registerWalletRoutes(
     "/v1/wallet/:party/balance",
     async (req, reply) => {
       if (!authed(req, reply)) return;
+      if (!readAllowed(req, reply, "balance")) return;
+      if (!(await readProven(req, reply))) return;
       const party = req.params.party;
       try {
         // Scope to the Amulet TEMPLATE — NOT a WildcardFilter. The loop below
@@ -1486,21 +1706,41 @@ export async function registerWalletRoutes(
       svc.scanUrl.replace(/\/$/, ""),
       ...(svc.scanFallbackUrls ?? []).map((u) => u.replace(/\/$/, "")),
     ].filter((u, i, a) => u && a.indexOf(u) === i);
+  //
+  // `priority` is the read's class in the shared outbound Scan budget
+  // (scan-budget.ts). True — the default — is the payment path and our own
+  // work: counted, never refused, retried as below. False is a relay read an
+  // anonymous caller asked for: every attempt must be admitted by the budget,
+  // and a 429 ends it at once, with no retry and no failover. A 429 is DA
+  // saying our one egress address is over its budget; eight more attempts per
+  // read were the multiplier that let a few IPs exhaust it for /settle too.
   const scanFetchRetry = async (
     path: string,
-    init: RequestInit
+    init: RequestInit,
+    priority = true
   ): Promise<Response> => {
+    const budget = svc.scanBudget;
     let lastErr: unknown;
     let lastRes: Response | undefined;
     for (const base of scanBases()) {
       for (let attempt = 0; ; attempt++) {
+        const url = `${base}${path}`;
+        const refused = budget?.admit(priority, Date.now(), url);
+        if (refused) throw refused;
         let res: Response | undefined;
         try {
-          res = await fetch(`${base}${path}`, init);
+          res = await fetch(url, init);
         } catch (err) {
           lastErr = err; // network/transport fault — transient
         }
         if (res?.ok) return res;
+        if (res?.status === 429 && budget?.enabled && budget.isScan(url)) {
+          const refusal = budget.noteRateLimited(Date.now(), url);
+          if (!priority) {
+            await res.body?.cancel().catch(() => undefined);
+            throw refusal;
+          }
+        }
         const transient = !res || res.status === 429 || res.status >= 500;
         if (res) lastRes = res;
         if (transient && attempt < 3) {
@@ -1547,23 +1787,39 @@ export async function registerWalletRoutes(
   let migrationIdCache: { migrationId: number; recordTime: string; at: number } | undefined;
   const snapshotBefore = (): string => new Date().toISOString();
   /** Read the snapshot record_time for a specific migration id, or null when that
-   *  migration has no snapshot before `before` (non-2xx after the bounded retries). */
+   *  migration has no snapshot before `before` (non-2xx after the bounded retries).
+   *  A best-effort read the budget refused or Scan 429'd THROWS: "we did not get
+   *  to ask" must never read as "this migration has no snapshot", or the walk
+   *  settles on an older migration and caches its stale snapshot for an hour. */
   const snapshotTimestampFor = async (
     migrationId: number,
-    before: string
+    before: string,
+    priority: boolean
   ): Promise<string | null> => {
     const r = await scanFetchRetry(
       `/api/scan/v0/state/acs/snapshot-timestamp?before=${encodeURIComponent(before)}` +
         `&migration_id=${migrationId}`,
-      { headers: { Accept: "application/json" } }
+      { headers: { Accept: "application/json" } },
+      priority
     );
     if (!r.ok) return null;
     const j = (await r.json()) as { record_time?: string };
     return typeof j.record_time === "string" ? j.record_time : null;
   };
+  /** Gap between the requests of one best-effort multi-request read. Without
+   *  it the probe walk and the page loop trip DA's two-request burst by
+   *  themselves (unpaced sequential reads did exactly that to the attribution
+   *  worker, e33dc0e), and a best-effort read is not retried. Priority reads
+   *  keep their old pace and their retries. */
+  const scanPace = async (priority: boolean): Promise<void> => {
+    const ms = priority ? 0 : (svc.scanBudget?.paceMs ?? 0);
+    if (ms > 0) await new Promise((r) => setTimeout(r, ms));
+  };
   /** The live migration id + its snapshot record_time, cached ~1h. Picks the
    *  probed migration with the LATEST record_time (not merely the first present). */
-  const discoverMigration = async (): Promise<{
+  const discoverMigration = async (
+    priority: boolean
+  ): Promise<{
     migrationId: number;
     recordTime: string;
   }> => {
@@ -1577,7 +1833,8 @@ export async function registerWalletRoutes(
     const before = snapshotBefore();
     let best: { migrationId: number; recordTime: string } | undefined;
     for (let mid = MIGRATION_ID_PROBE_MAX; mid >= 0; mid--) {
-      const recordTime = await snapshotTimestampFor(mid, before);
+      if (mid < MIGRATION_ID_PROBE_MAX) await scanPace(priority);
+      const recordTime = await snapshotTimestampFor(mid, before, priority);
       if (recordTime === null) continue;
       // Latest record_time wins — string compare is correct for ISO-8601 UTC.
       if (!best || recordTime > best.recordTime) best = { migrationId: mid, recordTime };
@@ -1594,13 +1851,32 @@ export async function registerWalletRoutes(
   //   cid is consumed at most once), so `recordTime` is surfaced for callers.
   const HOLDINGS_SCAN_PAGE_SIZE = 500;
   const HOLDINGS_SCAN_MAX_PAGES = 40; // bound the work: 40 * 500 = 20k amulets
+  // Up to 40 Scan fetches a call, for any party the caller names: its own caps
+  // inside the Scan tier. A wallet calls it once per merge run. The global cap
+  // takes 20 IPs held at their own cap to exhaust, and bounds the worst case
+  // at 4000 Scan pages a minute, far past the burst DA allows our one address
+  // (about two rapid requests, e33dc0e). So for a caller without a trusted key
+  // every page is also a best-effort read of the shared Scan budget.
+  const HOLDINGS_SCAN_MAX_PER_IP = 5;
+  const HOLDINGS_SCAN_MAX_GLOBAL = 100;
   app.get<{ Params: { party: string } }>(
     "/v1/wallet/:party/holdings-scan",
     async (req, reply) => {
       if (!authed(req, reply)) return;
+      if (
+        !readAllowed(req, reply, "holdings-scan", "scan", {
+          key: "holdings-scan",
+          maxPerIp: HOLDINGS_SCAN_MAX_PER_IP,
+          maxGlobal: HOLDINGS_SCAN_MAX_GLOBAL,
+        })
+      ) {
+        return;
+      }
+      if (!(await readProven(req, reply))) return;
       const party = req.params.party;
+      const priority = isTrusted(req);
       try {
-        const { migrationId, recordTime } = await discoverMigration();
+        const { migrationId, recordTime } = await discoverMigration(priority);
         const holdings: Array<{ cid: string; amount: string }> = [];
         // `after` is the cursor: absent on the first request, then the previous
         // page's next_page_token. The last page omits/nulls next_page_token.
@@ -1610,17 +1886,22 @@ export async function registerWalletRoutes(
         let pages = 0;
         let more = false;
         for (; pages < HOLDINGS_SCAN_MAX_PAGES; pages++) {
-          const r = await scanFetchRetry("/api/scan/v2/holdings/state", {
-            method: "POST",
-            headers: { "content-type": "application/json", Accept: "application/json" },
-            body: JSON.stringify({
-              migration_id: migrationId,
-              record_time: recordTime,
-              owner_party_ids: [party],
-              page_size: HOLDINGS_SCAN_PAGE_SIZE,
-              ...(after !== undefined ? { after } : {}),
-            }),
-          });
+          if (pages > 0) await scanPace(priority);
+          const r = await scanFetchRetry(
+            "/api/scan/v2/holdings/state",
+            {
+              method: "POST",
+              headers: { "content-type": "application/json", Accept: "application/json" },
+              body: JSON.stringify({
+                migration_id: migrationId,
+                record_time: recordTime,
+                owner_party_ids: [party],
+                page_size: HOLDINGS_SCAN_PAGE_SIZE,
+                ...(after !== undefined ? { after } : {}),
+              }),
+            },
+            priority
+          );
           if (!r.ok) throw new Error(`holdings/state HTTP ${r.status}`);
           const j = (await r.json()) as {
             created_events?: Array<{
@@ -1686,6 +1967,7 @@ export async function registerWalletRoutes(
     };
   }>("/v1/wallet/resolve/transfer-factory", async (req, reply) => {
     if (!authed(req, reply)) return;
+    if (!readAllowed(req, reply, "resolve/transfer-factory", "scan")) return;
     const { sender, receiver, amount, meta, instrumentId, inputHoldingCids } =
       req.body ?? ({} as never);
     if (!sender || !receiver || !amount) {
@@ -1746,13 +2028,15 @@ export async function registerWalletRoutes(
           body: reqBody,
         });
       } else {
+        // Best-effort for a caller without a trusted key (scan-budget.ts).
         r = await scanFetchRetry(
           `/registry/transfer-instruction/v1/transfer-factory`,
           {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: reqBody,
-          }
+          },
+          isTrusted(req)
         );
       }
       if (!r.ok) throw new Error(`transfer-factory HTTP ${r.status}`);
@@ -1789,6 +2073,7 @@ export async function registerWalletRoutes(
       Body: { instrumentId?: { admin?: string; id?: string }; choiceArguments?: unknown };
     }>(route, async (req, reply) => {
       if (!authed(req, reply)) return;
+      if (!readAllowed(req, reply, `resolve/${label}`, "scan")) return;
       const { instrumentId, choiceArguments } = req.body ?? ({} as never);
       if (!instrumentId?.admin || !instrumentId.id || typeof choiceArguments !== "object" || choiceArguments === null) {
         return reply.code(400).send({ error: "instrumentId {admin,id} and choiceArguments required" });
@@ -1812,7 +2097,7 @@ export async function registerWalletRoutes(
               `${registryBaseUrl}/api/token-standard/v0/registrars/${encodeURIComponent(instrumentId.admin)}${registryPath}`,
               init
             )
-          : await scanFetchRetry(registryPath, init);
+          : await scanFetchRetry(registryPath, init, isTrusted(req));
         if (!r.ok) {
           // A 4xx here is the registry rejecting the arguments: say so, with its
           // reason, rather than a bare status the caller cannot act on.
@@ -1858,6 +2143,8 @@ export async function registerWalletRoutes(
     Querystring: { templateId?: string; interfaceId?: string };
   }>("/v1/wallet/:party/contracts", async (req, reply) => {
     if (!authed(req, reply)) return;
+    if (!readAllowed(req, reply, "contracts")) return;
+    if (!(await readProven(req, reply))) return;
     const allowed = svc.walletReadIds ?? [];
     if (allowed.length === 0) return reply.code(404).send({ error: "not found" });
     const party = req.params.party;
@@ -1907,6 +2194,130 @@ export async function registerWalletRoutes(
     }
   });
 
+  /** Time the order-id lookup may start new reads in (each read has its own timeout). */
+  const TC_LINK_DEADLINE_MS = 5_000;
+
+  // ── A party's Tradecraft queued-mode history ──
+  //    Fills, cancellations and settlements, so a trader can tell a filled
+  //    order that waits for its settlement from a cancelled one (the order
+  //    leaves the ACS either way). Only the party's own orders, withdrawal
+  //    requests and Tradecraft allocations are returned: a settlement batch is
+  //    witnessed by every trader in it (see tradecraft-updates.ts). On only
+  //    when the operator lists the swap-order template and the allocation
+  //    interface in CANTON_X402_WALLET_READ_IDS, like /contracts. A fill
+  //    carries its output from the venue's batch helper of the same package,
+  //    which the read adds on its own. With `orderCids=true` a settlement leg
+  //    also carries the order it settles when the amounts leave one choice,
+  //    and `orderCidsComplete` says whether the records before the page could
+  //    be read for that (see linkSettlementsWithLookback).
+  //
+  //    Only for a party this facilitator hosts. With read rights for any
+  //    party, the participant would answer for a stranger too, from what it
+  //    witnessed: naming the venue's vault would list other traders' legs.
+  app.get<{
+    Params: { party: string };
+    Querystring: { after?: string; limit?: string; orderCids?: string };
+  }>("/v1/wallet/:party/tradecraft-updates", async (req, reply) => {
+    if (!authed(req, reply)) return;
+    if (!readAllowed(req, reply, "tradecraft-updates")) return;
+    if (!(await readProven(req, reply))) return;
+    const ids = tradecraftReadIds(svc.walletReadIds ?? []);
+    if (!ids.swapOrder || !ids.allocation) return reply.code(404).send({ error: "not found" });
+    const q = parseTradecraftUpdatesQuery(req.query);
+    if (!q.ok) return reply.code(400).send({ error: q.error });
+    const party = req.params.party;
+    try {
+      const hosted = await isHostedHere(party);
+      if (hosted === false) {
+        return reply.code(404).send({
+          error: "party not readable by this facilitator",
+          detail: "This facilitator's participant does not host that party. Use a party hosted here.",
+        });
+      }
+      if (hosted === undefined) {
+        return reply.code(503).header("Retry-After", "5").send({ error: "could not confirm that this facilitator hosts the party" });
+      }
+      const routed = svc.router ? await svc.router.forParty(party) : undefined;
+      const client = routed ? routed.client : svc.client;
+      if (!client.getUpdatesPage) {
+        return reply.code(501).send({ error: "this relay cannot read ledger updates" });
+      }
+      const readUpdates = client.getUpdatesPage.bind(client);
+      // Offsets belong to one participant. The tag changes when the party is
+      // served from another one, and a cursor kept across that means nothing.
+      const participant = createHash("sha256").update(routed?.id ?? "primary").digest("hex").slice(0, 16);
+      const withdrawalsRead = ids.withdrawalRequest !== undefined;
+      const end = (await client.getLedgerEnd()).offset;
+      // A cursor past the end was not issued by this participant (another
+      // participant's offset, or garbage). Answering "nothing new" would keep
+      // its holder waiting forever.
+      if (q.after > end) {
+        return reply.code(400).send({ error: `after (${q.after}) is past this ledger's end (${end}); read again from 0`, ledgerEnd: end, participant });
+      }
+      if (q.after === end) {
+        return reply.send({
+          party,
+          participant,
+          withdrawalsRead,
+          after: q.after,
+          next: end,
+          ledgerEnd: end,
+          complete: true,
+          ...(q.orderCids ? { orderCidsComplete: true } : {}),
+          updates: [],
+        });
+      }
+      const filter = tradecraftUpdatesFilter(party, ids);
+      const page = await readUpdates({ filter, beginExclusive: q.after, endInclusive: end, limit: q.limit });
+      const complete = page.rows < q.limit;
+      const updates = await summarizeTradecraftPage(party, page.transactions);
+      // On request, tie settlements to the fills they settle. That needs the
+      // party's records before the page too: at most three more reads, each
+      // charged to the caller's read budget. When they fail or are refused,
+      // the page still goes out, only without order ids.
+      let orderCidsComplete: boolean | undefined;
+      if (q.orderCids) {
+        try {
+          const linked = await linkSettlementsWithLookback(
+            party,
+            updates,
+            q.after,
+            (beginExclusive, endInclusive, limit) => readUpdates({ filter, beginExclusive, endInclusive, limit }),
+            { allowRead: () => readBudget(req), deadlineMs: TC_LINK_DEADLINE_MS }
+          );
+          orderCidsComplete = linked.complete;
+        } catch (err) {
+          for (const u of updates) for (const c of u.allocations) for (const l of c.legs) delete l.orderCid;
+          orderCidsComplete = false;
+          req.log.warn({ party, err: err instanceof Error ? err.message : String(err) }, "wallet relay tradecraft-updates: could not read before the page to tie settlements to fills");
+        }
+      }
+      const unread = updates.flatMap((u) => (u.anomalies ?? []).map((a) => `${u.offset}: ${a.detail}`));
+      const unknownChoices = updates.flatMap((u) => u.orders.filter((o) => o.kind === "archived").map((o) => `${u.offset}: ${o.choice}`));
+      if (unread.length > 0 || unknownChoices.length > 0) {
+        req.log.warn(
+          { party, unread: unread.slice(0, 5), unknownChoices: unknownChoices.slice(0, 5) },
+          "wallet relay tradecraft-updates: records it could not read, or orders closed by a choice it does not know"
+        );
+      }
+      return reply.send({
+        party,
+        participant,
+        withdrawalsRead,
+        after: q.after,
+        // Resume from here. A full page may stop mid-range; an exhausted range
+        // resumes at the ledger end it was read against.
+        next: complete ? end : (page.lastOffset ?? q.after),
+        ledgerEnd: end,
+        complete,
+        ...(orderCidsComplete !== undefined ? { orderCidsComplete } : {}),
+        updates,
+      });
+    } catch (err) {
+      return relayError(reply, "tradecraft-updates", err, party);
+    }
+  });
+
   // ── Read the Amulet OUTPUT cids a transfer transaction created for `party` ──
   //    (whale-merge OUTPUT DISCOVERY). After a `merge` batch self-transfer the
   //    resulting change/output amulets are NOT in the (lagging, daily) Scan
@@ -1922,6 +2333,8 @@ export async function registerWalletRoutes(
     "/v1/wallet/:party/tx-amulets",
     async (req, reply) => {
       if (!authed(req, reply)) return;
+      if (!readAllowed(req, reply, "tx-amulets")) return;
+      if (!(await readProven(req, reply))) return;
       const party = req.params.party;
       const updateId = req.query?.updateId;
       if (!updateId) return reply.code(400).send({ error: "updateId required" });
@@ -1954,11 +2367,19 @@ export async function registerWalletRoutes(
     }
   );
 
-  // ── Resolve the accept choice-context for a pending TransferInstruction ──
-  app.post<{ Body: { instructionCid: string; instrumentAdmin?: string } }>(
-    "/v1/wallet/resolve/accept",
-    async (req, reply) => {
+  // ── Resolve a pending TransferInstruction's choice-context ──
+  // `accept` for the receiver (claim), `withdraw` for the sender taking back
+  // an offer the receiver never took (reclaim). Both come from the registry
+  // that issued the instruction, routed the same way.
+  const resolveInstructionChoice =
+    (choice: "accept" | "withdraw") =>
+    async (
+      req: FastifyRequest<{ Body: { instructionCid: string; instrumentAdmin?: string } }>,
+      reply: FastifyReply
+    ) => {
+      const where = `resolve/${choice}`;
       if (!authed(req, reply)) return;
+      if (!readAllowed(req, reply, where, "scan")) return;
       const cid = req.body?.instructionCid;
       if (!cid) return reply.code(400).send({ error: "instructionCid required" });
       // INBOUND MUST ROUTE LIKE OUTBOUND DOES.
@@ -1987,14 +2408,14 @@ export async function registerWalletRoutes(
         const url =
           `${acceptRegistryBase}/api/token-standard/v0/registrars/` +
           `${encodeURIComponent(acceptAdmin!)}/registry/transfer-instruction/v1/` +
-          `${encodeURIComponent(cid)}/choice-contexts/accept`;
+          `${encodeURIComponent(cid)}/choice-contexts/${choice}`;
         try {
           const rr = await fetch(url, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ meta: {} }),
           });
-          if (!rr.ok) throw new Error(`registry choice-contexts/accept HTTP ${rr.status}`);
+          if (!rr.ok) throw new Error(`registry choice-contexts/${choice} HTTP ${rr.status}`);
           const j = (await rr.json()) as {
             choiceContextData: unknown;
             disclosedContracts: unknown[];
@@ -2004,26 +2425,66 @@ export async function registerWalletRoutes(
             disclosedContracts: j.disclosedContracts,
           });
         } catch (err) {
-          return relayError(reply, "resolve/accept", err);
+          return relayError(reply, where, err);
         }
       }
       try {
         const r = await scanFetchRetry(
-          `/registry/transfer-instruction/v1/${encodeURIComponent(cid)}/choice-contexts/accept`,
-          { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ meta: {} }) }
+          `/registry/transfer-instruction/v1/${encodeURIComponent(cid)}/choice-contexts/${choice}`,
+          { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ meta: {} }) },
+          isTrusted(req)
         );
-        if (!r.ok) throw new Error(`choice-contexts/accept HTTP ${r.status}`);
+        if (!r.ok) throw new Error(`choice-contexts/${choice} HTTP ${r.status}`);
         const j = (await r.json()) as { choiceContextData: unknown; disclosedContracts: unknown[] };
         return reply.send({ choiceContextData: j.choiceContextData, disclosedContracts: j.disclosedContracts });
       } catch (err) {
-        return relayError(reply, "resolve/accept", err);
+        return relayError(reply, where, err);
       }
-    }
+    };
+  app.post<{ Body: { instructionCid: string; instrumentAdmin?: string } }>(
+    "/v1/wallet/resolve/accept",
+    resolveInstructionChoice("accept")
   );
+  app.post<{ Body: { instructionCid: string; instrumentAdmin?: string } }>(
+    "/v1/wallet/resolve/withdraw",
+    resolveInstructionChoice("withdraw")
+  );
+
+  // The party's TransferInstructions, both directions, with their interface
+  // views. Scoped to the TransferInstructionV1 INTERFACE, not a WildcardFilter:
+  // a party with a large ACS (many amulets/coupons) blows past Canton's
+  // /v2/state/active-contracts element cap (JSON_API_MAXIMUM_LIST_ELEMENTS_
+  // NUMBER_REACHED -> 502) when we pull ALL its contracts just to keep the
+  // TransferInstructions. The interface filter returns O(open payments), not
+  // O(total contracts). Mirrors findCip56TransferInstruction in
+  // @ftptech/x402-canton-ledger.
+  const instructionEvents = async (party: string) =>
+    (await ledgerFor(party)).client.queryActiveContracts({
+      filtersByParty: {
+        [party]: {
+          cumulative: [
+            {
+              identifierFilter: {
+                InterfaceFilter: {
+                  value: {
+                    interfaceId:
+                      "#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction",
+                    includeInterfaceView: true,
+                    includeCreatedEventBlob: false,
+                  },
+                },
+              },
+            },
+          ],
+        },
+      },
+    });
 
   // ── Pending incoming transfers the agent can claim (accept) ──
   app.get<{ Params: { party: string }; Querystring: { registry?: string } }>("/v1/wallet/:party/pending", async (req, reply) => {
     if (!authed(req, reply)) return;
+    if (!readAllowed(req, reply, "pending")) return;
+    if (!(await readProven(req, reply))) return;
     const party = req.params.party;
     // Registry-token rows are OPT-IN (`?registry=1`): a client that does not ask
     // for them is a pre-registry agent-wallet whose claim loop aborts on the
@@ -2031,34 +2492,7 @@ export async function registerWalletRoutes(
     // Canton Coin instructions only.
     const wantRegistry = req.query?.registry === "1" || req.query?.registry === "true";
     try {
-      // Scope to the TransferInstructionV1 interface — NOT a WildcardFilter. A
-      // party with a large ACS (many amulets/coupons) blows past Canton's
-      // /v2/state/active-contracts element cap (JSON_API_MAXIMUM_LIST_ELEMENTS_
-      // NUMBER_REACHED -> 502) when we pull ALL its contracts just to keep the
-      // TransferInstructions. The interface filter returns O(open payments), not
-      // O(total contracts). includeInterfaceView:false keeps createArgument in
-      // the concrete template shape the loop below reads. Mirrors
-      // findCip56TransferInstruction in @ftptech/x402-canton-ledger.
-      const events = await (await ledgerFor(party)).client.queryActiveContracts({
-        filtersByParty: {
-          [party]: {
-            cumulative: [
-              {
-                identifierFilter: {
-                  InterfaceFilter: {
-                    value: {
-                      interfaceId:
-                        "#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction",
-                      includeInterfaceView: true,
-                      includeCreatedEventBlob: false,
-                    },
-                  },
-                },
-              },
-            ],
-          },
-        },
-      });
+      const events = await instructionEvents(party);
       // READ THE INTERFACE VIEW, NOT THE TEMPLATE NAME.
       //
       // The interface filter above already proves every row IS a
@@ -2131,6 +2565,65 @@ export async function registerWalletRoutes(
     }
   });
 
+  // ── The agent's own pending outgoing offers (reclaim) ──
+  // An offer the receiver never accepts keeps the sender's input locked until
+  // the sender withdraws it (seen on MainNet: a swap venue that left a token
+  // sell untaken). Lists what this party SENT, with the status and deadline the
+  // wallet needs to decide. Registry rows only, and only for a registrar this
+  // facilitator can route the withdraw for (as /pending?registry=1); the
+  // wallet verifies a registry withdraw before signing, not an Amulet one.
+  app.get<{ Params: { party: string } }>("/v1/wallet/:party/outgoing", async (req, reply) => {
+    if (!authed(req, reply)) return;
+    if (!readAllowed(req, reply, "outgoing")) return;
+    if (!(await readProven(req, reply))) return;
+    const party = req.params.party;
+    try {
+      const events = await instructionEvents(party);
+      const outgoing: Array<{
+        cid: string;
+        amount: string | undefined;
+        receiver: string | undefined;
+        instrumentId: { admin: string; id: string };
+        /** ISO instant after which the receiver can no longer accept. */
+        executeBefore?: string;
+        /** The instruction's status tag, e.g. TransferPendingReceiverAcceptance. */
+        status?: string;
+      }> = [];
+      for (const e of events) {
+        const view = e.interfaceViews?.find((v) =>
+          v.interfaceId.endsWith(":Splice.Api.Token.TransferInstructionV1:TransferInstruction")
+        )?.viewValue as
+          | {
+              transfer?: {
+                amount?: string;
+                sender?: string;
+                receiver?: string;
+                executeBefore?: string;
+                instrumentId?: { admin?: string; id?: string };
+              };
+              status?: { tag?: string };
+            }
+          | undefined;
+        const t = view?.transfer;
+        if (t?.sender !== party) continue;
+        const admin = t.instrumentId?.admin;
+        const id = t.instrumentId?.id;
+        if (!admin || !id || !svc.tokenRegistries?.[admin]) continue;
+        outgoing.push({
+          cid: e.contractId,
+          amount: t.amount,
+          receiver: t.receiver,
+          instrumentId: { admin, id },
+          ...(t.executeBefore ? { executeBefore: t.executeBefore } : {}),
+          ...(view?.status?.tag ? { status: view.status.tag } : {}),
+        });
+      }
+      return reply.send({ party, outgoing });
+    } catch (err) {
+      return relayError(reply, "outgoing", err, party);
+    }
+  });
+
   // ── Faucet: facilitator seeds an agent party with a tiny one-time CC grant ──
   // Out-of-box e2e: gives away REAL CC, so every guardrail below is load-bearing.
   // Same TransferFactory_Transfer the funder uses (e2e/fund.mjs), submitted as
@@ -2141,6 +2634,7 @@ export async function registerWalletRoutes(
     faucetCfg && svc.facilitatorParty
       ? new FaucetService({
           client: svc.client,
+          submit: faucetCfg.submit,
           facilitatorParty: svc.facilitatorParty,
           userId: svc.userId,
           synchronizerId: svc.synchronizerId,
@@ -2204,6 +2698,40 @@ export async function registerWalletRoutes(
     windowMs: faucetCfg?.burstWindowMs ?? 60_000,
   });
 
+  /** Only a peek: chargeStarterGrant charges the caps once a grant is actually
+   *  reserved, so a refused reservation does not use up the caller's share. */
+  const starterGrantCapped = (req: FastifyRequest): "burst" | "per_ip" | undefined => {
+    const cfg = faucetCfg!;
+    const ip = req.ip;
+    if (cfg.ipExempt?.includes(ip)) return undefined;
+    const now = Date.now();
+    if (!faucetBurstLimiter.peek("faucet:global", now, cfg.maxGlobalPerMin ?? 0)) return "burst";
+    if (isTrusted(req)) return undefined;
+    if (
+      !faucetLimiter.peek(`faucet:ip:${ip}`, now, cfg.maxPerIp) ||
+      !faucetLimiter.peek(`faucet:onboard-ip:${ip}`, now, cfg.onboardMaxPerIp ?? 3)
+    ) {
+      return "per_ip";
+    }
+    return undefined;
+  };
+  /** Charge the slots starterGrantCapped checked, for a reserved grant. */
+  const chargeStarterGrant = (req: FastifyRequest): void => {
+    const cfg = faucetCfg!;
+    const ip = req.ip;
+    if (cfg.ipExempt?.includes(ip)) return;
+    const now = Date.now();
+    faucetBurstLimiter.allowKeys([{ key: "faucet:global", max: cfg.maxGlobalPerMin ?? 0 }], now);
+    if (isTrusted(req)) return;
+    faucetLimiter.allowKeys(
+      [
+        { key: `faucet:ip:${ip}`, max: cfg.maxPerIp },
+        { key: `faucet:onboard-ip:${ip}`, max: cfg.onboardMaxPerIp ?? 3 },
+      ],
+      now
+    );
+  };
+
   type FaucetPayOutcome =
     | { kind: "paid"; updateId: string; amount: string }
     | { kind: "failed"; err: unknown };
@@ -2265,7 +2793,14 @@ export async function registerWalletRoutes(
           provesNothingCommitted(err) ||
           isUnknownInformees(err)
         ) {
-          await cfg.store.release(party).catch(() => {});
+          await cfg.store
+            .release(party)
+            .catch((e: unknown) =>
+              log.error(
+                { err: e, party },
+                "faucet release failed: nothing was paid, but the party stays reserved"
+              )
+            );
         } else {
           log.error(
             { err, party },
@@ -2285,7 +2820,16 @@ export async function registerWalletRoutes(
           "faucet markPaid failed (non-fatal; reservation holds)"
         )
       );
-    log.info({ party, ip, amount: cfg.amountCc, updateId: result.updateId }, "faucet payout");
+    log.info(
+      {
+        party,
+        ip,
+        amount: cfg.amountCc,
+        updateId: result.updateId,
+        sender: cfg.submit ? "rust" : "ts",
+      },
+      "faucet payout"
+    );
     return { kind: "paid", updateId: result.updateId, amount: cfg.amountCc };
   };
 
@@ -2447,13 +2991,171 @@ export async function registerWalletRoutes(
    */
   const submitLimiter = createSlidingWindowLimiter({
     maxPerPayer: svc.submitRateMaxPerKey ?? 60,
-    maxGlobal: 0,
+    // A GLOBAL arm, charged at spend (submitSpend below), never at admission.
+    //
+    // The per-key and per-IP caps above are admission control, and admission
+    // control cannot bound a resource everyone shares: every accepted execute
+    // spends OUR Global Synchronizer traffic. By the code's own numbers, four
+    // funded wallets on one IP reach the 240/min IP cap — twice the whole
+    // facilitator's /settle ceiling — and each further IP adds as much again,
+    // while /settle sat behind its own 120/min global and breaker. The relay
+    // had neither, so a few funded wallets moving CC in circles could drain
+    // the traffic /settle needs. Same reason as onboardLimiter's global arm.
+    maxGlobal: svc.submitRateMaxGlobal ?? 0,
     windowMs: 60_000,
   });
+  /** What callers without a trusted key may take of the global arm. Three
+   *  quarters, so anonymous callers holding the whole share still leave the
+   *  hosted MCP a quarter of the minute (the onboarding split, same reason). */
+  const submitAnonShare = (() => {
+    const g = svc.submitRateMaxGlobal ?? 0;
+    return g > 0 ? Math.max(1, Math.floor(g * 0.75)) : 0;
+  })();
+  /** What one network (an IPv4 address, an IPv6 /64) without a trusted key may
+   *  take of that share: a third. Below it on purpose: the per-key (60) and
+   *  per-IP (240) caps are both above the share, so one caller with one party
+   *  could otherwise hold the whole anonymous minute for everyone. Its refusal
+   *  is NOT a strike, as refuseDaily's is not: honest agents behind one NAT or
+   *  one /64 reach this share together (four at 16 a minute did), and a strike
+   *  there banned the whole address for an hour, its pay/prepare included. */
+  const submitNetShare = submitAnonShare > 0 ? Math.max(1, Math.floor(submitAnonShare / 3)) : 0;
+  /**
+   * The traffic breaker on the same two routes: /settle's pattern, its own
+   * instance.
+   *
+   * Own instance, not /settle's: a trip here then never closes /settle, and
+   * whatever trips /settle (its known false positives included) never spreads
+   * to the relay.
+   *
+   * Fed ONLY by a failure whose text the caller cannot shape. /settle feeds
+   * its breaker with isTrafficError over the whole error, but there the bytes
+   * were validated first; here the caller chooses the transaction, the parties
+   * (a party hint can say "traffic") and the submissionId, which the
+   * participant echoes back as correlationId. Counted: a 5xx answer from the
+   * participant naming traffic, with those caller strings removed. Not
+   * counted: a 4xx (the participant judging the request) and a rejected
+   * completion (its message is the transaction's own failure). Otherwise three
+   * crafted failures a minute would hold every relay submission shut.
+   *
+   * WHAT IS PROVEN, AND WHAT IS NOT. The bound on our traffic is the global
+   * arm above: it holds whatever the participant answers. This breaker's
+   * trigger is NOT proven. No exhaustion of our traffic has been recorded on
+   * /v2/interactive-submission/execute, so how it arrives is not known. The
+   * one ABORTED this repo has on record came as HTTP 409 (the JSON API maps
+   * gRPC ABORTED and ALREADY_EXISTS to 409, see cantonErrorId in the ledger
+   * package), and its only "not enough traffic" body is a hand-written 503
+   * fixture. If exhaustion comes as a 409, the breaker never opens and the
+   * slot is handed back as a definite refusal. That is right for the quota
+   * (nothing was sequenced, so nothing was spent), but the relay keeps asking.
+   * Counting 4xx text instead would let any caller shut the breaker. Revisit
+   * once a real exhaustion response is on record.
+   */
+  const submitBreaker = createCircuitBreaker(svc.submitBreaker);
+  const submitBreakerRetryAfter = String(Math.ceil((svc.submitBreaker?.cooldownMs ?? 60_000) / 1000));
+  /** `callerStrings` are THIS request's own (its submissionId and parties), so
+   *  a caller can only ever hide its own failure, never count someone else's. */
+  const isOurTrafficVerdict = (err: unknown, callerStrings: readonly string[]): boolean => {
+    const e = err as { code?: unknown; status?: unknown; responseBody?: unknown; message?: unknown } | null;
+    if (e?.code !== "HTTP_ERROR" || typeof e.status !== "number" || e.status < 500) return false;
+    let text = typeof e.responseBody === "string" ? e.responseBody : typeof e.message === "string" ? e.message : "";
+    for (const s of callerStrings) if (s) text = text.split(s).join("");
+    text = text.replace(/"correlationId"\s*:\s*"[^"]*"/g, "");
+    return /traffic|OUT_OF_QUOTA/i.test(text);
+  };
+  /** The parties a caller-supplied partySignatures names. Read defensively:
+   *  the body is unvalidated, and a non-array here must reach the participant
+   *  (which refuses it with a 4xx) rather than throw on our side. */
+  const signingParties = (partySignatures: unknown): string[] => {
+    const sigs = (partySignatures as { signatures?: unknown } | null | undefined)?.signatures;
+    if (!Array.isArray(sigs)) return [];
+    return sigs.map((s) => {
+      const p = (s as { party?: unknown } | null)?.party;
+      return typeof p === "string" ? p : "";
+    });
+  };
+  /**
+   * THE LINE PAST WHICH A RELAY SUBMISSION SPENDS: breaker, then the global
+   * arm. Call immediately before the participant is asked to execute. Returns
+   * a give-back for a submission the participant then refused outright (a
+   * definite 4xx, nothing sequenced): junk the participant rejects on sight
+   * must not hold the minute shared with everyone who does pay.
+   *
+   * Both refusals answer 429, never 5xx. The wallet reads a 5xx on a
+   * submitting route as "this may have committed, check the balance before
+   * retrying"; nothing was submitted here, and 429 says exactly that.
+   */
+  const submitSpend = (
+    req: FastifyRequest,
+    reply: FastifyReply,
+    where: string
+  ): false | (() => void) => {
+    const now = Date.now();
+    if (submitBreaker.isOpen(now)) {
+      // Error, not warn, as on /settle: our traffic is probably gone.
+      req.log.error({ where }, "wallet relay: traffic breaker OPEN — submission refused, nothing submitted");
+      svc.metrics?.recordRateLimited("relay_submit");
+      reply
+        .code(429)
+        .header("Retry-After", submitBreakerRetryAfter)
+        .send({
+          error: "facilitator_traffic_unavailable",
+          detail: "the relay is pausing submissions while its ledger traffic recovers; nothing was submitted",
+        });
+      return false;
+    }
+    const netKey = `submit-global:net:${ipBucket(clientIp(req))}`;
+    const keys = isTrusted(req)
+      ? []
+      : [
+          { key: "submit-global:anonymous", max: submitAnonShare },
+          { key: netKey, max: submitNetShare },
+        ];
+    if (!submitLimiter.allowKeys(keys, now)) {
+      if (!isTrusted(req) && !submitLimiter.peek(netKey, now, submitNetShare)) {
+        // This network's share. No strike (see submitNetShare): refused, not
+        // punished, like the daily onboarding shares.
+        req.log.warn(
+          { where, network: ipBucket(clientIp(req)), share: submitNetShare },
+          "wallet relay: this network's share of the submission minute is used up — nothing submitted"
+        );
+        svc.metrics?.recordRateLimited("relay_submit");
+        reply
+          .code(429)
+          .header("Retry-After", "60")
+          .send({ error: "too many submissions from this network; nothing was submitted" });
+        return false;
+      }
+      // Error, not warn: each network's share refuses one abuser long before
+      // this, so reaching it is a distributed attempt or a real surge.
+      req.log.error(
+        { where, cap: svc.submitRateMaxGlobal, trusted: isTrusted(req) },
+        "wallet relay: GLOBAL submission budget exhausted — nothing submitted"
+      );
+      svc.metrics?.recordRateLimited("relay_submit");
+      reply
+        .code(429)
+        .header("Retry-After", "60")
+        .send({ error: "relay submissions are rate-limited facilitator-wide; nothing was submitted" });
+      return false;
+    }
+    let given = false;
+    return () => {
+      if (given) return;
+      given = true;
+      submitLimiter.release(keys, now);
+    };
+  };
+  /** After the participant answered a relay submission: feed the breaker, and
+   *  give the global slot back when nothing can have been sequenced. */
+  const noteSubmitFailure = (err: unknown, giveBack: () => void, callerStrings: readonly string[]): void => {
+    if (isOurTrafficVerdict(err, callerStrings)) submitBreaker.recordTrafficFailure(Date.now());
+    if (provesNothingCommitted(err)) giveBack();
+  };
 
   /**
-   * Per-IP bound for the three routes that had none: onboard/prepare,
-   * onboard/finalize and submit/prepare. They are anonymous in production
+   * Per-IP bound for the routes that had none: onboard/prepare,
+   * onboard/finalize, submit/prepare, and the two self-preapproval prepares
+   * (each route its own key). They are anonymous in production
    * (authed() is inert without CANTON_X402_AGENT_WALLET_KEY, which an
    * out-of-box agent could not present anyway), and onboard/finalize writes
    * permanent topology under our participant on our traffic. Keyed on the
@@ -2485,14 +3187,63 @@ export async function registerWalletRoutes(
    * global above bounds the burst; this bounds the TOTAL over 24h. Without it a
    * script pacing just under the minute cap has no daily limit and, over ~12h,
    * can exhaust the participant's user-rights slots (Canton default 1000) and
-   * lock onboarding for every user. Global-only arm and charged at spend, for
-   * the same reasons as onboardLimiter. `<= 0` disables.
+   * lock onboarding for every user. Its global arm is the ceiling, its keys
+   * are the shares below; charged at spend, for the same reasons as
+   * onboardLimiter. `<= 0` disables the ceiling, and with it the shares that
+   * are not set explicitly.
    */
   const onboardDailyLimiter = createSlidingWindowLimiter({
     maxPerPayer: 0,
     maxGlobal: svc.onboardDailyMax ?? 0,
     windowMs: 86_400_000,
   });
+  /**
+   * The ceiling's keys split the day. Callers without a trusted key get a
+   * share of it and a cap per network inside the share; trusted callers (the
+   * hosted MCP, pay-proxy) get a share of their own. Without them one IP at
+   * its 10 a minute used up the whole day in 20 minutes, and every new wallet
+   * was refused until the next day. Keys of the ceiling's own limiter, so a
+   * refusal by the ceiling or by any share spends none of them.
+   */
+  const dailyShare = (explicit: number | undefined): number =>
+    explicit ?? Math.floor((svc.onboardDailyMax ?? 0) * 0.75);
+  const onboardDailyPerIp = svc.onboardDailyMaxPerIp ?? 20;
+  const onboardDailyKeys = (req: FastifyRequest): { key: string; max: number }[] =>
+    isTrusted(req)
+      ? [{ key: "onboard-day:trusted", max: dailyShare(svc.onboardDailyMaxTrusted) }]
+      : [
+          { key: "onboard-day:anonymous", max: dailyShare(svc.onboardDailyMaxAnonymous) },
+          { key: `onboard-day:net:${ipBucket(clientIp(req))}`, max: onboardDailyPerIp },
+        ];
+  /**
+   * What may come back per 24h: the ceiling across everyone, each channel's
+   * share, and the network cap per network for callers without a trusted key.
+   * Past it a failure counts as spent, so neither junk nor timeouts that did
+   * allocate can multiply the day.
+   */
+  const onboardRefundLimiter = createSlidingWindowLimiter({
+    maxPerPayer: 0,
+    maxGlobal: svc.onboardDailyMax ?? 0,
+    windowMs: 86_400_000,
+  });
+  const refuseDaily = (req: FastifyRequest, reply: FastifyReply, now: number): false => {
+    if (!onboardDailyLimiter.wouldAllow([], now)) {
+      req.log.error(
+        { dailyCap: svc.onboardDailyMax },
+        "wallet relay: DAILY party-allocation limit reached — no party allocated"
+      );
+    } else {
+      req.log.warn(
+        { trusted: isTrusted(req), network: ipBucket(clientIp(req)), perNetwork: onboardDailyPerIp },
+        "wallet relay: daily party-allocation share used up — no party allocated"
+      );
+    }
+    reply
+      .code(429)
+      .header("Retry-After", "3600")
+      .send({ error: "onboarding daily limit reached" });
+    return false;
+  };
   /**
    * Charge the global allocation budget — called ONLY immediately before the
    * allocation itself, never at admission.
@@ -2505,12 +3256,14 @@ export async function registerWalletRoutes(
   const onboardSpendAllowed = (
     req: FastifyRequest,
     reply: FastifyReply
-  ): boolean => {
+  ): false | ((opts: { minute: boolean }) => void) => {
     const now = Date.now();
-    // Per-MINUTE global first: it is the cheaper budget (60s window), so a slot
-    // spent here but then refused by the daily cap below recovers within a
-    // minute. Charging the DAILY budget (24h window) first would burn a
-    // day-long slot whenever the minute cap refuses — the expensive mistake.
+    const daily = onboardDailyKeys(req);
+    // The day is checked before the minute is charged, and charged after it,
+    // with no await in between. A request the day refuses spends no minute
+    // slot (the minute is shared with the trusted callers), and a request the
+    // minute refuses spends no day-long one.
+    if (!onboardDailyLimiter.wouldAllow(daily, now)) return refuseDaily(req, reply, now);
     if (!onboardLimiter.allowKeys([], now)) {
       // Error, not warn: the per-IP caps refuse abusers long before this trips,
       // so reaching it means either a distributed attempt or a real surge — both
@@ -2525,28 +3278,42 @@ export async function registerWalletRoutes(
         .send({ error: "party allocation is rate-limited facilitator-wide" });
       return false;
     }
-    // Absolute daily ceiling. Disabled cleanly when onboardDailyMax <= 0.
-    if (!onboardDailyLimiter.allowKeys([], now)) {
-      req.log.error(
-        { dailyCap: svc.onboardDailyMax },
-        "wallet relay: DAILY party-allocation limit reached — no party allocated"
-      );
-      reply
-        .code(429)
-        .header("Retry-After", "3600")
-        .send({ error: "onboarding daily limit reached" });
-      return false;
-    }
-    return true;
+    // The ceiling and the caller's shares, in one atomic charge. Passed the
+    // check above in this same tick, so it cannot refuse here.
+    if (!onboardDailyLimiter.allowKeys(daily, now)) return refuseDaily(req, reply, now);
+    // Gives the charge back, once, when the allocation failed before anything
+    // was written: the day within the refund budget, the minute when asked.
+    // Per channel too, as the day is split: junk without a key cannot use up
+    // the refunds a hosted MCP outage needs.
+    const refundKeys = isTrusted(req)
+      ? [{ key: "onboard-refund:trusted", max: dailyShare(svc.onboardDailyMaxTrusted) }]
+      : [
+          { key: "onboard-refund:anonymous", max: dailyShare(svc.onboardDailyMaxAnonymous) },
+          { key: `onboard-refund:net:${ipBucket(clientIp(req))}`, max: onboardDailyPerIp },
+        ];
+    let refunded = false;
+    return ({ minute }) => {
+      if (refunded) return;
+      refunded = true;
+      if (!onboardRefundLimiter.allowKeys(refundKeys, Date.now())) return;
+      onboardDailyLimiter.release(daily, now);
+      if (minute) onboardLimiter.release([], now);
+    };
   };
+  /** Per-IP cap for the two onboarding doors. Below the global minute cap on
+   *  purpose: equal to it, one caller could take the whole facilitator-wide
+   *  minute budget without a single per-IP refusal, so without a strike. A
+   *  trusted request has none (0); the global caps at spend still hold it. */
+  const onboardIpCap = (req: FastifyRequest): number =>
+    ipCap(req, svc.onboardRateMaxPerIp ?? svc.submitRateMaxPerKey ?? 60);
   const onboardAllowed = (
     req: FastifyRequest,
     reply: FastifyReply,
-    where: string
+    where: string,
+    cap: number
   ): boolean => {
     // An IP already in the abuse cooldown is refused up front, before any work.
     if (penaltyBlocked(req, reply, where)) return false;
-    const cap = svc.submitRateMaxPerKey ?? 60;
     if (cap <= 0) return true;
     if (
       onboardLimiter.allowKeys(
@@ -2575,6 +3342,53 @@ export async function registerWalletRoutes(
     maxGlobal: 0,
     windowMs: tfPay?.wasteWindowMs ?? 300_000,
   });
+  /** pay/prepare admissions per minute (see the route). Every key carries its
+   *  own cap; no global arm, for the reason prepareWasteLimiter has none. */
+  const payPrepareLimiter = createSlidingWindowLimiter({ maxPerPayer: 0, maxGlobal: 0, windowMs: 60_000 });
+
+  /**
+   * THE CANTON COIN FACTORY RESOLVE, CACHED PER RECEIVER FOR A FEW SECONDS.
+   *
+   * What the SV Scan answers depends on the receiver and on DSO-wide state, not
+   * on who pays or how much. Read off three MainNet TransferFactory_Transfer
+   * transactions in agent-wallet's fixtures (direct delivery, a distinct
+   * provider, a self-provider): the context they carry is the factory
+   * (ExternalPartyAmuletRules), the receiver's TransferPreapproval, its
+   * provider's FeaturedAppRight and the ExternalPartyConfigState, nothing of
+   * the sender's. The payer's own holdings travel in the transfer argument,
+   * not in the context, and the SV Scan ignores them (tx.ts). So payers of one
+   * merchant can share one answer.
+   *
+   * Only briefly, because those contracts do change: a renewed preapproval or a
+   * new config state makes a cached answer stale, and a transaction built on it
+   * fails at execution with inactive contracts. Nothing moves then, and the
+   * payer prepares again; the uncached path already lives with the same window
+   * between prepare and execute (up to executeBefore), so 5 s adds little. Not
+   * for a registry token: a DA Registry Utility reads the inputs.
+   */
+  type AmuletFactoryAnswer = {
+    factoryId: string;
+    choiceContext: { choiceContextData: unknown; disclosedContracts: DisclosedContract[] };
+  };
+  const AMULET_FACTORY_TTL_MS = 5_000;
+  const AMULET_FACTORY_CACHE_MAX = 1_024;
+  const amuletFactoryCache = new Map<string, { at: number; f: AmuletFactoryAnswer }>();
+  const amuletFactoryFor = (receiver: string, now: number): AmuletFactoryAnswer | undefined => {
+    const hit = amuletFactoryCache.get(receiver);
+    if (!hit) return undefined;
+    if (now - hit.at < AMULET_FACTORY_TTL_MS) return hit.f;
+    amuletFactoryCache.delete(receiver);
+    return undefined;
+  };
+  const rememberAmuletFactory = (receiver: string, f: AmuletFactoryAnswer, now: number): void => {
+    amuletFactoryCache.delete(receiver);
+    amuletFactoryCache.set(receiver, { at: now, f });
+    while (amuletFactoryCache.size > AMULET_FACTORY_CACHE_MAX) {
+      const oldest = amuletFactoryCache.keys().next().value;
+      if (oldest === undefined) break;
+      amuletFactoryCache.delete(oldest);
+    }
+  };
 
   /**
    * EVERY CIP-56 TOKEN'S HOLDINGS, READ THE ONE WAY THE STANDARD GUARANTEES.
@@ -3229,7 +4043,7 @@ export async function registerWalletRoutes(
     // never touches, while a genuinely stuck client — one party looping from
     // one host, which is the case actually observed in production — still
     // fills its own.
-    const wasteKey = `prepare-waste:${party}|${clientIp(req)}`;
+    const wasteKey = `prepare-waste:${party}|${ipOrTrusted(req)}`;
     if (!prepareWasteLimiter.peek(wasteKey, Date.now(), wasteMax)) {
       req.log.warn(
         { party, receiver, wasteMax, wasteWindowMs },
@@ -3242,6 +4056,39 @@ export async function registerWalletRoutes(
           error:
             "too many failed pay/prepare attempts for this party — fund the wallet, then retry",
         });
+    }
+    // ADMISSION, before the participant read and the Scan resolve. The waste
+    // budget above only counts prepares that FAIL; a prepare that succeeds was
+    // unlimited, and each one was a participant ACS read plus a priority Scan
+    // read that the shared budget never refuses. Measured on this branch: 500
+    // from one IP in a minute, all served, and the Scan window full for every
+    // best-effort read. That read is now priority only for a payment-path
+    // receiver (see the factory resolve below). The party is caller-asserted (any funded party works),
+    // so the pair key holds one agent and the IP key holds the network.
+    //
+    // The network is an IPv4 address or an IPv6 /64 (ipBucket), as for the
+    // submission shares: one host usually holds a whole /64, and keyed by
+    // address it could take a fresh cap with every request.
+    //
+    // No strike, as for any share a NAT of honest agents can reach together.
+    // A trusted key (the hosted MCP, the pay-proxy) is exempt, as everywhere.
+    if (!isTrusted(req)) {
+      const net = ipBucket(clientIp(req));
+      const admitted = payPrepareLimiter.allowKeys(
+        [
+          { key: `pay-prepare:${party}|${net}`, max: svc.payPrepareRateMaxPerKey ?? 0 },
+          { key: `pay-prepare-ip:${net}`, max: svc.payPrepareRateMaxPerIp ?? 0 },
+        ],
+        Date.now(),
+        false
+      );
+      if (!admitted) {
+        req.log.warn({ party, network: net }, "pay/prepare refused: caller over its per-minute admission");
+        return reply
+          .code(429)
+          .header("Retry-After", "60")
+          .send({ error: "too many pay/prepare requests from this caller; retry in a minute" });
+      }
     }
     try {
       // Amulet (default): admin=DSO, id="Amulet", resolved on the SV Scan.
@@ -3344,7 +4191,7 @@ export async function registerWalletRoutes(
         },
         excludeDebugFields: true,
       });
-      let r: Response;
+      let f: AmuletFactoryAnswer;
       if (registryBaseUrl) {
         const url = `${registryBaseUrl}/api/token-standard/v0/registrars/${encodeURIComponent(
           admin
@@ -3373,25 +4220,57 @@ export async function registerWalletRoutes(
           break;
         }
         if (!res) throw lastErr ?? new Error("registry fetch failed");
-        r = res;
+        if (!res.ok) throw new Error(`transfer-factory HTTP ${res.status}`);
+        f = (await res.json()) as AmuletFactoryAnswer;
       } else {
-        r = await scanFetchRetry(
-          `/registry/transfer-instruction/v1/transfer-factory`,
-          {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: resolveBody,
+        const cached = amuletFactoryFor(receiver, Date.now());
+        if (cached) {
+          f = cached;
+        } else {
+          // The class in the shared Scan budget. Priority for a trusted caller
+          // and for a receiver on the payment path: the payments the budget
+          // keeps room for. Best-effort for any other receiver an anonymous
+          // caller names: a fresh receiver per call misses the cache above
+          // every time, and on the priority class three IPv4 callers filled
+          // the Scan window that way. A shed read answers 503 scan_busy
+          // (relayError) and charges no waste. Not wired: priority, as before.
+          const priority =
+            isTrusted(req) || (svc.isPaymentPathMerchant?.(receiver, Date.now()) ?? true);
+          const read = (): Promise<Response> =>
+            scanFetchRetry(
+              `/registry/transfer-instruction/v1/transfer-factory`,
+              {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: resolveBody,
+              },
+              priority
+            );
+          let r: Response;
+          try {
+            r = await read();
+          } catch (err) {
+            // Held back only by a Scan host's cooldown, which any 429 on that
+            // host starts: wait it out once, at most 2 s, as Rule 7 does, so a
+            // first payment to a merchant we do not serve yet is not failed by
+            // someone else's 429. A full budget line is the answer as it is.
+            if (
+              !priority &&
+              err instanceof ScanBudgetRefusedError &&
+              err.reason === "cooldown" &&
+              err.retryAfterMs <= PAY_PREPARE_COOLDOWN_WAIT_MS
+            ) {
+              await new Promise((done) => setTimeout(done, err.retryAfterMs + COOLDOWN_WAIT_SLACK_MS));
+              r = await read();
+            } else {
+              throw err;
+            }
           }
-        );
+          if (!r.ok) throw new Error(`transfer-factory HTTP ${r.status}`);
+          f = (await r.json()) as AmuletFactoryAnswer;
+          rememberAmuletFactory(receiver, f, Date.now());
+        }
       }
-      if (!r.ok) throw new Error(`transfer-factory HTTP ${r.status}`);
-      const f = (await r.json()) as {
-        factoryId: string;
-        choiceContext: {
-          choiceContextData: unknown;
-          disclosedContracts: DisclosedContract[];
-        };
-      };
       const ledger = await ledgerFor(party);
       const prepared = await ledger.client.interactiveSubmissionPrepare({
         userId: ledger.userId,

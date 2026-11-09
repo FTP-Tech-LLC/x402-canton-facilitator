@@ -8,6 +8,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { buildServices } from "./services.js";
 import { mintUnsafeHmacJwt, createOidcTokenProvider } from "./auth/token.js";
 import type { FacilitatorConfig } from "./config.js";
+import { ScanBudgetRefusedError } from "./scan-budget.js";
 
 function baseConfig(
   overrides: Partial<FacilitatorConfig> = {}
@@ -545,5 +546,304 @@ describe("buildServices", () => {
     expect(svc.verifyRateLimit).toEqual({ maxPerPayer: 7, maxGlobal: 0, windowMs: 1000 });
     expect(svc.settleRateLimit).toEqual({ maxPerPayer: 9, maxGlobal: 99, windowMs: 2000 });
     expect(svc.verifyRateLimit).not.toBe(svc.settleRateLimit);
+  });
+
+  it("buildServices: /verify gets its waste budgets next to the valid cap", () => {
+    const svc = buildServices(
+      baseConfig({ verifyRateMaxPerIp: 50, verifyWasteMaxPerIp: 30, verifyWasteMaxPerPayer: 4 } as Partial<FacilitatorConfig>)
+    );
+    expect(svc.verifyRateLimit).toEqual({ maxPerPayer: 50, maxGlobal: 0, windowMs: 60000 });
+    expect(svc.verifyWaste).toEqual({ maxPerIp: 30, maxPerPayer: 4 });
+  });
+
+  it("buildServices: pay/prepare gets its admission caps", () => {
+    const svc = buildServices(
+      baseConfig({ walletPayPrepareRateMaxPerKey: 5, walletPayPrepareRateMaxPerIp: 9 } as Partial<FacilitatorConfig>)
+    );
+    expect(svc.payPrepareRateMaxPerKey).toBe(5);
+    expect(svc.payPrepareRateMaxPerIp).toBe(9);
+  });
+
+  it("buildServices: pay/prepare's Scan class follows the payment-path merchants", () => {
+    const svc = buildServices(baseConfig());
+    const now = Date.now();
+    expect(svc.isPaymentPathMerchant("merchant::1220beef0009", now)).toBe(false);
+    svc.noteServedMerchant("merchant::1220beef0009");
+    expect(svc.isPaymentPathMerchant("merchant::1220beef0009", now)).toBe(true);
+  });
+
+  it("buildServices: relay submissions get the global arm and the /settle breaker's settings", () => {
+    const svc = buildServices(
+      baseConfig({
+        walletSubmitRateMaxGlobal: 33,
+        settleBreakerThreshold: 4,
+        settleBreakerCooldownMs: 5000,
+        settleBreakerWindowMs: 7000,
+        settleBreakerFailureRate: 0.6,
+        settleBreakerMinSamples: 12,
+      })
+    );
+    expect(svc.submitRateMaxGlobal).toBe(33);
+    expect(svc.submitBreaker).toEqual({
+      threshold: 4,
+      cooldownMs: 5000,
+      windowMs: 7000,
+      failureRate: 0.6,
+      minSamples: 12,
+    });
+    // Same settings, not the same object: the relay builds its own instance.
+    expect(svc.submitBreaker).not.toBe(svc.settleBreaker);
+  });
+
+  describe("Rule 7 lookups and the shared Scan budget", () => {
+    const live = (party: string, expiresAt = "2099-01-01T00:00:00Z") =>
+      new Response(
+        JSON.stringify({
+          transfer_preapproval: {
+            contract: { contract_id: `00${party}`, payload: { dso: "DSO::1220", receiver: party, provider: party, expiresAt } },
+          },
+        }),
+        { status: 200 }
+      );
+    const stub = (expiresAt?: string) => {
+      const f = vi.fn(async (url: string) => {
+        const party = decodeURIComponent(String(url).split("/by-party/")[1] ?? "");
+        return live(party, expiresAt);
+      });
+      vi.stubGlobal("fetch", f);
+      return f;
+    };
+    const cfg = (o: Partial<FacilitatorConfig> = {}) =>
+      baseConfig({ scanFlavor: "sv", scanBudgetPerMin: 1, scanCooldownMs: 2000, ...o } as Partial<FacilitatorConfig>);
+    afterEach(() => vi.unstubAllGlobals());
+
+    it("a merchant nobody has paid is best-effort: past the shared line it is refused without a Scan request", async () => {
+      const f = stub();
+      const svc = buildServices(cfg());
+      await expect(svc.inline.fetchPreapproval("a::1220aa")).resolves.toMatchObject({ receiver: "a::1220aa" });
+      const err = await svc.inline.fetchPreapproval("b::1220bb").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ScanBudgetRefusedError);
+      expect(f).toHaveBeenCalledTimes(1);
+    });
+
+    it("a merchant with a validated payment, or one the operator lists, is the payment path", async () => {
+      const f = stub();
+      const svc = buildServices(
+        cfg({
+          discoveryResources: [
+            { resource: "https://api.example/x", type: "http", accepts: [{ payTo: "listed::1220cc" }] },
+          ],
+          inlineMerchantAllowlist: ["allowed::1220dd"],
+        } as Partial<FacilitatorConfig>)
+      );
+      await svc.inline.fetchPreapproval("a::1220aa"); // the line is reached
+      svc.noteServedMerchant("paid::1220bb");
+      for (const p of ["paid::1220bb", "listed::1220cc", "allowed::1220dd"]) {
+        await expect(svc.inline.fetchPreapproval(p)).resolves.toMatchObject({ receiver: p });
+      }
+      expect(f).toHaveBeenCalledTimes(4);
+    });
+
+    it("a paid merchant whose preapproval has lapsed drops back to best-effort", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const party = decodeURIComponent(String(url).split("/by-party/")[1] ?? "");
+          return live(party, party === "paid::1220bb" ? "2000-01-01T00:00:00Z" : undefined);
+        })
+      );
+      const svc = buildServices(cfg({ scanBudgetPerMin: 3 } as Partial<FacilitatorConfig>));
+      svc.noteServedMerchant("paid::1220bb");
+      // Priority, and learns the expiry. An expired record is read twice: the
+      // client never serves one from its cache.
+      await svc.inline.fetchPreapproval("paid::1220bb");
+      await svc.inline.fetchPreapproval("a::1220aa"); // the line is reached
+      const err = await svc.inline.fetchPreapproval("paid::1220bb").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ScanBudgetRefusedError);
+    });
+
+    it("a paid merchant whose preapproval is gone (Scan 404) drops back to best-effort", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const party = decodeURIComponent(String(url).split("/by-party/")[1] ?? "");
+          return party === "gone::1220bb" ? new Response("not found", { status: 404 }) : live(party);
+        })
+      );
+      const svc = buildServices(cfg({ scanBudgetPerMin: 2 } as Partial<FacilitatorConfig>));
+      svc.noteServedMerchant("gone::1220bb");
+      await expect(svc.inline.fetchPreapproval("gone::1220bb")).rejects.toMatchObject({ status: 404 });
+      await svc.inline.fetchPreapproval("a::1220aa"); // the line is reached
+      const err = await svc.inline.fetchPreapproval("gone::1220bb").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ScanBudgetRefusedError);
+    });
+
+    it("the main Scan client spends the same budget, so the payment path's use leaves less for the rest", async () => {
+      stub();
+      const svc = buildServices(cfg());
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => new Response(JSON.stringify({ amulet_rules_update: { contract: {}, domain_id: "d" } }), { status: 200 }))
+      );
+      await svc.scan.getAmuletRulesFresh();
+      const err = await svc.inline.fetchPreapproval("a::1220aa").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ScanBudgetRefusedError);
+    });
+
+    it("routes get the best-effort client as a separate Scan client on the same budget", async () => {
+      stub();
+      const svc = buildServices(cfg());
+      expect(svc.bestEffortScan).not.toBe(svc.scan);
+      await svc.scan.getTransferPreapprovalByParty("a::1220aa"); // priority takes the line
+      const err = await svc.bestEffortScan.getTransferPreapprovalByParty("b::1220bb").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ScanBudgetRefusedError);
+    });
+
+    it("Rule 7 records of merchants we serve survive any number of other parties read on the priority client", async () => {
+      // The ledger client keeps 512 preapproval records and drops all of them on
+      // overflow; the trusted status check reads arbitrary parties on `scan`.
+      const reads = new Map<string, number>();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const party = decodeURIComponent(String(url).split("/by-party/")[1] ?? "");
+          reads.set(party, (reads.get(party) ?? 0) + 1);
+          return live(party);
+        })
+      );
+      const svc = buildServices(cfg({ scanBudgetPerMin: 0 } as Partial<FacilitatorConfig>));
+      svc.noteServedMerchant("paid::1220bb");
+      await svc.inline.fetchPreapproval("paid::1220bb");
+      for (let i = 0; i < 520; i++) await svc.scan.getTransferPreapprovalByParty(`x${i}::1220aa`);
+      await svc.inline.fetchPreapproval("paid::1220bb");
+      expect(reads.get("paid::1220bb")).toBe(1);
+    });
+
+    it("/verify gets its valid-outcome caps per payer and per payment", () => {
+      const svc = buildServices(
+        baseConfig({ verifyRateMaxPerPayer: 7, verifyRateMaxPerPayment: 3 } as Partial<FacilitatorConfig>)
+      );
+      expect(svc.verifyValid).toEqual({ maxPerPayer: 7, maxPerPayment: 3 });
+    });
+
+    it("a 429 from a registry utility reached through ScanClient does not cool the Scan down", async () => {
+      // The utility is not DA's Scan: its requests are not counted, and its
+      // 429 must not hold back best-effort Scan reads.
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          if (String(url).startsWith("https://utility.example")) return new Response("busy", { status: 429 });
+          const party = decodeURIComponent(String(url).split("/by-party/")[1] ?? "");
+          return live(party);
+        })
+      );
+      const svc = buildServices(cfg({ scanBudgetPerMin: 100, scanCooldownMs: 60_000 } as Partial<FacilitatorConfig>));
+      await svc.scan
+        .resolveTransferKind({
+          sender: "s::1220aa",
+          receiver: "r::1220bb",
+          amount: "1.0000000000",
+          admin: "usdcx::1220cc",
+          id: "USDCx",
+          requestedAt: new Date().toISOString(),
+          executeBefore: new Date(Date.now() + 60_000).toISOString(),
+          registryBaseUrl: "https://utility.example",
+        })
+        .catch(() => undefined);
+      expect(svc.scanBudget._inWindow(Date.now())).toBe(0);
+      await expect(svc.inline.fetchPreapproval("a::1220aa")).resolves.toMatchObject({ receiver: "a::1220aa" });
+    });
+
+    it("the attribution Scans are counted in the same budget", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => new Response(JSON.stringify({}), { status: 200 }))
+      );
+      const svc = buildServices(
+        cfg({ scanBudgetPerMin: 1, attributionScanUrls: ["https://scan.attr.example"] } as Partial<FacilitatorConfig>)
+      );
+      await svc.attributionScanClients[0]!.getEventTrafficSummary("1220ab").catch(() => undefined);
+      expect(svc.scanBudget._inWindow(Date.now())).toBe(1);
+    });
+
+    it("merchants of recent settled payments are the payment path from startup", async () => {
+      stub();
+      const svc = buildServices(cfg());
+      expect(await svc.seedServedMerchants({ recentMerchants: async () => ["settled::1220aa"] })).toBe(1);
+      await svc.inline.fetchPreapproval("x::1220cc"); // the line is reached
+      await expect(svc.inline.fetchPreapproval("settled::1220aa")).resolves.toMatchObject({ receiver: "settled::1220aa" });
+    });
+
+    it("a store that cannot answer seeds nothing and throws nothing", async () => {
+      const svc = buildServices(cfg());
+      expect(
+        await svc.seedServedMerchants({
+          recentMerchants: async () => {
+            throw new Error("db down");
+          },
+        })
+      ).toBe(0);
+    });
+
+    it("an unknown merchant refused only by a cooldown waits it out once, then asks", async () => {
+      const f = stub();
+      const svc = buildServices(cfg({ scanBudgetPerMin: 100, scanCooldownMs: 300 } as Partial<FacilitatorConfig>));
+      svc.scanBudget.noteRateLimited(Date.now(), "http://localhost:3903/api/scan/v0/x");
+      const t0 = Date.now();
+      await expect(svc.inline.fetchPreapproval("a::1220aa")).resolves.toMatchObject({ receiver: "a::1220aa" });
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
+      expect(f).toHaveBeenCalledTimes(1);
+    });
+
+    it("a refusal by the budget line is not waited on", async () => {
+      stub();
+      const svc = buildServices(cfg({ scanBudgetPerMin: 1, scanCooldownMs: 300 } as Partial<FacilitatorConfig>));
+      await svc.inline.fetchPreapproval("a::1220aa");
+      const err = await svc.inline.fetchPreapproval("b::1220bb").catch((e: unknown) => e);
+      expect((err as ScanBudgetRefusedError).reason).toBe("budget");
+    });
+
+    it("the start of a cooldown is counted, per host", async () => {
+      const svc = buildServices(cfg({ scanBudgetPerMin: 100, scanCooldownMs: 60_000 } as Partial<FacilitatorConfig>));
+      svc.scanBudget.noteRateLimited(Date.now(), "http://localhost:3903/api/scan/v0/x");
+      svc.scanBudget.noteRateLimited(Date.now(), "http://localhost:3903/api/scan/v0/y");
+      const text = await svc.metrics.registry.metrics();
+      expect(text).toContain('x402_facilitator_scan_cooldown_total{host="localhost:3903"} 1');
+    });
+
+    it("budget 0: Rule 7 reads behave as before", async () => {
+      const f = stub();
+      const svc = buildServices(cfg({ scanBudgetPerMin: 0 } as Partial<FacilitatorConfig>));
+      for (const p of ["a::1220aa", "b::1220bb", "c::1220cc"]) await svc.inline.fetchPreapproval(p);
+      expect(f).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  it("attribution Scan clients never carry the ledger token, even with CANTON_ATTRIBUTION_SCAN_AUTH=true", async () => {
+    // Attribution URLs are third-party SV Scans; the only token buildServices
+    // holds is the participant's ledger credential.
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({}), { status: 200 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const svc = buildServices(
+        baseConfig({
+          attributionScanUrls: ["https://scan.sv-2.example"],
+          attributionScanAuth: true,
+        })
+      );
+      expect(svc.attributionScanClients).toHaveLength(1);
+      await svc.attributionScanClients[0]!.getEventTrafficSummary("1220ab");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0]!;
+      expect(url).toBe("https://scan.sv-2.example/api/scan/v0/events/1220ab");
+      expect((init?.headers as Record<string, string>).Authorization).toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("CANTON_ATTRIBUTION_SCAN_AUTH=true is ignored"));
+    } finally {
+      warn.mockRestore();
+      vi.unstubAllGlobals();
+    }
   });
 });

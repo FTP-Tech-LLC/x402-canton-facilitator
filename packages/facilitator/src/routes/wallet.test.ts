@@ -1,3 +1,4 @@
+import { CantonError } from "@ftptech/x402-canton-ledger";
 import { FaucetPreSubmitError } from "../canton/faucet.js";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import Fastify from "fastify";
@@ -52,6 +53,10 @@ async function build(s: WalletRelayServices) {
   return a;
 }
 const pk = { publicKey: { format: "f", keyData: "k", keySpec: "s" }, partyHint: "agent" };
+const TRUSTED_KEY = "trusted-relay-key-for-tests-only-000000";
+const trusted = { "x-agent-key": TRUSTED_KEY };
+/** Not trusted: one character off, one character longer, one shorter. */
+const UNTRUSTED_KEYS = [`${TRUSTED_KEY.slice(0, -1)}1`, `${TRUSTED_KEY}0`, TRUSTED_KEY.slice(0, -1)];
 
 describe("wallet relay routes", () => {
   it("preapproval/self/prepare with an unfunded merchant → 409 merchant_unfunded, not 502", async () => {
@@ -193,6 +198,16 @@ describe("wallet relay routes", () => {
     expect(no.statusCode).toBe(401);
     const ok = await a.inject({ method: "POST", url: "/v1/wallet/onboard/prepare", payload: pk, headers: { "x-agent-key": "secret" } });
     expect(ok.statusCode).toBe(200);
+    await a.close();
+  });
+
+  it("api-key gate: a trusted key passes it too, an untrusted one does not", async () => {
+    const a = await build(svc({ agentWalletApiKey: "secret", trustedKeys: [TRUSTED_KEY] }));
+    const prepare = (headers: Record<string, string>) =>
+      a.inject({ method: "POST", url: "/v1/wallet/onboard/prepare", payload: pk, headers });
+    expect((await prepare(trusted)).statusCode).toBe(200);
+    expect((await prepare({ "x-agent-key": "secret" })).statusCode).toBe(200);
+    for (const key of UNTRUSTED_KEYS) expect((await prepare({ "x-agent-key": key })).statusCode).toBe(401);
     await a.close();
   });
 
@@ -907,6 +922,86 @@ describe("wallet relay faucet route (POST /v1/wallet/faucet/claim)", () => {
     expect(r.claimed).toBe(true);
   });
 
+  describe("through the Rust sender (faucet.submit)", () => {
+    async function claimThrough(submit: ReturnType<typeof vi.fn>) {
+      stubScanFetch();
+      const store = createInMemoryFaucetStore();
+      const clientSubmit = vi.fn();
+      const a = await build(
+        faucetSvc({
+          client: mockClient({ submitAndWaitForTransaction: clientSubmit }) as never,
+          faucet: faucetConf({ store, submit: submit as never }),
+        })
+      );
+      const r = await a.inject({
+        method: "POST",
+        url: "/v1/wallet/faucet/claim",
+        payload: { party: "agent::1220cafe1234" },
+      });
+      await a.close();
+      return {
+        r,
+        clientSubmit,
+        claimed: await store.hasClaimed("agent::1220cafe1234"),
+      };
+    }
+
+    it("pays through it, not through the client", async () => {
+      const submit = vi.fn().mockResolvedValue({ updateId: "u-rust", offset: 1, events: [] });
+      const { r, clientSubmit, claimed } = await claimThrough(submit);
+      expect(r.statusCode).toBe(200);
+      expect(r.json().updateId).toBe("u-rust");
+      expect(submit).toHaveBeenCalledOnce();
+      expect(clientSubmit).not.toHaveBeenCalled();
+      expect(claimed).toBe(true);
+    });
+
+    it("KEEPS the reservation when the failure proves nothing", async () => {
+      for (const err of [
+        new CantonError("timed out", "TIMEOUT"),
+        new CantonError("binary crashed", "TRANSPORT_ERROR"),
+        new CantonError("unreadable answer", "INVALID_RESPONSE"),
+        new CantonError("gateway", "HTTP_ERROR", 503),
+      ]) {
+        const { r, claimed } = await claimThrough(vi.fn().mockRejectedValue(err));
+        expect(r.statusCode).toBe(502);
+        expect(claimed).toBe(true);
+      }
+    });
+
+    it("answers even when the release itself fails", async () => {
+      stubScanFetch();
+      const release = vi.fn().mockRejectedValue(new Error("db down"));
+      const store = { ...createInMemoryFaucetStore(), release };
+      const a = await build(
+        faucetSvc({
+          faucet: faucetConf({
+            store,
+            submit: vi.fn().mockRejectedValue(new CantonError("refused", "HTTP_ERROR", 400)),
+          }),
+        })
+      );
+      const r = await a.inject({
+        method: "POST",
+        url: "/v1/wallet/faucet/claim",
+        payload: { party: "agent::1220cafe1234" },
+      });
+      await a.close();
+      expect(r.statusCode).toBe(502);
+      expect(release).toHaveBeenCalledOnce();
+    });
+
+    it("RELEASES on a participant refusal and on a sender that never started", async () => {
+      for (const err of [
+        new CantonError("refused", "HTTP_ERROR", 400),
+        new FaucetPreSubmitError(new Error("spawn ENOENT")),
+      ]) {
+        const { claimed } = await claimThrough(vi.fn().mockRejectedValue(err));
+        expect(claimed).toBe(false);
+      }
+    });
+  });
+
   it("is gated by the api key when set", async () => {
     const a = await build(faucetSvc({ agentWalletApiKey: "secret" }));
     const no = await a.inject({
@@ -1099,6 +1194,392 @@ describe("wallet relay faucet route (POST /v1/wallet/faucet/claim)", () => {
       expect(submit).not.toHaveBeenCalled();
       await a.close();
     });
+
+    describe("the claim route's per-caller caps bound it too", () => {
+      // A party is a fresh key away, so per-party-once bounds nothing here:
+      // without per-caller caps one host could onboard its way through the
+      // whole daily budget.
+      const PARTIES = ["agent::1220aa01", "agent::1220aa02", "agent::1220aa03"];
+      const capSvc = (
+        submit: ReturnType<typeof vi.fn>,
+        over: Partial<NonNullable<WalletRelayServices["faucet"]>>
+      ) => {
+        const alloc = vi.fn();
+        for (const partyId of PARTIES) alloc.mockResolvedValueOnce({ partyId });
+        return faucetSvc({
+          client: mockClient({ submitAndWaitForTransaction: submit, allocateExternalParty: alloc }) as never,
+          faucet: faucetConf({ amountCc: "1", dailyBudgetCc: "10", onOnboard: true, ...over }),
+        });
+      };
+      const finalizeFrom = (
+        a: Awaited<ReturnType<typeof build>>,
+        remoteAddress: string,
+        headers: Record<string, string> = {}
+      ) =>
+        a.inject({
+          method: "POST",
+          url: "/v1/wallet/onboard/finalize",
+          remoteAddress,
+          headers,
+          payload: {
+            onboardingTransactions: ["tx1"],
+            multiHashSignatures: [{ format: "F", signature: "S", signingAlgorithmSpec: "A", signedBy: "fp1" }],
+          },
+        });
+      const scheduled = { status: "scheduled", amountCc: "1" };
+
+      it("one IP gets its share; past it the wallet is still created, with no grant", async () => {
+        stubScanFetch();
+        const submit = vi.fn().mockResolvedValue({ updateId: "u-grant", offset: 1, events: [] });
+        const a = await build(capSvc(submit, { onboardMaxPerIp: 1 }));
+        const first = await finalizeFrom(a, "203.0.113.5");
+        expect(first.json()).toEqual({ party: PARTIES[0], starterGrant: scheduled });
+        const second = await finalizeFrom(a, "203.0.113.5");
+        expect(second.statusCode).toBe(200);
+        expect(second.json()).toEqual({ party: PARTIES[1] });
+        const other = await finalizeFrom(a, "203.0.113.6");
+        expect(other.json()).toEqual({ party: PARTIES[2], starterGrant: scheduled });
+        await vi.waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
+        expect([receiverOf(submit, 0).receiver, receiverOf(submit, 1).receiver].sort()).toEqual(
+          [PARTIES[0], PARTIES[2]].sort()
+        );
+        await a.close();
+      });
+
+      it("shares the claim route's per-IP allowance", async () => {
+        stubScanFetch();
+        const submit = vi.fn().mockResolvedValue({ updateId: "u-grant", offset: 1, events: [] });
+        const a = await build(capSvc(submit, { maxPerIp: 1, onboardMaxPerIp: 0 }));
+        expect((await finalizeFrom(a, "203.0.113.5")).json()).toEqual({
+          party: PARTIES[0],
+          starterGrant: scheduled,
+        });
+        const claim = await a.inject({
+          method: "POST",
+          url: "/v1/wallet/faucet/claim",
+          remoteAddress: "203.0.113.5",
+          payload: { party: "agent::1220cafe1234" },
+        });
+        expect(claim.statusCode).toBe(429);
+        expect(claim.json().error).toMatch(/per IP/);
+        await a.close();
+      });
+
+      it("an exempt IP is not capped", async () => {
+        stubScanFetch();
+        const submit = vi.fn().mockResolvedValue({ updateId: "u-grant", offset: 1, events: [] });
+        const a = await build(
+          capSvc(submit, { maxPerIp: 1, onboardMaxPerIp: 1, maxGlobalPerMin: 1, ipExempt: ["203.0.113.7"] })
+        );
+        expect((await finalizeFrom(a, "203.0.113.7")).json().starterGrant).toEqual(scheduled);
+        expect((await finalizeFrom(a, "203.0.113.7")).json().starterGrant).toEqual(scheduled);
+        await vi.waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
+        await a.close();
+      });
+
+      it("the global burst cap holds across IPs", async () => {
+        stubScanFetch();
+        const submit = vi.fn().mockResolvedValue({ updateId: "u-grant", offset: 1, events: [] });
+        const a = await build(capSvc(submit, { maxGlobalPerMin: 1 }));
+        expect((await finalizeFrom(a, "203.0.113.8")).json().starterGrant).toEqual(scheduled);
+        const second = await finalizeFrom(a, "203.0.113.9");
+        expect(second.statusCode).toBe(200);
+        expect(second.json()).toEqual({ party: PARTIES[1] });
+        await a.close();
+      });
+
+      it("a refused reservation does not use up the caller's share", async () => {
+        stubScanFetch();
+        const submit = vi.fn().mockResolvedValue({ updateId: "u-grant", offset: 1, events: [] });
+        const store = createInMemoryFaucetStore();
+        await store.tryClaim({
+          party: PARTIES[0]!,
+          ip: "198.51.100.9",
+          amountCc: "1",
+          nowMs: Date.now(),
+          windowMs: 86_400_000,
+          dailyBudgetCc: "10",
+          lifetimeCapCc: "25",
+        });
+        const a = await build(capSvc(submit, { store, maxPerIp: 1, onboardMaxPerIp: 1, maxGlobalPerMin: 1 }));
+        expect((await finalizeFrom(a, "203.0.113.5")).json()).toEqual({ party: PARTIES[0] });
+        expect((await finalizeFrom(a, "203.0.113.5")).json()).toEqual({
+          party: PARTIES[1],
+          starterGrant: scheduled,
+        });
+        await vi.waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+        expect(receiverOf(submit, 0).receiver).toBe(PARTIES[1]);
+        await a.close();
+      });
+
+      it("a trusted key skips the per-IP caps", async () => {
+        stubScanFetch();
+        const submit = vi.fn().mockResolvedValue({ updateId: "u-grant", offset: 1, events: [] });
+        const a = await build({
+          ...capSvc(submit, { maxPerIp: 1, onboardMaxPerIp: 1 }),
+          trustedKeys: [TRUSTED_KEY],
+        });
+        for (let i = 0; i < 3; i++) {
+          expect((await finalizeFrom(a, "203.0.113.7", trusted)).json().starterGrant).toEqual(scheduled);
+        }
+        await vi.waitFor(() => expect(submit).toHaveBeenCalledTimes(3));
+        await a.close();
+      });
+
+      it("an untrusted key is held to the per-IP caps like no key at all", async () => {
+        stubScanFetch();
+        const submit = vi.fn().mockResolvedValue({ updateId: "u-grant", offset: 1, events: [] });
+        const a = await build({
+          ...capSvc(submit, { maxPerIp: 1, onboardMaxPerIp: 1 }),
+          trustedKeys: [TRUSTED_KEY],
+        });
+        expect((await finalizeFrom(a, "203.0.113.7")).json().starterGrant).toEqual(scheduled);
+        for (const key of UNTRUSTED_KEYS.slice(0, 2)) {
+          const r = await finalizeFrom(a, "203.0.113.7", { "x-agent-key": key });
+          expect(r.statusCode).toBe(200);
+          expect(r.json().starterGrant).toBeUndefined();
+        }
+        await vi.waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+        await a.close();
+      });
+
+      it("a trusted key still obeys the burst cap", async () => {
+        stubScanFetch();
+        const submit = vi.fn().mockResolvedValue({ updateId: "u-grant", offset: 1, events: [] });
+        const a = await build({ ...capSvc(submit, { maxGlobalPerMin: 1 }), trustedKeys: [TRUSTED_KEY] });
+        expect((await finalizeFrom(a, "203.0.113.7", trusted)).json().starterGrant).toEqual(scheduled);
+        expect((await finalizeFrom(a, "203.0.113.7", trusted)).json()).toEqual({ party: PARTIES[1] });
+        await a.close();
+      });
+    });
+  });
+});
+
+describe("onboarding per-IP cap (onboardRateMaxPerIp)", () => {
+  const finalize = (
+    a: Awaited<ReturnType<typeof build>>,
+    remoteAddress: string,
+    headers: Record<string, string> = {}
+  ) =>
+    a.inject({
+      method: "POST",
+      url: "/v1/wallet/onboard/finalize",
+      remoteAddress,
+      headers,
+      payload: {
+        onboardingTransactions: ["tx1"],
+        multiHashSignatures: [{ format: "F", signature: "S", signingAlgorithmSpec: "A", signedBy: "fp1" }],
+      },
+    });
+  const strictSvc = () =>
+    svc({
+      client: mockClient({ allocateExternalParty: vi.fn().mockResolvedValue({ partyId: "agent::1220new" }) }) as never,
+      submitRateMaxPerKey: 1,
+      onboardRateMaxPerIp: 1,
+      abuseStrikesToBan: 1,
+      abuseStrikeSpacingMs: 0,
+      trustedKeys: [TRUSTED_KEY],
+    });
+
+  it("refuses one IP at its own share while the global minute cap still has room", async () => {
+    // Equal to the global cap, one caller could spend the whole facilitator
+    // budget without a single per-IP refusal, so without a strike.
+    const alloc = vi.fn().mockResolvedValue({ partyId: "agent::1220new" });
+    const a = await build(
+      svc({
+        client: mockClient({ allocateExternalParty: alloc }) as never,
+        submitRateMaxPerKey: 60,
+        onboardRateMaxPerIp: 2,
+        onboardRateMaxGlobal: 60,
+      })
+    );
+    expect((await finalize(a, "203.0.113.20")).statusCode).toBe(200);
+    expect((await finalize(a, "203.0.113.20")).statusCode).toBe(200);
+    const third = await finalize(a, "203.0.113.20");
+    expect(third.statusCode).toBe(429);
+    expect(third.json().error).toBe("too many onboarding requests");
+    expect((await finalize(a, "203.0.113.21")).statusCode).toBe(200);
+    expect(alloc).toHaveBeenCalledTimes(3);
+    await a.close();
+  });
+
+  it("a trusted key skips the per-IP caps and is never struck", async () => {
+    const a = await build(strictSvc());
+    const prep = (headers: Record<string, string> = {}) =>
+      a.inject({
+        method: "POST",
+        url: "/v1/wallet/submit/prepare",
+        remoteAddress: "203.0.113.22",
+        headers,
+        payload: { commands: [{ ExerciseCommand: { choice: "TransferFactory_Transfer" } }], actAs: ["agent::12201"] },
+      });
+    for (let i = 0; i < 3; i++) {
+      expect((await finalize(a, "203.0.113.22", trusted)).statusCode).toBe(200);
+      expect((await prep(trusted)).statusCode).toBe(200);
+    }
+    // Not banned, and none of its own share spent: the same IP without the key.
+    expect((await finalize(a, "203.0.113.22")).statusCode).toBe(200);
+    expect((await prep()).statusCode).toBe(200);
+    expect((await prep()).statusCode).toBe(429);
+    await a.close();
+  });
+
+  it("an untrusted key, or none, is capped and, at one strike, banned", async () => {
+    const a = await build(strictSvc());
+    const callers: Array<Record<string, string>> = [{}, ...UNTRUSTED_KEYS.map((k) => ({ "x-agent-key": k }))];
+    for (const [i, headers] of callers.entries()) {
+      const ip = `203.0.113.${30 + i}`;
+      expect((await finalize(a, ip, headers)).statusCode).toBe(200);
+      expect((await finalize(a, ip, headers)).json().error).toBe("too many onboarding requests");
+      expect((await finalize(a, ip, headers)).json().error).toMatch(/suspended/);
+    }
+    await a.close();
+  });
+
+  it("a ban on its IP does not refuse a trusted request", async () => {
+    const a = await build(strictSvc());
+    expect((await finalize(a, "203.0.113.23")).statusCode).toBe(200);
+    expect((await finalize(a, "203.0.113.23")).statusCode).toBe(429);
+    expect((await finalize(a, "203.0.113.23")).json().error).toMatch(/suspended/);
+    expect((await finalize(a, "203.0.113.23", trusted)).statusCode).toBe(200);
+    expect((await finalize(a, "203.0.113.23")).json().error).toMatch(/suspended/);
+    await a.close();
+  });
+
+  it("leaves submit/prepare on the submit cap", async () => {
+    const a = await build(svc({ submitRateMaxPerKey: 60, onboardRateMaxPerIp: 1 }));
+    const prep = () =>
+      a.inject({
+        method: "POST",
+        url: "/v1/wallet/submit/prepare",
+        payload: {
+          commands: [{ ExerciseCommand: { choice: "TransferFactory_Transfer" } }],
+          actAs: ["agent::12201"],
+        },
+      });
+    for (let i = 0; i < 3; i++) expect((await prep()).statusCode).not.toBe(429);
+    await a.close();
+  });
+});
+
+describe("a trusted key's budgets are not its IP's", () => {
+  // The hosted MCP's users can make it send unkeyed requests from its IP (its
+  // `pay` follows redirects), so those must never fill a bucket its keyed
+  // requests are counted in.
+  const IP = "198.51.100.7";
+  afterEach(() => vi.unstubAllGlobals());
+
+  describe("pay/prepare wasted-prepare budget", () => {
+    const V = "victim::1220abcdef";
+    const USDCX = "usdcx-admin::1220a";
+    const app = async () => {
+      const registry = vi.fn(async () => new Response("stop", { status: 400 }));
+      vi.stubGlobal("fetch", registry);
+      const holding = {
+        contractId: "c1",
+        interfaceViews: [
+          {
+            interfaceId: "#pkg:Splice.Api.Token.HoldingV1:Holding",
+            viewValue: { owner: V, instrumentId: { admin: USDCX, id: "USDCx" }, amount: "0.5000000000", lock: null },
+          },
+        ],
+      };
+      const a = await build(
+        svc({
+          client: mockClient({ queryActiveContracts: vi.fn().mockResolvedValue([holding]) }) as never,
+          tokenRegistries: { [USDCX]: "http://reg.test" },
+          tfPay: { wasteMax: 3, wasteWindowMs: 300_000, defaultExecuteBeforeSeconds: 120, maxExecuteBeforeSeconds: 600 },
+          trustedKeys: [TRUSTED_KEY],
+        })
+      );
+      const pay = (amount: string, headers: Record<string, string> = {}, party = V) =>
+        a.inject({
+          method: "POST",
+          url: "/v1/wallet/pay/prepare",
+          remoteAddress: IP,
+          headers,
+          payload: { party, receiver: "merchant::1220abcdef01", amount, instrumentId: { admin: USDCX, id: "USDCx" } },
+        });
+      return { a, pay, registry };
+    };
+    const HUGE = "999999999999999";
+
+    it("unkeyed refusals for a party do not lock the keyed caller out of paying for it", async () => {
+      const { a, pay, registry } = await app();
+      for (let i = 0; i < 3; i++) expect((await pay(HUGE)).statusCode).toBe(400);
+      expect((await pay(HUGE)).statusCode).toBe(429);
+      expect((await pay("0.1000000000", trusted)).statusCode).not.toBe(429);
+      expect(registry).toHaveBeenCalled(); // past the budget, at the registry resolve
+      expect((await pay("0.1000000000")).statusCode).toBe(429);
+      await a.close();
+    });
+
+    it("the keyed caller still has a budget per party", async () => {
+      const { a, pay } = await app();
+      for (let i = 0; i < 3; i++) expect((await pay(HUGE, trusted)).statusCode).toBe(400);
+      expect((await pay(HUGE, trusted)).statusCode).toBe(429);
+      expect((await pay(HUGE, trusted, "other::1220abcdef")).statusCode).toBe(400);
+      // Nor did it spend the unkeyed caller's share.
+      expect((await pay(HUGE)).statusCode).toBe(400);
+      await a.close();
+    });
+  });
+
+  it("submit/prepare: unkeyed requests that fill the IP's share do not refuse the keyed caller", async () => {
+    const a = await build(svc({ submitRateMaxPerKey: 2, trustedKeys: [TRUSTED_KEY] }));
+    const prep = (headers: Record<string, string> = {}, payload: unknown = {}) =>
+      a.inject({ method: "POST", url: "/v1/wallet/submit/prepare", remoteAddress: IP, headers, payload });
+    const claim = { commands: [{ ExerciseCommand: { choice: "TransferInstruction_Accept" } }], actAs: ["agent::1220abcdef"] };
+    for (let i = 0; i < 2; i++) expect((await prep()).statusCode).toBe(400);
+    expect((await prep()).statusCode).toBe(429);
+    for (let i = 0; i < 3; i++) expect((await prep(trusted, claim)).statusCode).toBe(200);
+    expect((await prep({}, claim)).statusCode).toBe(429);
+    await a.close();
+  });
+
+  it("submit/execute: the keyed caller skips the IP arm, not its per-party cap", async () => {
+    const a = await build(svc({ submitRateMaxPerKey: 1, submitRateMaxPerIp: 2, trustedKeys: [TRUSTED_KEY] }));
+    const exec = (party: string, headers: Record<string, string> = {}) =>
+      a.inject({
+        method: "POST",
+        url: "/v1/wallet/submit/execute",
+        remoteAddress: IP,
+        headers,
+        payload: { preparedTransaction: "cHJlcA==", partySignatures: { signatures: [{ party }] } },
+      });
+    const A = "agent::1220aa000001";
+    expect((await exec(A)).statusCode).toBe(200);
+    expect((await exec("agent::1220aa000002")).statusCode).toBe(200);
+    expect((await exec("agent::1220aa000003")).statusCode).toBe(429);
+    expect((await exec(A, trusted)).statusCode).toBe(200);
+    expect((await exec(A, trusted)).statusCode).toBe(429);
+    expect((await exec("agent::1220aa000004")).statusCode).toBe(429);
+    await a.close();
+  });
+
+  it("preapproval/self/commit: the same rule on the same budget", async () => {
+    const a = await build(
+      svc({
+        submitRateMaxPerKey: 1,
+        submitRateMaxPerIp: 1,
+        trustedKeys: [TRUSTED_KEY],
+        selfPreapproval: { executeSelfPreapproval: vi.fn().mockResolvedValue({ updateId: "u1" }) },
+      } as never)
+    );
+    const commit = (party: string, headers: Record<string, string> = {}) =>
+      a.inject({
+        method: "POST",
+        url: "/v1/wallet/preapproval/self/commit",
+        remoteAddress: IP,
+        headers,
+        payload: { party, preparedTransaction: "cHJlcA==", partySignatures: { signatures: [{ party, signatures: [{}] }] } },
+      });
+    const P = "agent::1220aa000001";
+    expect((await commit(P)).statusCode).toBe(200);
+    expect((await commit("agent::1220aa000002")).statusCode).toBe(429);
+    expect((await commit(P, trusted)).statusCode).toBe(200);
+    expect((await commit(P, trusted)).statusCode).toBe(429);
+    await a.close();
   });
 });
 
@@ -1739,10 +2220,12 @@ describe("onboard/finalize — daily allocation ceiling", () => {
     const alloc = vi.fn().mockResolvedValue({ partyId: "agent::1220new" });
     const s = svc({
       client: mockClient({ allocateExternalParty: alloc }) as never,
-      // Minute + per-IP caps far out of the way: this asserts the DAILY arm.
+      // Minute + per-IP caps and the share without a key far out of the way:
+      // this asserts the DAILY arm.
       submitRateMaxPerKey: 100,
       onboardRateMaxGlobal: 100,
       onboardDailyMax: 2,
+      onboardDailyMaxAnonymous: 2,
     });
     const a = await build(s);
     expect((await finalize(a, "203.0.113.1")).statusCode).toBe(200);
@@ -1789,6 +2272,263 @@ describe("onboard/finalize — daily allocation ceiling", () => {
     expect(second.statusCode).toBe(429);
     expect(second.headers["retry-after"]).toBe("60");
     expect(alloc).toHaveBeenCalledTimes(1);
+    await a.close();
+  });
+
+  const caps = (over: Record<string, unknown>) => {
+    const alloc = vi.fn().mockResolvedValue({ partyId: "agent::1220new" });
+    const s = svc({
+      client: mockClient({ allocateExternalParty: alloc }) as never,
+      submitRateMaxPerKey: 100,
+      onboardRateMaxGlobal: 100,
+      trustedKeys: [TRUSTED_KEY],
+      ...over,
+    });
+    return { alloc, s };
+  };
+
+  it("one network without a key stops at its daily cap; another network carries on", async () => {
+    const { alloc, s } = caps({ onboardDailyMax: 100, onboardDailyMaxPerIp: 2 });
+    const a = await build(s);
+    expect((await finalize(a, "203.0.113.1")).statusCode).toBe(200);
+    expect((await finalize(a, "203.0.113.1")).statusCode).toBe(200);
+    const third = await finalize(a, "203.0.113.1");
+    expect(third.statusCode).toBe(429);
+    expect(third.headers["retry-after"]).toBe("3600");
+    expect((third.json() as { error: string }).error).toBe("onboarding daily limit reached");
+    expect((await finalize(a, "203.0.113.2")).statusCode).toBe(200);
+    expect(alloc).toHaveBeenCalledTimes(3);
+    await a.close();
+  });
+
+  it("counts an IPv6 /64 as one network", async () => {
+    const { alloc, s } = caps({ onboardDailyMax: 100, onboardDailyMaxPerIp: 2 });
+    const a = await build(s);
+    expect((await finalize(a, "2001:db8:1:2::1")).statusCode).toBe(200);
+    expect((await finalize(a, "2001:db8:1:2::2")).statusCode).toBe(200);
+    expect((await finalize(a, "2001:db8:1:2:ffff::3")).statusCode).toBe(429);
+    expect((await finalize(a, "2001:db8:1:3::1")).statusCode).toBe(200);
+    expect(alloc).toHaveBeenCalledTimes(3);
+    await a.close();
+  });
+
+  it("callers without a key use their share; trusted callers keep the rest of the day", async () => {
+    const { alloc, s } = caps({ onboardDailyMax: 4, onboardDailyMaxAnonymous: 2, onboardDailyMaxPerIp: 100 });
+    const a = await build(s);
+    const asTrusted = () =>
+      a.inject({
+        method: "POST",
+        url: "/v1/wallet/onboard/finalize",
+        remoteAddress: "198.51.100.9",
+        headers: { "x-agent-key": TRUSTED_KEY },
+        payload: {
+          onboardingTransactions: ["tx1"],
+          multiHashSignatures: [{ format: "F", signature: "S", signingAlgorithmSpec: "A", signedBy: "fp1" }],
+        },
+      });
+    expect((await finalize(a, "203.0.113.1")).statusCode).toBe(200);
+    expect((await finalize(a, "203.0.113.2")).statusCode).toBe(200);
+    expect((await finalize(a, "203.0.113.3")).statusCode).toBe(429);
+    expect((await asTrusted()).statusCode).toBe(200);
+    expect((await asTrusted()).statusCode).toBe(200);
+    // The day itself is spent now, for everyone.
+    expect((await asTrusted()).statusCode).toBe(429);
+    expect(alloc).toHaveBeenCalledTimes(4);
+    await a.close();
+  });
+
+  const asTrusted = (a: ReturnType<typeof Fastify>) =>
+    a.inject({
+      method: "POST",
+      url: "/v1/wallet/onboard/finalize",
+      remoteAddress: "198.51.100.9",
+      headers: { "x-agent-key": TRUSTED_KEY },
+      payload: {
+        onboardingTransactions: ["tx1"],
+        multiHashSignatures: [{ format: "F", signature: "S", signingAlgorithmSpec: "A", signedBy: "fp1" }],
+      },
+    });
+
+  it("a refusal by the ceiling spends neither the share nor the network's day", async () => {
+    const t0 = Date.parse("2026-11-08T00:00:00Z");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(t0);
+    try {
+      const { alloc, s } = caps({
+        onboardDailyMax: 4,
+        onboardDailyMaxTrusted: 4,
+        onboardDailyMaxAnonymous: 3,
+        onboardDailyMaxPerIp: 2,
+      });
+      const a = await build(s);
+      for (let i = 0; i < 4; i++) expect((await asTrusted(a)).statusCode).toBe(200);
+      clock.mockReturnValue(t0 + 3_600_000);
+      for (let i = 0; i < 3; i++) expect((await finalize(a, "203.0.113.1")).statusCode).toBe(429);
+      // A day after the trusted calls, an hour short of a day after the refusals.
+      clock.mockReturnValue(t0 + 86_400_000 + 60_000);
+      expect((await finalize(a, "203.0.113.1")).statusCode).toBe(200);
+      expect((await finalize(a, "203.0.113.1")).statusCode).toBe(200);
+      expect((await asTrusted(a)).statusCode).toBe(200);
+      expect(alloc).toHaveBeenCalledTimes(7);
+      await a.close();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("a refusal by the day spends no slot of the minute shared with trusted callers", async () => {
+    const { alloc, s } = caps({ onboardDailyMax: 100, onboardDailyMaxPerIp: 1, onboardRateMaxGlobal: 3 });
+    const a = await build(s);
+    expect((await finalize(a, "2001:db8:1:2::1")).statusCode).toBe(200);
+    expect((await finalize(a, "2001:db8:1:2::2")).statusCode).toBe(429);
+    expect((await finalize(a, "2001:db8:1:2::3")).statusCode).toBe(429);
+    expect((await asTrusted(a)).statusCode).toBe(200);
+    expect((await asTrusted(a)).statusCode).toBe(200);
+    const third = await asTrusted(a);
+    expect(third.statusCode).toBe(429);
+    expect(third.headers["retry-after"]).toBe("60");
+    expect(alloc).toHaveBeenCalledTimes(3);
+    await a.close();
+  });
+
+  it("trusted callers have a share of their own, three quarters of the day by default", async () => {
+    const { alloc, s } = caps({ onboardDailyMax: 4, onboardDailyMaxPerIp: 100 });
+    const a = await build(s);
+    for (let i = 0; i < 3; i++) expect((await asTrusted(a)).statusCode).toBe(200);
+    const fourth = await asTrusted(a);
+    expect(fourth.statusCode).toBe(429);
+    expect((fourth.json() as { error: string }).error).toBe("onboarding daily limit reached");
+    expect((await finalize(a, "203.0.113.1")).statusCode).toBe(200);
+    expect(alloc).toHaveBeenCalledTimes(4);
+    await a.close();
+  });
+
+  it("a body the participant refuses spends neither the day nor the minute", async () => {
+    const { alloc, s } = caps({ onboardDailyMax: 100, onboardDailyMaxPerIp: 3, onboardRateMaxGlobal: 3 });
+    for (let i = 0; i < 3; i++) alloc.mockRejectedValueOnce(new CantonError("rejected", "HTTP_ERROR", 400));
+    const a = await build(s);
+    for (let i = 0; i < 3; i++) expect((await finalize(a, "203.0.113.5")).statusCode).not.toBe(200);
+    for (let i = 0; i < 3; i++) expect((await finalize(a, "203.0.113.5")).statusCode).toBe(200);
+    const day = await finalize(a, "203.0.113.5");
+    expect(day.statusCode).toBe(429);
+    expect(day.headers["retry-after"]).toBe("3600");
+    expect(alloc).toHaveBeenCalledTimes(6);
+    await a.close();
+  });
+
+  it("a malformed body is refused before anything is charged", async () => {
+    const { alloc, s } = caps({ onboardDailyMax: 100, onboardRateMaxGlobal: 2 });
+    const a = await build(s);
+    for (const payload of [
+      { onboardingTransactions: "x", multiHashSignatures: "x" },
+      { onboardingTransactions: [1], multiHashSignatures: [{}] },
+      { onboardingTransactions: ["tx1"], multiHashSignatures: ["sig"] },
+    ]) {
+      for (let i = 0; i < 3; i++) {
+        const r = await a.inject({ method: "POST", url: "/v1/wallet/onboard/finalize", remoteAddress: "203.0.113.9", payload });
+        expect(r.statusCode).toBe(400);
+      }
+    }
+    // The minute (2) is untouched: both trusted calls go through.
+    expect((await asTrusted(a)).statusCode).toBe(200);
+    expect((await asTrusted(a)).statusCode).toBe(200);
+    expect(alloc).toHaveBeenCalledTimes(2);
+    await a.close();
+  });
+
+  it("refunds stop at the network's refund budget: past it a refused body is spent", async () => {
+    const { alloc, s } = caps({ onboardDailyMax: 100, onboardDailyMaxPerIp: 2 });
+    for (let i = 0; i < 3; i++) alloc.mockRejectedValueOnce(new CantonError("rejected", "HTTP_ERROR", 400));
+    const a = await build(s);
+    for (let i = 0; i < 3; i++) expect((await finalize(a, "203.0.113.10")).statusCode).not.toBe(200);
+    // Two refunded, the third spent one of the network's two.
+    expect((await finalize(a, "203.0.113.10")).statusCode).toBe(200);
+    expect((await finalize(a, "203.0.113.10")).statusCode).toBe(429);
+    expect(alloc).toHaveBeenCalledTimes(4);
+    await a.close();
+  });
+
+  it("refunds stop at the ceiling across everyone, trusted callers included", async () => {
+    const { alloc, s } = caps({ onboardDailyMax: 2, onboardDailyMaxTrusted: 2 });
+    for (let i = 0; i < 3; i++) {
+      alloc.mockRejectedValueOnce(new CantonError("POST /v2/parties/external/allocate failed: fetch failed", "TRANSPORT_ERROR"));
+    }
+    const a = await build(s);
+    for (let i = 0; i < 3; i++) expect((await asTrusted(a)).statusCode).not.toBe(200);
+    expect((await asTrusted(a)).statusCode).toBe(200);
+    expect((await asTrusted(a)).statusCode).toBe(429);
+    expect(alloc).toHaveBeenCalledTimes(4);
+    await a.close();
+  });
+
+  it("junk without a key cannot use up the refunds trusted callers need", async () => {
+    const { alloc, s } = caps({
+      onboardDailyMax: 4,
+      onboardDailyMaxAnonymous: 2,
+      onboardDailyMaxTrusted: 2,
+      onboardDailyMaxPerIp: 100,
+    });
+    for (let i = 0; i < 4; i++) alloc.mockRejectedValueOnce(new CantonError("rejected", "HTTP_ERROR", 400));
+    alloc.mockRejectedValueOnce(new CantonError("POST /v2/parties/external/allocate failed: fetch failed", "TRANSPORT_ERROR"));
+    const a = await build(s);
+    for (let i = 0; i < 4; i++) expect((await finalize(a, `203.0.113.${20 + i}`)).statusCode).not.toBe(200);
+    // A hosted MCP mint during an outage: given back from the trusted share.
+    expect((await asTrusted(a)).statusCode).not.toBe(200);
+    expect((await asTrusted(a)).statusCode).toBe(200);
+    expect((await asTrusted(a)).statusCode).toBe(200);
+    expect((await asTrusted(a)).statusCode).toBe(429);
+    expect(alloc).toHaveBeenCalledTimes(7);
+    await a.close();
+  });
+
+  const coHostCaps = (coAlloc: ReturnType<typeof vi.fn>, over: Record<string, unknown>) =>
+    caps({
+      onboardCoHost: {
+        participantUid: "co::1220",
+        client: { allocateExternalParty: coAlloc, grantUserRights: vi.fn() } as never,
+        userId: "co-user",
+        grantPartyRights: false,
+      },
+      ...over,
+    });
+
+  it("a co-host that cannot be reached gives the day back and keeps the minute", async () => {
+    const coAlloc = vi
+      .fn()
+      .mockRejectedValueOnce(new CantonError("POST /v2/parties/external/allocate failed: fetch failed", "TRANSPORT_ERROR"))
+      .mockResolvedValue({ partyId: "agent::1220new" });
+    const { alloc, s } = coHostCaps(coAlloc, { onboardDailyMax: 100, onboardDailyMaxPerIp: 1, onboardRateMaxGlobal: 2 });
+    const a = await build(s);
+    expect((await finalize(a, "203.0.113.6")).statusCode).not.toBe(200);
+    expect(alloc).not.toHaveBeenCalled();
+    expect((await finalize(a, "203.0.113.6")).statusCode).toBe(200);
+    // The failed attempt kept its minute slot: two of two are used.
+    const third = await finalize(a, "203.0.113.7");
+    expect(third.statusCode).toBe(429);
+    expect(third.headers["retry-after"]).toBe("60");
+    expect(alloc).toHaveBeenCalledTimes(1);
+    await a.close();
+  });
+
+  it("once the co-host has allocated, a refusal by the primary gives nothing back", async () => {
+    const coAlloc = vi.fn().mockResolvedValue({ partyId: "agent::1220new" });
+    const { alloc, s } = coHostCaps(coAlloc, { onboardDailyMax: 100, onboardDailyMaxPerIp: 1 });
+    alloc.mockRejectedValueOnce(new CantonError("rejected", "HTTP_ERROR", 400));
+    const a = await build(s);
+    expect((await finalize(a, "203.0.113.8")).statusCode).not.toBe(200);
+    const again = await finalize(a, "203.0.113.8");
+    expect(again.statusCode).toBe(429);
+    expect(again.headers["retry-after"]).toBe("3600");
+    await a.close();
+  });
+
+  it("the share without a key defaults to three quarters of the day", async () => {
+    const { alloc, s } = caps({ onboardDailyMax: 4, onboardDailyMaxPerIp: 100 });
+    const a = await build(s);
+    for (const ip of ["203.0.113.1", "203.0.113.2", "203.0.113.3"]) {
+      expect((await finalize(a, ip)).statusCode).toBe(200);
+    }
+    expect((await finalize(a, "203.0.113.4")).statusCode).toBe(429);
+    expect(alloc).toHaveBeenCalledTimes(3);
     await a.close();
   });
 });
@@ -2215,6 +2955,85 @@ describe("/pending lists registry-token rows only when asked (?registry=1)", () 
     const r = await a.inject({ method: "GET", url: "/v1/wallet/agent::12201/pending?registry=1" });
     expect(r.statusCode).toBe(200);
     expect(r.json().pending.map((p: { cid: string }) => p.cid)).toEqual(["cc-1", "cc-noview"]);
+  });
+});
+
+describe("/outgoing lists the party's own registry offers, for reclaim", () => {
+  const USDCX_ADMIN = "usdcx-admin::1220";
+  const DSO = "DSO::1220dso";
+  const TI = "#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction";
+  const row = (cid: string, sender: string, receiver: string, admin: string, id: string, tag: string) => ({
+    contractId: cid,
+    templateId: "#utility-registry-app-v0:Utility.Registry.App.V0.Model.Transfer:TransferOffer",
+    createArgument: {},
+    interfaceViews: [
+      {
+        interfaceId: TI,
+        viewValue: {
+          transfer: { sender, receiver, amount: "0.18", instrumentId: { admin, id }, executeBefore: "2026-10-24T15:41:23.741Z" },
+          status: { tag },
+        },
+      },
+    ],
+    signatories: [],
+    observers: [],
+    packageName: "p",
+  });
+  const events = [
+    row("mine-1", "agent::12201", "cantex-swap::1220c", USDCX_ADMIN, "USDCx", "TransferPendingReceiverAcceptance"),
+    row("incoming", "merchant::1220m", "agent::12201", USDCX_ADMIN, "USDCx", "TransferPendingReceiverAcceptance"),
+    row("unrouted", "agent::12201", "x::1220x", "unknown-admin::1220u", "TOK", "TransferPendingReceiverAcceptance"),
+    row("cc", "agent::12201", "x::1220x", DSO, "Amulet", "TransferPendingReceiverAcceptance"),
+  ];
+  const withEvents = () =>
+    svc({ client: { ...mockClient(), queryActiveContracts: vi.fn(async () => events) } as never, tokenRegistries: { [USDCX_ADMIN]: "https://registry.example" } });
+
+  it("lists only what the party sent, for a registrar it can route, with status and deadline", async () => {
+    const a = await build(withEvents());
+    const r = await a.inject({ method: "GET", url: "/v1/wallet/agent::12201/outgoing" });
+    expect(r.statusCode).toBe(200);
+    expect(r.json().outgoing).toEqual([
+      {
+        cid: "mine-1",
+        amount: "0.18",
+        receiver: "cantex-swap::1220c",
+        instrumentId: { admin: USDCX_ADMIN, id: "USDCx" },
+        executeBefore: "2026-10-24T15:41:23.741Z",
+        status: "TransferPendingReceiverAcceptance",
+      },
+    ]);
+  });
+});
+
+describe("withdrawing an offer asks the registry for the withdraw context", () => {
+  const USDCX_ADMIN = "usdcx-admin::1220";
+  const REG = "https://registry.example";
+
+  it("routes to the per-registrar choice-contexts/withdraw when the admin is a configured registry", async () => {
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (u: string) => {
+        seen.push(String(u));
+        return { ok: true, status: 200, json: async () => ({ choiceContextData: { w: 1 }, disclosedContracts: [] }) } as never;
+      })
+    );
+    const a = await build(svc({ tokenRegistries: { [USDCX_ADMIN]: REG } }));
+    const r = await a.inject({
+      method: "POST",
+      url: "/v1/wallet/resolve/withdraw",
+      payload: { instructionCid: "00abc", instrumentAdmin: USDCX_ADMIN },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.json()).toEqual({ choiceContextData: { w: 1 }, disclosedContracts: [] });
+    expect(seen.some((u) => u.startsWith(REG) && u.endsWith("/00abc/choice-contexts/withdraw"))).toBe(true);
+    vi.unstubAllGlobals();
+  });
+
+  it("requires the instruction id", async () => {
+    const a = await build(svc({ tokenRegistries: { [USDCX_ADMIN]: REG } }));
+    const r = await a.inject({ method: "POST", url: "/v1/wallet/resolve/withdraw", payload: {} });
+    expect(r.statusCode).toBe(400);
   });
 });
 
@@ -3389,5 +4208,185 @@ describe("holdings-scan (Scan ACS snapshot, whale path)", () => {
     expect(holdingsCalls[0]!.body.after).toBeUndefined();
     expect(holdingsCalls[1]!.body.after).toBe("tok-2");
     expect(holdingsCalls[0]!.body.migration_id).toBe(4);
+  });
+});
+
+describe("relay reads are bounded per caller", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  const P = encodeURIComponent("agent::12201");
+  const get = (
+    a: Awaited<ReturnType<typeof build>>,
+    url: string,
+    remoteAddress = "203.0.113.30",
+    headers: Record<string, string> = {}
+  ) => a.inject({ method: "GET", url, remoteAddress, headers });
+  const resolve = (
+    a: Awaited<ReturnType<typeof build>>,
+    remoteAddress = "203.0.113.30",
+    headers: Record<string, string> = {}
+  ) =>
+    a.inject({
+      method: "POST",
+      url: "/v1/wallet/resolve/transfer-factory",
+      remoteAddress,
+      headers,
+      payload: { sender: "agent::1220a", receiver: "merchant::1220m", amount: "1.0000000000" },
+    });
+  const stubFetch = () => {
+    const f = vi.fn(async (url: unknown) => {
+      const u = String(url);
+      if (u.includes("/dso-party-id")) {
+        return new Response(JSON.stringify({ dso_party_id: "DSO::1220cafe" }), { status: 200 });
+      }
+      if (u.includes("/transfer-factory")) {
+        return new Response(
+          JSON.stringify({ factoryId: "00f", choiceContext: { choiceContextData: {}, disclosedContracts: [] } }),
+          { status: 200 }
+        );
+      }
+      return new Response("not found", { status: 404 });
+    });
+    vi.stubGlobal("fetch", f);
+    return f;
+  };
+
+  it("refuses one IP past its share, across the read routes, before reading", async () => {
+    const q = vi.fn().mockResolvedValue([]);
+    const a = await build(svc({ client: mockClient({ queryActiveContracts: q }) as never, readRateMaxPerIp: 2 }));
+    expect((await get(a, `/v1/wallet/${P}/balance`)).statusCode).toBe(200);
+    expect((await get(a, `/v1/wallet/${P}/pending`)).statusCode).toBe(200);
+    const third = await get(a, `/v1/wallet/${P}/holdings`);
+    expect(third.statusCode).toBe(429);
+    expect(third.headers["retry-after"]).toBe("60");
+    expect(q).toHaveBeenCalledTimes(2);
+    // Another caller is unaffected.
+    expect((await get(a, `/v1/wallet/${P}/balance`, "203.0.113.31")).statusCode).toBe(200);
+    await a.close();
+  });
+
+  it("has no global arm: callers held at their own cap cannot refuse another's resolve", async () => {
+    // Resolves sit on the payment path; a refusal earns no strike, so a global
+    // arm would let a handful of IPs refuse every wallet for free.
+    stubFetch();
+    const a = await build(svc({ scanReadRateMaxPerIp: 1 }));
+    for (let i = 0; i < 5; i++) {
+      const ip = `198.51.100.${i + 1}`;
+      expect((await resolve(a, ip)).statusCode).toBe(200);
+      expect((await resolve(a, ip)).statusCode).toBe(429);
+    }
+    expect((await resolve(a, "203.0.113.99")).statusCode).toBe(200);
+    expect((await get(a, `/v1/wallet/${P}/balance`, "203.0.113.99")).statusCode).toBe(200);
+    await a.close();
+  });
+
+  it("0 disables the cap", async () => {
+    const a = await build(svc({ readRateMaxPerIp: 0 }));
+    for (let i = 0; i < 5; i++) expect((await get(a, `/v1/wallet/${P}/balance`)).statusCode).toBe(200);
+    await a.close();
+  });
+
+  it("a trusted key skips the per-IP caps", async () => {
+    stubFetch();
+    const a = await build(svc({ readRateMaxPerIp: 1, scanReadRateMaxPerIp: 1, trustedKeys: [TRUSTED_KEY] }));
+    for (let i = 0; i < 3; i++) {
+      expect((await get(a, `/v1/wallet/${P}/balance`, "203.0.113.30", trusted)).statusCode).toBe(200);
+      expect((await resolve(a, "203.0.113.30", trusted)).statusCode).toBe(200);
+    }
+    await a.close();
+  });
+
+  it("an untrusted key is held to the per-IP caps like no key at all", async () => {
+    stubFetch();
+    const a = await build(svc({ readRateMaxPerIp: 1, scanReadRateMaxPerIp: 1, trustedKeys: [TRUSTED_KEY] }));
+    const callers: Array<Record<string, string>> = [{}, ...UNTRUSTED_KEYS.map((k) => ({ "x-agent-key": k }))];
+    for (const [i, headers] of callers.entries()) {
+      const ip = `203.0.113.${40 + i}`;
+      expect((await get(a, `/v1/wallet/${P}/balance`, ip, headers)).statusCode).toBe(200);
+      expect((await get(a, `/v1/wallet/${P}/balance`, ip, headers)).statusCode).toBe(429);
+      expect((await resolve(a, ip, headers)).statusCode).toBe(200);
+      expect((await resolve(a, ip, headers)).statusCode).toBe(429);
+    }
+    await a.close();
+  });
+
+  it("resolves have their own stricter tier and are refused before any Scan fetch", async () => {
+    const f = stubFetch();
+    const a = await build(svc({ scanReadRateMaxPerIp: 1, readRateMaxPerIp: 100 }));
+    expect((await resolve(a)).statusCode).toBe(200);
+    const fetches = f.mock.calls.length;
+    const second = await resolve(a);
+    expect(second.statusCode).toBe(429);
+    expect(f.mock.calls.length).toBe(fetches);
+    // The ledger tier is a separate budget.
+    expect((await get(a, `/v1/wallet/${P}/balance`)).statusCode).toBe(200);
+    expect((await resolve(a, "203.0.113.31")).statusCode).toBe(200);
+    await a.close();
+  });
+
+  it("resolve/accept and the allocation resolves share the Scan tier", async () => {
+    stubFetch();
+    const a = await build(svc({ scanReadRateMaxPerIp: 1 }));
+    expect((await resolve(a)).statusCode).toBe(200);
+    for (const url of ["/v1/wallet/resolve/accept", "/v1/wallet/resolve/allocation-factory", "/v1/wallet/resolve/settlement-factory"]) {
+      const r = await a.inject({ method: "POST", url, remoteAddress: "203.0.113.30", payload: {} });
+      expect(r.statusCode, url).toBe(429);
+    }
+    await a.close();
+  });
+
+  it("holdings-scan has tighter caps of its own inside the Scan tier", async () => {
+    const f = stubFetch();
+    const a = await build(svc({ scanReadRateMaxPerIp: 100 }));
+    for (let i = 0; i < 5; i++) {
+      expect((await get(a, `/v1/wallet/${P}/holdings-scan`)).statusCode).not.toBe(429);
+    }
+    const fetches = f.mock.calls.length;
+    expect((await get(a, `/v1/wallet/${P}/holdings-scan`)).statusCode).toBe(429);
+    expect(f.mock.calls.length).toBe(fetches);
+    await a.close();
+  });
+
+  it("holdings-scan alone keeps a global cap, well above one IP's share, that binds trusted keys too", async () => {
+    stubFetch();
+    const a = await build(svc({ scanReadRateMaxPerIp: 100, trustedKeys: [TRUSTED_KEY] }));
+    for (let i = 0; i < 95; i++) {
+      expect((await get(a, `/v1/wallet/${P}/holdings-scan`, `198.51.100.${Math.floor(i / 5) + 1}`)).statusCode).not.toBe(
+        429
+      );
+    }
+    for (let i = 0; i < 5; i++) {
+      expect((await get(a, `/v1/wallet/${P}/holdings-scan`, "203.0.113.70", trusted)).statusCode).not.toBe(429);
+    }
+    expect((await get(a, `/v1/wallet/${P}/holdings-scan`, "203.0.113.71")).statusCode).toBe(429);
+    expect((await get(a, `/v1/wallet/${P}/holdings-scan`, "203.0.113.70", trusted)).statusCode).toBe(429);
+    // The global arm is holdings-scan's own: other Scan reads still pass.
+    expect((await resolve(a, "203.0.113.71")).statusCode).toBe(200);
+    await a.close();
+  });
+
+  it("a caller under an abuse ban is refused on reads too", async () => {
+    const a = await build(
+      svc({
+        submitRateMaxPerKey: 1,
+        onboardRateMaxPerIp: 1,
+        abuseStrikesToBan: 1,
+        abuseStrikeSpacingMs: 0,
+        client: mockClient({ allocateExternalParty: vi.fn().mockResolvedValue({ partyId: "agent::1220new" }) }) as never,
+      })
+    );
+    const finalize = () =>
+      a.inject({
+        method: "POST",
+        url: "/v1/wallet/onboard/finalize",
+        remoteAddress: "203.0.113.40",
+        payload: { onboardingTransactions: ["tx1"], multiHashSignatures: [{ signature: "S" }] },
+      });
+    expect((await finalize()).statusCode).toBe(200);
+    expect((await finalize()).statusCode).toBe(429);
+    const r = await get(a, `/v1/wallet/${P}/balance`, "203.0.113.40");
+    expect(r.statusCode).toBe(429);
+    expect(r.json().error).toMatch(/suspended/);
+    await a.close();
   });
 });

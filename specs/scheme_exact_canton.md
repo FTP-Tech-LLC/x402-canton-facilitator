@@ -224,7 +224,8 @@ On failure:
 {
   "success": false,
   "errorReason": "invalid_exact_canton_amount_mismatch",
-  "transaction": ""
+  "transaction": "",
+  "network": "canton:mainnet"
 }
 ```
 
@@ -347,6 +348,8 @@ After verification succeeds:
 | `invalid_exact_canton_fee_payer_mismatch` | `extra.feePayer` ≠ the facilitator's own (relaying) party. |
 | `invalid_exact_canton_expired` | `executeBefore` is past or within the safety margin. |
 | `invalid_exact_canton_self_payment` | Proven sender equals the facilitator / `feePayer` party. |
+| `invalid_exact_canton_payment_already_settled` | This payment already settled; `transaction` carries its `updateId`. The server decides from its own record whether it delivered it. |
+| `settlement_pending` | Non-terminal, sent with HTTP 503: the transfer was relayed and its outcome is not known yet; `transaction` carries `preparedTxHash`. Retry the same payload; do not pay again. |
 | `invalid_exact_canton_execute_failed` | The relayed transfer was rejected on execution — e.g. an input holding was already spent (concurrent settlement) or funds were insufficient. Transient input contention SHOULD be retried. |
 | `unexpected_canton_ledger_error` | Participant read failure, ledger rejection, or timeout not covered above. |
 

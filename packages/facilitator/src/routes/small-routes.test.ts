@@ -118,6 +118,14 @@ describe("GET /supported tells a client what it can actually use", () => {
     expect(extra.carriages).not.toContain("stash");
   });
 
+  it("names the feePayer, which the official @x402/canton server copies into its 402s", async () => {
+    const app = Fastify();
+    await registerSupportedRoute(app, dummyConfig());
+    const body = (await app.inject({ method: "GET", url: "/supported" })).json() as SupportedResponse;
+    expect(body.kinds[0]!.extra?.feePayer).toBe("ftp_facilitator::1220");
+    expect(body.signers["canton:*"]).toEqual([body.kinds[0]!.extra?.feePayer]);
+  });
+
   it("names the configured registry instruments, and nothing when there are none", async () => {
     const bare = Fastify();
     await registerSupportedRoute(bare, dummyConfig());

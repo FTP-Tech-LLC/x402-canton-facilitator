@@ -71,7 +71,10 @@ export function transferCompletedFromResult(
   return undefined;
 }
 
-const TRANSFER_INSTRUCTION_SUFFIX_RE = /:TransferInstruction$/;
+/** A pending instruction's template entity: the token standard's
+ *  `TransferInstruction`, or an implementation's own such as Amulet's
+ *  `AmuletTransferInstruction`. */
+const TRANSFER_INSTRUCTION_SUFFIX_RE = /:\w*TransferInstruction$/;
 
 export type PreapprovalKind = "yes" | "no" | "unknown";
 
@@ -594,8 +597,9 @@ export class TransferFactoryService {
       }
     }
     // Inconclusive read after retries: the execute committed (we have an
-    // updateId) and the caller only reaches here AFTER the preapproval=yes gate,
-    // which excludes the Pending case. Trust the committed signal; flag it.
+    // updateId) and the caller only reaches here AFTER the inline arm proved the
+    // one-step delivery in the signed bytes, which excludes the Pending case.
+    // Trust the committed signal; flag it.
     return { updateId, transferred: true, confirmInconclusive: true };
   }
 }

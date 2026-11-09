@@ -47,11 +47,17 @@ export interface ResolvedFaucetFactory {
   disclosedContracts: DisclosedContract[];
 }
 
+/** The final ledger submission: `client.submitAndWaitForTransaction`, or the
+ *  Rust sender in canton/rust-submit.ts, which keeps its contract and errors. */
+export type FaucetSubmit = CantonClient["submitAndWaitForTransaction"];
+
 export interface FaucetServiceDeps {
   client: Pick<
     CantonClient,
     "submitAndWaitForTransaction" | "queryActiveContracts"
   >;
+  /** Replaces `client.submitAndWaitForTransaction` for the payout. */
+  submit?: FaucetSubmit | undefined;
   /** The facilitator's own party — the faucet SENDER (and provider). */
   facilitatorParty: string;
   /** Ledger user the facilitator submits as (validator m2m). */
@@ -188,7 +194,9 @@ export class FaucetService {
       throw new FaucetPreSubmitError(err);
     }
 
-    const result = await client.submitAndWaitForTransaction({
+    const submit: FaucetSubmit =
+      this.deps.submit ?? ((commands) => client.submitAndWaitForTransaction(commands));
+    const result = await submit({
       commandId: `faucet-${randomUUID()}`,
       userId,
       // Facilitator only — the faucet sends the facilitator's OWN CC; no agent

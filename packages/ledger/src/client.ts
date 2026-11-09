@@ -108,6 +108,38 @@ export interface CreatedEvent {
     interfaceId: string;
     viewValue: Record<string, unknown>;
   }>;
+  /** On an update read: true when the event changes the requesting party's
+   *  active contracts (the party is a stakeholder), false when the party only
+   *  witnessed it. Absent on ACS reads. */
+  acsDelta?: boolean;
+}
+
+/** An exercise node as `/v2/updates` returns it with the ledger-effects shape. */
+export interface LedgerExercisedEvent {
+  contractId: string;
+  templateId: string;
+  /** Set when the choice was exercised through an interface. */
+  interfaceId?: string | null;
+  choice: string;
+  choiceArgument?: unknown;
+  actingParties?: string[];
+  consuming?: boolean;
+  exerciseResult?: unknown;
+  /** True when the exercise archives or changes a contract the requesting
+   *  party is a stakeholder of; false when the party only witnessed it. */
+  acsDelta?: boolean;
+}
+
+/** One transaction of a `/v2/updates` page. */
+export interface LedgerTransaction {
+  updateId: string;
+  offset: number;
+  recordTime?: string;
+  events: Array<{
+    CreatedEvent?: CreatedEvent;
+    ExercisedEvent?: LedgerExercisedEvent;
+    ArchivedEvent?: { contractId: string; templateId: string };
+  }>;
 }
 
 export interface TransactionResult {
@@ -288,6 +320,11 @@ export class CantonError extends Error {
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
+
+/** What `/v2/updates` may return for a transactions-only update format. */
+const UPDATE_KINDS = new Set(["Transaction", "OffsetCheckpoint", "Reassignment", "TopologyTransaction"]);
+/** What a transaction's events may be. */
+const EVENT_KINDS = new Set(["CreatedEvent", "ExercisedEvent", "ArchivedEvent"]);
 
 /** The participant's list cap, read from its refusal: "The number of matching
  *  elements (201) is greater than the node limit (200)." Undefined when the
@@ -698,6 +735,78 @@ export class CantonClient {
         ? ((c as { createdEvent?: CreatedEvent }).createdEvent ?? null)
         : ((c as CreatedEvent | undefined) ?? null);
     return { created, archived: Boolean(response.archived) };
+  }
+
+  /**
+   * POST /v2/updates?limit=N — one page of transactions for a filter, between
+   * two offsets, as the ledger-effects tree with verbose values.
+   *
+   * The shape matters: only ledger effects carry the exercise that archived a
+   * contract (a Tradecraft `Order_Complete` or `Order_Cancel`) and its argument;
+   * the ACS-delta shape shows a bare archive. `endInclusive` bounds the read, so
+   * the HTTP call returns as soon as the page is filled or the range is
+   * exhausted instead of waiting for new transactions.
+   *
+   * `rows` counts every entry the participant returned, transactions or not
+   * (topology events, reassignments, offset checkpoints), because those count
+   * against `limit` too: a page is the end of the range only when `rows` is
+   * below the limit.
+   */
+  async getUpdatesPage(args: {
+    filter: ActiveContractsFilter;
+    beginExclusive: number;
+    endInclusive: number;
+    limit: number;
+  }): Promise<{ transactions: LedgerTransaction[]; rows: number; lastOffset: number | undefined }> {
+    if (!Number.isInteger(args.limit) || args.limit < 1) {
+      throw new CantonError(
+        `getUpdatesPage: limit must be a positive integer (got ${args.limit})`,
+        "INVALID_ARGUMENT"
+      );
+    }
+    const response = await this.post<unknown>(`/v2/updates?limit=${args.limit}`, {
+      beginExclusive: args.beginExclusive,
+      endInclusive: args.endInclusive,
+      updateFormat: {
+        includeTransactions: {
+          eventFormat: { ...args.filter, verbose: true },
+          transactionShape: "TRANSACTION_SHAPE_LEDGER_EFFECTS",
+        },
+      },
+    });
+    // Every row must be read, or the page refused: a row skipped here while a
+    // later row's offset still moves the cursor would lose that row for good.
+    const invalid = (what: string) =>
+      new CantonError(`getUpdatesPage: the participant returned ${what}`, "INVALID_RESPONSE");
+    if (!Array.isArray(response)) throw invalid("something other than a list of updates");
+    const transactions: LedgerTransaction[] = [];
+    let lastOffset: number | undefined;
+    for (const entry of response as Array<{ update?: unknown }>) {
+      const u = entry?.update;
+      const kinds = u !== null && typeof u === "object" ? Object.keys(u) : [];
+      const kind = kinds.length === 1 ? kinds[0]! : undefined;
+      if (kind === undefined || !UPDATE_KINDS.has(kind)) {
+        throw invalid(`an update of an unknown kind (${kinds.join(",") || typeof u})`);
+      }
+      const value = (u as Record<string, { value?: Record<string, unknown> }>)[kind]?.value;
+      const off = value?.offset;
+      if (typeof off !== "number" || !Number.isSafeInteger(off)) throw invalid(`a ${kind} without an offset`);
+      if (lastOffset === undefined || off > lastOffset) lastOffset = off;
+      if (kind === "Transaction") {
+        if (typeof value!.updateId !== "string" || !Array.isArray(value!.events)) {
+          throw invalid(`a transaction at offset ${off} without its updateId or events`);
+        }
+        for (const ev of value!.events as unknown[]) {
+          const k = ev !== null && typeof ev === "object" ? Object.keys(ev) : [];
+          if (k.length !== 1 || !EVENT_KINDS.has(k[0]!)) {
+            throw invalid(`an event of an unknown kind (${k.join(",") || typeof ev}) at offset ${off}`);
+          }
+        }
+        transactions.push(value as unknown as LedgerTransaction);
+      }
+    }
+    const entries = response;
+    return { transactions, rows: entries.length, lastOffset };
   }
 
   /**

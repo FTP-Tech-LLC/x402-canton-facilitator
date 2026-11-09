@@ -126,6 +126,16 @@ async function main(): Promise<void> {
     reply.code(status).send({ error: "Internal Server Error", statusCode: status });
   });
 
+  // Merchants of the last week's settled payments are served from boot, so a
+  // restart does not drop them to best-effort Scan reads until their next
+  // settle (scan-budget.ts). Bounded and never fatal: a slow or absent store
+  // seeds nothing and the facilitator starts anyway.
+  const seeded = await Promise.race([
+    services.seedServedMerchants(),
+    new Promise<number>((done) => setTimeout(() => done(0), 5_000).unref()),
+  ]);
+  app.log.info({ seeded }, "served merchants seeded from recent settled payments");
+
   await registerHealthRoute(app);
   await registerReadyRoute(app, services.readiness);
   await registerMetricsRoute(app, services.metrics);

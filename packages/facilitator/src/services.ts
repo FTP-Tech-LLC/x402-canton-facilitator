@@ -9,7 +9,11 @@
 
 import type { CantonNetwork } from "@ftptech/x402-canton-core";
 import type { FacilitatorConfig } from "./config.js";
-import { CantonClient, type TokenProvider, ScanClient } from "@ftptech/x402-canton-ledger";
+import {
+  CantonClient,
+  type TokenProvider,
+  ScanClient,
+} from "@ftptech/x402-canton-ledger";
 import { MerchantContractService } from "./canton/merchant-contract.js";
 import { mintUnsafeHmacJwt, createOidcTokenProvider } from "./auth/token.js";
 import { createConsumedStore, type ConsumedPaymentStore } from "./db/consumed-store.js";
@@ -18,8 +22,18 @@ import {
   type InlineSettleStore,
 } from "./db/inline-settle-store.js";
 import { createFaucetStore, type FaucetClaimStore } from "./db/faucet-store.js";
+import type { FaucetSubmit } from "./canton/faucet.js";
+import { createRustSubmit } from "./canton/rust-submit.js";
 import { TransferFactoryService } from "./canton/transfer-factory.js";
 import { PreapprovalService } from "./canton/preapproval.js";
+import {
+  createPaymentPathMerchants,
+  createScanBudget,
+  scanBudgetFetch,
+  ScanBudgetRefusedError,
+  COOLDOWN_WAIT_SLACK_MS,
+  type ScanBudget,
+} from "./scan-budget.js";
 import type { SlidingWindowConfig, CircuitBreakerConfig } from "./rate-limit.js";
 import {
   createAttributionStore,
@@ -40,7 +54,8 @@ import {
   type ReadinessProbe,
   type ReadinessCheckResult,
 } from "./readiness.js";
-import { createPayerProofVerifier } from "./canton/payer-proof.js";
+import { createPayerProofVerifier, recomputeFailureKind } from "./canton/payer-proof.js";
+import { createReadProofGuard, type ReadProofGuard } from "./routes/read-proof.js";
 import { createTopologyReaderLookup } from "./canton/topology-reader-client.js";
 import { createParticipantRouter, participantId, type ParticipantRouter } from "./participant-router.js";
 
@@ -82,11 +97,26 @@ export interface Services {
   walletSubmitChoices: readonly string[];
   walletSubmitCreateTemplates: readonly string[];
   walletReadIds: readonly string[];
+  /** Signed-read check for the relay's per-party GETs (config.walletReadProofMode). */
+  readProofGuard: ReadProofGuard;
   submitRateMaxPerKey: number;
   /** Facilitator-wide ceiling on external-party allocations per minute. */
   onboardRateMaxGlobal: number;
   /** Facilitator-wide ABSOLUTE ceiling on external-party allocations per 24h. */
   onboardDailyMax: number;
+  /** Part of onboardDailyMax for callers without a trusted key (config.walletOnboardDailyMaxAnonymous). */
+  onboardDailyMaxAnonymous: number;
+  /** Allocations per 24h per network without a trusted key (config.walletOnboardDailyMaxPerIp). */
+  onboardDailyMaxPerIp: number;
+  /** Part of onboardDailyMax for callers with a trusted key (config.walletOnboardDailyMaxTrusted). */
+  onboardDailyMaxTrusted: number;
+  /** Per-caller ceiling on onboard/prepare and onboard/finalize per minute. */
+  onboardRateMaxPerIp: number;
+  /** X-Agent-Key values that skip the relay's per-IP caps, strikes and bans (config.walletTrustedKeys). */
+  trustedKeys: readonly string[];
+  /** Relay read caps per IP per minute (config.walletReadRateMaxPerIp, walletScanReadRateMaxPerIp). */
+  readRateMaxPerIp: number;
+  scanReadRateMaxPerIp: number;
   /** Escalating-cooldown (penalty box) config for repeat abusers on agent-side
    *  money routes. `abuseStrikesToBan <= 0` disables it. */
   abuseStrikesToBan: number;
@@ -96,6 +126,18 @@ export interface Services {
   abuseMaxBanMs: number;
   abuseStrikeSpacingMs: number;
   submitRateMaxPerIp: number;
+  /** Facilitator-wide relay submissions per minute (config.walletSubmitRateMaxGlobal). */
+  submitRateMaxGlobal: number;
+  /** pay/prepare admissions per minute without a trusted key
+   *  (config.walletPayPrepareRateMaxPerKey/PerIp). */
+  payPrepareRateMaxPerKey: number;
+  payPrepareRateMaxPerIp: number;
+  /** pay/prepare's Scan class: priority only for a receiver on the payment
+   *  path (paymentPathMerchants), for callers without a trusted key. */
+  isPaymentPathMerchant: (party: string, now: number) => boolean;
+  /** Traffic breaker for the relay submission routes: the /settle breaker's
+   *  settings, its own instance (built in registerWalletRoutes). */
+  submitBreaker: CircuitBreakerConfig;
   /** Agent CC faucet config + store. undefined when CANTON_X402_FAUCET_ENABLED
    *  is off → the faucet route 503s. Consumed by registerWalletRoutes. */
   faucet:
@@ -112,6 +154,10 @@ export interface Services {
         ipExempt?: readonly string[] | undefined;
         /** Pay each newly onboarded party one grant right after allocation. */
         onOnboard?: boolean | undefined;
+        /** Max starter grants per client IP within `windowMs`. */
+        onboardMaxPerIp?: number | undefined;
+        /** The Rust sender (canton/rust-submit.ts). Unset: the ledger client. */
+        submit?: FaucetSubmit | undefined;
       }
     | undefined;
   /** transfer-factory ("V3") master switch (config.tfEnabled). Threaded to the
@@ -168,11 +214,19 @@ export interface Services {
   transferFactory: TransferFactoryService | undefined;
   /** Rollout stage for the /settle unknown-outcome guard (config). */
   settleDispatchMark: "off" | "observe" | "enforce";
+  /** How /settle answers repeats and unknown outcomes (config.settleAnswers). */
+  settleAnswers?: "spec" | "legacy";
   /** /settle operational guards (sliding-window rate limit + traffic breaker). */
   settleRateLimit?: SlidingWindowConfig;
   settleBreaker?: CircuitBreakerConfig;
-  /** /verify rate limit (separate limiter instance, keyed by client IP). */
+  /** /verify rate limit (separate limiter instance, keyed by client IP): the
+   *  cap on VALID outcomes per caller and the window of every /verify budget. */
   verifyRateLimit?: SlidingWindowConfig;
+  /** /verify budgets for INVALID outcomes (config.verifyWasteMaxPerIp/PerPayer). */
+  verifyWaste: { maxPerIp: number; maxPerPayer: number };
+  /** /verify budgets for VALID outcomes besides the per-caller cap
+   *  (config.verifyRateMaxPerPayer/PerPayment). */
+  verifyValid: { maxPerPayer: number; maxPerPayment: number };
   /** Attribution store. undefined when DATABASE_URL or CANTON_ATTRIBUTION_SCAN_URLS is absent. */
   attribution: AttributionStore | undefined;
   attributionScanClients: ScanClient[];
@@ -194,6 +248,20 @@ export interface Services {
   /** Readiness probe backing GET /ready (token mint + participant + Scan
    *  reachability, short-TTL cached). */
   readiness: ReadinessProbe;
+  /** The process-wide outbound Scan budget (scan-budget.ts): `scan` spends it
+   *  as priority; relay reads without a trusted key and Rule 7 lookups for an
+   *  unserved merchant are its best-effort class. */
+  scanBudget: ScanBudget;
+  /** The same Scan as `scan`, on the best-effort class of that budget: for
+   *  anonymous reads routes make outside the payment path (the merchant
+   *  preapproval-status check). */
+  bestEffortScan: ScanClient;
+  /** A payment to this merchant settled: its Rule 7 lookups are now the
+   *  payment path (priority). Called from /settle. */
+  noteServedMerchant: (party: string) => void;
+  /** Mark the merchants of recently settled payments as served (startup).
+   *  `store` defaults to the attribution store; returns how many. */
+  seedServedMerchants: (store?: Pick<AttributionStore, "recentMerchants">) => Promise<number>;
   /** Participant MEMBER id for the GS traffic-budget monitor; undefined → the
    *  monitor stays inert (logs once, skips). */
   facilitatorMemberId: string | undefined;
@@ -208,6 +276,13 @@ export interface Services {
   /** Grant our user CanActAs on each onboarded wallet on the primary. */
   grantPartyRights: boolean;
 }
+
+/** Longest a Rule 7 read waits out a Scan cooldown, once (see fetchPreapproval). */
+const RULE7_COOLDOWN_WAIT_MS = 2_000;
+/** Startup seed of served merchants: the last week's settled payments, at most
+ *  the served set's size. */
+const SERVED_SEED_WINDOW_MS = 7 * 86_400_000;
+const SERVED_SEED_MAX = 256;
 
 export function buildServices(config: FacilitatorConfig): Services {
   const userId = process.env.CANTON_USER_ID ?? "ledger-api-user";
@@ -300,17 +375,69 @@ export function buildServices(config: FacilitatorConfig): Services {
   // ledger API; for the public SV it's no token at all.
   // Conditional spread keeps `token` out of the options object when
   // we want the public-SV (no-auth) path, under exactOptionalPropertyTypes.
-  const scan = new ScanClient({
+  //
+  // ONE outbound Scan budget for the process (scan-budget.ts). `scan` is the
+  // priority client — settle, readiness and the background workers: counted,
+  // never refused, retried as before. `rule7Scan` is the same, kept for Rule 7
+  // lookups of merchants we serve and nothing else (see paymentPathMerchants).
+  // `bestEffortScan` is the same Scan for the reads a stranger can multiply:
+  // Rule 7 for a merchant no settled payment has made one we serve, and the
+  // anonymous preapproval-status check.
+  const metrics = createMetrics();
+  const scanBudget = createScanBudget({
+    maxPerWindow: config.scanBudgetPerMin,
+    cooldownMs: config.scanCooldownMs,
+    onCooldown: (host) => metrics.recordScanCooldown(host),
+    // The SV Scans we read: the main one, its fallbacks, the attribution ones.
+    // A registry utility that ScanClient also reaches is not among them.
+    scanHosts: [config.scanUrl, ...(config.scanFallbackUrls ?? []), ...(config.attributionScanUrls ?? [])],
+  });
+  const scanOptions = {
     scanUrl: config.scanUrl,
     fallbackUrls: config.scanFallbackUrls,
     flavor: config.scanFlavor,
     // Pass the OIDC token to the Scan when it is RBAC-gated (mainnet sv) or for
     // the validator scan-proxy; testnet public sv scans take no token.
     ...(config.scanAuth || config.scanFlavor !== "sv" ? { token } : {}),
+  };
+  const scan = new ScanClient({ ...scanOptions, fetch: scanBudgetFetch(scanBudget, true) });
+  const rule7Scan = new ScanClient({ ...scanOptions, fetch: scanBudgetFetch(scanBudget, true) });
+  const bestEffortScan = new ScanClient({ ...scanOptions, fetch: scanBudgetFetch(scanBudget, false) });
+  // Whose Rule 7 lookups are the payment path: merchants a SETTLED payment
+  // paid (/settle), plus the ones the operator lists (the Bazaar, the inline
+  // allowlist), so the merchants we serve are priority from boot.
+  //
+  // At most 256, and on a client of their own, because a ScanClient keeps 512
+  // preapproval records and drops ALL of them once 512 live keys are reached
+  // (ledger KeyedTtlSingleFlightCache). Shared with the trusted status check,
+  // which reads any party, that overflow would throw out the cached records of
+  // the merchants actually being paid. Alone and under 512, it cannot.
+  const paymentPathMerchants = createPaymentPathMerchants({
+    max: 256,
+    seed: [
+      ...(config.discoveryResources ?? []).flatMap((r) =>
+        (r.accepts ?? []).flatMap((a) => {
+          const payTo = (a as { payTo?: unknown } | null)?.payTo;
+          return typeof payTo === "string" ? [payTo] : [];
+        })
+      ),
+      ...(config.inlineMerchantAllowlist ?? []),
+    ],
   });
 
-  const metrics = createMetrics();
+  const recomputeErrorsLogged = new Set<string>();
 
+  // One signing-key lookup (the topology reader client), used by the payer
+  // proof and by signed relay reads. Each keeps its own limits: the read guard
+  // has its own cache, budget and breaker and never calls through the payer
+  // proof, so reads cannot spend the payer proof's lookups.
+  const topologyKeyLookup =
+    config.topologyReaderUrl && config.topologyReaderToken
+      ? createTopologyReaderLookup({
+          baseUrl: config.topologyReaderUrl,
+          token: config.topologyReaderToken,
+        })
+      : undefined;
   // ONE payer-proof verifier, shared by both carriages. The inline arm and the
   // legacy pay/commit must judge a signature by exactly the same rule; two
   // instances built from the same arguments would be the same today and drift
@@ -327,14 +454,7 @@ export function buildServices(config: FacilitatorConfig): Services {
         //
         // Unconfigured → no lookup → the verifier refuses every inline payment.
         // Fail-closed, and the state a deploy is in until the reader is up.
-        ...(config.topologyReaderUrl && config.topologyReaderToken
-          ? {
-              fetchPayerSigningKey: createTopologyReaderLookup({
-                baseUrl: config.topologyReaderUrl,
-                token: config.topologyReaderToken,
-              }),
-            }
-          : {}),
+        ...(topologyKeyLookup ? { fetchPayerSigningKey: topologyKeyLookup } : {}),
         // A reader outage refuses every inline payment as
         // `signature_invalid`, which on the wire is indistinguishable from
         // someone forging signatures at us. Counted, not logged: during an
@@ -352,6 +472,26 @@ export function buildServices(config: FacilitatorConfig): Services {
               ? "no_key"
               : "unavailable"
           ),
+        // A refused graph is someone's bad bytes: counted only. Over the
+        // hashing budget is forged bytes or a real payment the budget is too
+        // tight for, so it is also logged. Any other recompute error is our
+        // hasher failing on input, for example a participant ahead of the
+        // pinned library, and then every inline payment fails the same way.
+        // One line per distinct message says why.
+        onRecomputeError: (err, payer) => {
+          const kind = recomputeFailureKind(err);
+          metrics.recordInlineHashRecomputeFailed(kind);
+          if (kind === "graph") return;
+          const text = (err instanceof Error ? `${err.name}: ${err.message}` : String(err)).slice(0, 200);
+          if (recomputeErrorsLogged.size < 20 && !recomputeErrorsLogged.has(text)) {
+            recomputeErrorsLogged.add(text);
+            // The payer is whatever the unverified bytes name: quoted and cut,
+            // so it cannot forge a log line.
+            console.warn(
+              `[facilitator] payer-proof hash recompute failed (payer ${JSON.stringify(String(payer).slice(0, 120))}): ${text}`
+            );
+          }
+        },
       });
 
   // Readiness probe (GET /ready): can this facilitator settle right now? The
@@ -412,9 +552,31 @@ export function buildServices(config: FacilitatorConfig): Services {
       })
     : undefined;
 
+  const attributionServices = buildAttributionServices(config, dbExecutor, scanBudget);
+
   return {
     metrics,
     readiness,
+    scanBudget,
+    bestEffortScan,
+    noteServedMerchant: (party: string) => paymentPathMerchants.markServed(party),
+    seedServedMerchants: async (store) => {
+      // The merchants of the last week's settled payments, so a restart does
+      // not drop every merchant we serve back to best-effort until its next
+      // settle. Read from the attribution store when there is one. Never
+      // fails the caller: an unreadable store seeds nothing.
+      const source = store ?? attributionServices.attribution;
+      if (!source?.recentMerchants) return 0;
+      let parties: string[];
+      try {
+        parties = await source.recentMerchants({ withinMs: SERVED_SEED_WINDOW_MS, limit: SERVED_SEED_MAX });
+      } catch {
+        return 0;
+      }
+      // Oldest first, so the most recent end up the most recently used.
+      for (const p of [...parties].reverse()) paymentPathMerchants.markServed(p);
+      return parties.length;
+    },
     facilitatorMemberId: config.facilitatorMemberId,
     router,
     // New wallets also on the secondary participant (config.onboardCoHostParticipantUid).
@@ -467,9 +629,25 @@ export function buildServices(config: FacilitatorConfig): Services {
     walletSubmitChoices: config.walletSubmitChoiceAllowlist,
     walletSubmitCreateTemplates: config.walletSubmitCreateTemplates,
     walletReadIds: config.walletReadIds,
+    readProofGuard: createReadProofGuard({
+      mode: config.walletReadProofMode,
+      lookupBudgetPerMinute: config.walletReadProofLookupsPerMin,
+      lookupBudgetPerSourcePerMinute: config.walletReadProofLookupsPerSourcePerMin,
+      breakerMs: config.walletReadProofBreakerMs,
+      breakerDistinctParties: config.walletReadProofBreakerParties,
+      lookup: topologyKeyLookup,
+      record: (r, why) => metrics.recordWalletReadProof(r, why),
+    }),
     submitRateMaxPerKey: config.walletSubmitRateMaxPerKey,
     onboardRateMaxGlobal: config.walletOnboardRateMaxGlobal,
     onboardDailyMax: config.walletOnboardDailyMax,
+    onboardDailyMaxAnonymous: config.walletOnboardDailyMaxAnonymous,
+    onboardDailyMaxPerIp: config.walletOnboardDailyMaxPerIp,
+    onboardDailyMaxTrusted: config.walletOnboardDailyMaxTrusted,
+    onboardRateMaxPerIp: config.walletOnboardRateMaxPerIp,
+    trustedKeys: config.walletTrustedKeys,
+    readRateMaxPerIp: config.walletReadRateMaxPerIp,
+    scanReadRateMaxPerIp: config.walletScanReadRateMaxPerIp,
     abuseStrikesToBan: config.abuseStrikesToBan,
     abuseStrikeWindowMs: config.abuseStrikeWindowMs,
     abuseBaseBanMs: config.abuseBaseBanMs,
@@ -477,6 +655,17 @@ export function buildServices(config: FacilitatorConfig): Services {
     abuseMaxBanMs: config.abuseMaxBanMs,
     abuseStrikeSpacingMs: config.abuseStrikeSpacingMs,
     submitRateMaxPerIp: config.walletSubmitRateMaxPerIp,
+    submitRateMaxGlobal: config.walletSubmitRateMaxGlobal,
+    payPrepareRateMaxPerKey: config.walletPayPrepareRateMaxPerKey,
+    payPrepareRateMaxPerIp: config.walletPayPrepareRateMaxPerIp,
+    isPaymentPathMerchant: (party: string, now: number) => paymentPathMerchants.isPriority(party, now),
+    submitBreaker: {
+      threshold: config.settleBreakerThreshold,
+      cooldownMs: config.settleBreakerCooldownMs,
+      windowMs: config.settleBreakerWindowMs,
+      failureRate: config.settleBreakerFailureRate,
+      minSamples: config.settleBreakerMinSamples,
+    },
     agentWalletApiKey: config.agentWalletApiKey,
     faucet: config.faucetEnabled
       ? {
@@ -496,6 +685,10 @@ export function buildServices(config: FacilitatorConfig): Services {
           burstWindowMs: config.faucetBurstWindowMs,
           ipExempt: config.faucetIpExempt,
           onOnboard: config.faucetOnOnboard,
+          onboardMaxPerIp: config.faucetOnboardMaxPerIp,
+          submit: config.faucetRustSender
+            ? createRustSubmit({ participantUrl: config.participantUrl, token })
+            : undefined,
         }
       : undefined,
     tfEnabled: config.tfEnabled,
@@ -526,8 +719,55 @@ export function buildServices(config: FacilitatorConfig): Services {
       // record is never served from the cache, since this is the field the
       // /settle gate refuses payments on.
       // The WHOLE record — the arm binds receiver and issuer, not just expiry.
+      //
+      // WHICH SCAN CLASS. Rule 7 runs before the signature check, so an
+      // unsigned payload naming a fresh payTo costs one Scan read per /verify,
+      // and those reads spend the same address budget every CC payment needs.
+      // A merchant a settled payment paid (or the operator lists) is the
+      // payment path: the priority client, never refused. Any other payTo is a
+      // best-effort read: refused past the shared line or in a cooldown, a 429
+      // not retried. Its refusal is not a verdict about the merchant, so the
+      // arm lets it through and the route answers 503, not preapproval_missing.
       fetchPreapproval: async (party: string) => {
-        const r = await scan.getTransferPreapprovalByParty(party);
+        const priority = paymentPathMerchants.isPriority(party, Date.now());
+        const read = () => (priority ? rule7Scan : bestEffortScan).getTransferPreapprovalByParty(party);
+        let r: Awaited<ReturnType<ScanClient["getTransferPreapprovalByParty"]>>;
+        try {
+          try {
+            r = await read();
+          } catch (err) {
+            // The first payment of a merchant we do not serve yet (a new one,
+            // or any after a restart that the seed below did not know), held
+            // back only because a 429 put the Scan host in its cooldown: wait
+            // the cooldown out once, at most 2 s, and ask. Without this that
+            // payment was answered 503: express and next turn it into a 502,
+            // and the shipped client re-sends the same payment (3 s, then 6 s
+            // later) before it reports PAYMENT_UNCONFIRMED. Waiting here saves
+            // the payer that round. Not for a refusal by the budget line (the
+            // window, not the host, is full), and only once: a second refusal
+            // is the answer.
+            if (
+              err instanceof ScanBudgetRefusedError &&
+              err.reason === "cooldown" &&
+              err.retryAfterMs <= RULE7_COOLDOWN_WAIT_MS
+            ) {
+              await new Promise((done) => setTimeout(done, err.retryAfterMs + COOLDOWN_WAIT_SLACK_MS));
+              r = await read();
+            } else {
+              throw err;
+            }
+          }
+        } catch (err) {
+          // Scan's definite "no preapproval for this party". Like an expired
+          // one it is never cached, so a merchant that has lost its
+          // preapproval must leave the priority class, or every junk lookup
+          // quoting it is a never-refused Scan read.
+          if ((err as { status?: unknown } | null)?.status === 404) {
+            paymentPathMerchants.noteRecord(party, undefined);
+          }
+          throw err;
+        }
+        paymentPathMerchants.noteRecord(party, r ? Date.parse(r.expiresAt) : undefined);
         return r
           ? {
               receiver: r.receiver,
@@ -606,6 +846,7 @@ export function buildServices(config: FacilitatorConfig): Services {
     },
     transferFactory,
     settleDispatchMark: config.settleDispatchMarkMode,
+    settleAnswers: config.settleAnswers,
     settleRateLimit: {
       maxPerPayer: config.settleRateMaxPerPayer,
       maxPerIp: config.settleRateMaxPerIp,
@@ -625,7 +866,15 @@ export function buildServices(config: FacilitatorConfig): Services {
       maxGlobal: 0,
       windowMs: config.verifyRateWindowMs,
     },
-    ...buildAttributionServices(config, token, dbExecutor),
+    verifyWaste: {
+      maxPerIp: config.verifyWasteMaxPerIp,
+      maxPerPayer: config.verifyWasteMaxPerPayer,
+    },
+    verifyValid: {
+      maxPerPayer: config.verifyRateMaxPerPayer,
+      maxPerPayment: config.verifyRateMaxPerPayment,
+    },
+    ...attributionServices,
     ...buildMarkerServices(config, dbExecutor),
   };
 }
@@ -660,8 +909,8 @@ function buildMarkerServices(
 
 function buildAttributionServices(
   config: FacilitatorConfig,
-  token: string | TokenProvider,
-  dbExecutor: PgExecutor | undefined
+  dbExecutor: PgExecutor | undefined,
+  scanBudget?: ScanBudget
 ): Pick<
   Services,
   | "attribution"
@@ -689,13 +938,29 @@ function buildAttributionServices(
     }
   }
 
+  // Attribution Scans are SV Scans run by other operators. The only token here
+  // is the participant's ledger credential, so it is never sent to them.
+  if (config.attributionScanAuth) {
+    console.warn(
+      "[attribution] CANTON_ATTRIBUTION_SCAN_AUTH=true is ignored: the ledger" +
+        " token is never sent to an SV Scan. Set it to false."
+    );
+  }
+
   return {
     attribution: enabled
       ? createAttributionStore(config.dbUrl!, { executor: dbExecutor })
       : undefined,
     attributionScanClients: enabled
       ? scanUrls.map(
-          (url) => new ScanClient({ scanUrl: url, flavor: "sv", ...(config.attributionScanAuth ? { token } : {}) })
+          // Priority in the shared Scan budget: counted, never refused, and a
+          // 429 they meet cools that host for the best-effort reads.
+          (url) =>
+            new ScanClient({
+              scanUrl: url,
+              flavor: "sv",
+              ...(scanBudget ? { fetch: scanBudgetFetch(scanBudget, true) } : {}),
+            })
         )
       : [],
     attributionRequired: config.attributionRequired ?? false,

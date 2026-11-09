@@ -46,6 +46,12 @@ export interface AttributionStore {
     maxAttempts: number
   ): Promise<Array<{ updateId: string; createUpdateId: string }>>;
 
+  /** The merchants of payments settled within `withinMs`, most recent first,
+   *  at most `limit`. Read at startup to tell the shared Scan budget which
+   *  merchants this facilitator serves (scan-budget.ts). Optional: a store
+   *  without it seeds nothing. */
+  recentMerchants?(opts: { withinMs: number; limit: number }): Promise<string[]>;
+
   getTotals(opts: {
     excludedParticipants: string[];
     excludedParties: string[];
@@ -287,6 +293,22 @@ export function createPostgresAttributionStore(
           " WHERE update_id=$1 AND create_status='pending'",
         [sendUpdateId, maxAttempts]
       );
+    },
+
+    async recentMerchants({ withinMs, limit }) {
+      await init();
+      // One aggregate over the window; no index on settled_at, so this is a
+      // scan of payment_burns, run once at startup under the pool's statement
+      // timeout.
+      const r = await executor.query(
+        "SELECT merchant_party FROM payment_burns" +
+          " WHERE settle_status='served' AND settled_at > now() - make_interval(secs => $1)" +
+          " GROUP BY merchant_party ORDER BY MAX(settled_at) DESC LIMIT $2",
+        [Math.floor(withinMs / 1000), limit]
+      );
+      return (r.rows as Array<{ merchant_party?: unknown }>)
+        .map((row) => row.merchant_party)
+        .filter((p): p is string => typeof p === "string" && p.length > 0);
     },
 
     async getPendingCreate(limit, maxAttempts) {

@@ -14,8 +14,10 @@
  * resolve) gets the EXACT same multi-SV robustness instead of the e2e shim's
  * single-Scan `fetch(SCAN_URL + path)` — which was the source of the shim's
  * single-Scan 503 flakiness. wallet.ts keeps its own in-file copy (left
- * untouched to avoid any regression on the proven money path); the two are
- * behaviourally identical and covered by the same kind of fetch-stub tests.
+ * untouched to avoid any regression on the proven money path), and that copy
+ * now also spends the shared outbound Scan budget (scan-budget.ts): a
+ * best-effort read there is refused past the budget and never retries a 429.
+ * This one does not, so a caller wiring it in must decide its class first.
  */
 
 /** Distinct, trailing-slash-stripped Scan bases: primary first, then fallbacks,
@@ -35,7 +37,7 @@ export function scanBases(scanUrl: string, fallbackUrls?: string[]): string[] {
  * handle; a transient-exhausted base falls over to the next SV. When every base
  * is exhausted the last response is returned (so the caller's `!r.ok` throws the
  * upstream status), or the last transport error is rethrown if there was no
- * response at all. Byte-for-byte the same control flow as wallet.ts.
+ * response at all. The control flow of wallet.ts's copy for a priority read.
  *
  * `fetchImpl` is injectable purely for deterministic unit tests; production
  * passes nothing and the global `fetch` is used (matching wallet.ts, whose

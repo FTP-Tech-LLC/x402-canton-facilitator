@@ -143,10 +143,82 @@ describe("createOidcTokenProvider", () => {
     // Advance to expiresAt - skew exactly → still in the cache window.
     now += 3600_000 - 60_000 - 1;
     expect(await provider()).toBe("tok-1");
-    // Cross the skew boundary → refresh fires, tok-2 returned.
+    // Cross the skew boundary → the refresh starts; the still-valid token is
+    // answered at once, and the next call gets the new one.
     now += 2;
+    expect(await provider()).toBe("tok-1");
+    await new Promise((r) => setTimeout(r, 0));
     expect(await provider()).toBe("tok-2");
     expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("a hung IdP does not hold calls while the cached token is valid, and times out once it expired", async () => {
+    let now = 1_000_000_000_000;
+    let calls = 0;
+    const fetch = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(JSON.stringify({ access_token: "tok-1", expires_in: 3600 }), { status: 200 });
+      }
+      // Accepts the connection and never answers, until the request is aborted.
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+      });
+    });
+    const provider = createOidcTokenProvider({
+      ...baseArgs,
+      fetch: fetch as unknown as typeof globalThis.fetch,
+      now: () => now,
+      refreshSkewMs: 60_000,
+      timeoutMs: 50,
+    });
+    expect(await provider()).toBe("tok-1");
+    now += 3600_000 - 30_000; // inside the skew window, still valid
+    const t0 = Date.now();
+    expect(await provider()).toBe("tok-1");
+    expect(Date.now() - t0).toBeLessThan(40);
+    now += 60_000; // expired
+    await expect(provider()).rejects.toThrow(/did not answer within 50 ms/);
+  });
+
+  it("near expiry, a call waits for the refresh instead of answering a token about to expire", async () => {
+    let now = 1_000_000_000_000;
+    let issued = 0;
+    const fetch = vi.fn(async () => {
+      issued += 1;
+      return new Response(JSON.stringify({ access_token: `tok-${issued}`, expires_in: 3600 }), { status: 200 });
+    });
+    const provider = createOidcTokenProvider({
+      ...baseArgs,
+      fetch: fetch as unknown as typeof globalThis.fetch,
+      now: () => now,
+      refreshSkewMs: 60_000,
+    });
+    expect(await provider()).toBe("tok-1");
+    now += 3600_000 - 1; // 1 ms of life left: the first call of a quiet client in the window
+    expect(await provider()).toBe("tok-2");
+  });
+
+  it("near expiry, a failed refresh still answers the cached token while it has life", async () => {
+    let now = 1_000_000_000_000;
+    let calls = 0;
+    const fetch = vi.fn(async () => {
+      calls += 1;
+      return calls === 1
+        ? new Response(JSON.stringify({ access_token: "tok-1", expires_in: 3600 }), { status: 200 })
+        : new Response("down", { status: 503 });
+    });
+    const provider = createOidcTokenProvider({
+      ...baseArgs,
+      fetch: fetch as unknown as typeof globalThis.fetch,
+      now: () => now,
+      refreshSkewMs: 60_000,
+    });
+    expect(await provider()).toBe("tok-1");
+    now += 3600_000 - 5_000; // 5 s left, under the 15 s floor
+    expect(await provider()).toBe("tok-1");
+    now += 5_000; // expired
+    await expect(provider()).rejects.toThrow(/503/);
   });
 
   it("singleflight: concurrent calls during the refresh share one IdP request", async () => {
@@ -843,8 +915,11 @@ describe("createOidcTokenProvider — serve-stale-on-error (refresh resilience)"
     });
     expect(await provider()).toBe("tok-1");
     t += 60_000; // within skew, still valid
-    expect(await provider()).toBe("tok-1"); // refresh #2 fails → serve stale
-    expect(await provider()).toBe("tok-3"); // refresh #3 succeeds → fresh token
+    expect(await provider()).toBe("tok-1"); // refresh #2 starts in the background and fails
+    await new Promise((r) => setTimeout(r, 0));
+    expect(await provider()).toBe("tok-1"); // still valid; refresh #3 starts
+    await new Promise((r) => setTimeout(r, 0));
+    expect(await provider()).toBe("tok-3"); // refresh #3 succeeded → fresh token
     expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
 });

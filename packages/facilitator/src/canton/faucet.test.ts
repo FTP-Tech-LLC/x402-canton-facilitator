@@ -298,6 +298,40 @@ describe("FaucetService.claim — 'we never asked the ledger' is a distinct answ
     await expect(svc.claim({ recipient: "agent::1220a" })).rejects.toBe(boom);
   });
 
+  it("deps.submit takes over the payout, and gets the commands the client would", async () => {
+    const clientSubmit = vi.fn(async () => ({ updateId: "u-client", offset: 1, events: [] }));
+    const client = {
+      submitAndWaitForTransaction: clientSubmit,
+      queryActiveContracts: vi.fn(async () => AMULETS),
+    } as unknown as FaucetServiceDeps["client"];
+    await svcWith({ client }).claim({ recipient: "agent::1220a" });
+
+    const submit = vi.fn(async () => ({ updateId: "u-rust", offset: 1, events: [] }));
+    const r = await svcWith({ client, submit }).claim({ recipient: "agent::1220a" });
+
+    expect(r.updateId).toBe("u-rust");
+    expect(clientSubmit).toHaveBeenCalledOnce();
+    const sent = [clientSubmit, submit].map((fn) => {
+      const [body] = fn.mock.calls[0] as unknown as [unknown];
+      return JSON.stringify(body)
+        .replace(/faucet-[0-9a-f-]{36}/, "id")
+        .replace(/\d{4}-\d\d-\d\dT[\d:.]+Z/g, "time");
+    });
+    expect(sent[1]).toBe(sent[0]);
+  });
+
+  it("a contention refusal from deps.submit re-selects inputs once", async () => {
+    let n = 0;
+    const submit = vi.fn(async () => {
+      if (n++ === 0) throw new CantonError("locked", "HTTP_ERROR", 409);
+      return { updateId: "u-rust", offset: 1, events: [] };
+    });
+    await expect(svcWith({ submit }).claim({ recipient: "agent::1220a" })).resolves.toMatchObject({
+      updateId: "u-rust",
+    });
+    expect(submit).toHaveBeenCalledTimes(2);
+  });
+
   it("a pre-submit 404 is still input contention — the single re-select survives the marker", async () => {
     // isInputContention has to unwrap, or wrapping would silently disable the
     // one retry that exists for a holding consumed mid-flight.

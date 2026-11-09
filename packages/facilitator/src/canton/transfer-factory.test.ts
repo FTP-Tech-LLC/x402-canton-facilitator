@@ -111,6 +111,27 @@ describe("funds-moved gate: an unreadable confirmation is INCONCLUSIVE, never a 
     expect(r).toMatchObject({ transferred: false, confirmInconclusive: false });
   });
 
+  it("a pending Amulet two-step (AmuletTransferInstruction) is not a transfer", async () => {
+    // What the Amulet factory creates when the preapproval is left out of the
+    // choice context: the input is archived into a lock, so the archive alone
+    // must not read as paid.
+    const s = svc(
+      vi.fn(async () => ({
+        events: [
+          { ArchivedEvent: { templateId: "pkg:Splice.Amulet:Amulet" } },
+          {
+            CreatedEvent: {
+              templateId: "pkg:Splice.AmuletTransferInstruction:AmuletTransferInstruction",
+            },
+          },
+          { CreatedEvent: { templateId: "pkg:Splice.Amulet:LockedAmulet" } },
+        ],
+      }))
+    );
+    const r = await s.execute(input);
+    expect(r).toMatchObject({ transferred: false, confirmInconclusive: false });
+  });
+
   // Registry-utility funds-moved: the pending TransferInstruction lives in the
   // token's OWN module, not Splice.Api.Token.TransferInstructionV1 — the gate
   // must still see it, or it reports a pending escrow as settled (false pos).

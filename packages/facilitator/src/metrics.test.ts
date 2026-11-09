@@ -83,6 +83,20 @@ describe("createMetrics", () => {
     expect(s).toMatch(/route="pay\/prepare",kind="client"\} 1/);
   });
 
+  it("labels inline_hash_recompute_failed_total by kind", async () => {
+    const m = createMetrics({ collectDefault: false });
+    m.recordInlineHashRecomputeFailed("graph");
+    m.recordInlineHashRecomputeFailed("graph");
+    m.recordInlineHashRecomputeFailed("budget");
+    m.recordInlineHashRecomputeFailed("error");
+    const s = await m.registry.getSingleMetricAsString(
+      "x402_facilitator_inline_hash_recompute_failed_total"
+    );
+    expect(s).toMatch(/kind="graph"\} 2/);
+    expect(s).toMatch(/kind="budget"\} 1/);
+    expect(s).toMatch(/kind="error"\} 1/);
+  });
+
   it("two instances have independent registries (test isolation)", async () => {
     const a = createMetrics({ collectDefault: false });
     const b = createMetrics({ collectDefault: false });

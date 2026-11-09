@@ -1,7 +1,7 @@
 {
   "name": "@ftptech/x402-canton-core",
-  "version": "1.4.0",
-  "description": "Shared types and helpers for the Canton x402 stack",
+  "version": "1.9.0",
+  "description": "Shared types and helpers for the Canton x402 stack.",
   "license": "Apache-2.0",
   "author": "FTP team",
   "homepage": "https://github.com/FTP-Tech-LLC/x402-canton-facilitator/tree/main/packages/core#readme",

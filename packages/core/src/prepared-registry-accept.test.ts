@@ -112,15 +112,32 @@ describe("assertPreparedAcceptMatches — real USDCx registry offer accept", () 
     ).toMatch(/creates a holding that names/);
   });
 
+  it("refuses an offer the expected registrar did not sign — the issuer, not the template name, decides", () => {
+    const other = "decentralized-usdc-interchain-rep::1220" + "e".repeat(64);
+    expect(refusal(() => assertPreparedAcceptMatches(RAW, { ...base, instrumentAdmin: other }))).toMatch(
+      /the offer is not signed by the registrar/
+    );
+  });
+
+  it("refuses an offer that pays someone other than the agent", () => {
+    const other = "agent::1220" + "a".repeat(64);
+    expect(refusal(() => assertPreparedAcceptMatches(RAW, { ...base, selfParty: other }))).toMatch(
+      /the offer pays .* not the agent/
+    );
+  });
+
   it("refuses a created holding redirected to another party — the byte-mutated owner is caught", () => {
     const redirected = mutateCreatedHoldingParty(RAW, "agent::", "devil::");
     const msg = refusal(() => assertPreparedAcceptMatches(redirected, base));
-    expect(msg).toMatch(/creates a holding that (names|does not name the agent)/);
+    // The owner field is read first now; either refusal names the redirect.
+    expect(msg).toMatch(/creates a holding (that (names|does not name the agent)|owned by "devil::)/);
   });
 
   it("refuses a registry accept not rooted on the registrar's TransferOffer — an interface choice's body is whatever implements it", () => {
+    // The mutation renames the offer's input contract too, so the issuer check
+    // (the accepted instruction must be the registrar's TransferOffer) fires first.
     expect(refusal(() => assertPreparedAcceptMatches(mutateRootTemplate(RAW), base))).toMatch(
-      /rooted on .*TransferOffeX/
+      /rooted on .*TransferOffeX|not among the input contracts exactly once as Utility\.Registry\.App\.V0\.Model\.Transfer:TransferOffer/
     );
   });
 });

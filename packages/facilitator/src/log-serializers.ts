@@ -44,6 +44,9 @@ export function cantonErrSerializer(
   err: Parameters<typeof pino.stdSerializers.err>[0]
 ): SerializedCantonError {
   const base = pino.stdSerializers.err(err);
+  // Several log calls pass only the message. Spread below, a string would come
+  // out one key per character and no search would find it.
+  if (typeof base !== "object") return base;
   const e = err as unknown as CantonErrorLike;
   const extra: Pick<
     SerializedCantonError,

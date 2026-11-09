@@ -21,10 +21,10 @@
  *      require our participant to host the party.
  *
  * THE LOOKUP IS STILL A PORT, and its absence is still a refusal. That matters
- * operationally: the topology route exists only from Canton 3.5.10 (Splice
- * 0.6.14). On an older participant it 404s, the lookup yields nothing, and this
- * verifier answers false — so an inline payment does not settle rather than
- * settling half-checked.
+ * operationally: the keys come from the topology reader beside the participant
+ * (packages/topology-reader, over the admin gRPC API). Without it, or when it
+ * answers no keys, the lookup yields nothing and this verifier answers false —
+ * so an inline payment does not settle rather than settling half-checked.
  *
  * WHY HALF A STILL EARNS ITS PLACE. `preparedTxHash` is what the signature is
  * over and what any audit trail records. Binding it to the bytes removes the
@@ -34,7 +34,21 @@
  * degrading to "hash matched, good enough".
  * ════════════════════════════════════════════════════════════════════════ */
 import { createHash, createPublicKey, verify as cryptoVerify, timingSafeEqual } from "node:crypto";
-import { recomputeHash } from "@ftptech/x402-canton-ledger";
+import {
+  recomputeHash,
+  PreparedTransactionBudgetError,
+  PreparedTransactionGraphError,
+} from "@ftptech/x402-canton-ledger";
+
+/**
+ * The hashing budget for a payment (ledger MAX_HASHED_STEPS). The inline
+ * carriage holds at most 64 KB of transaction (inline-codec), and real
+ * transactions take at most 75 steps per KB, so under 5,000 even at that size;
+ * real payments take 1,267 to 1,681. 64 KB of dots took 118 ms to hash; this
+ * budget refuses it in about 2 ms, and the costliest payment within it (dots
+ * again) hashes in about 30 ms.
+ */
+const PAYMENT_MAX_HASH_STEPS = 10_000;
 
 /**
  * Reads an external party's raw Ed25519 signing keys from synchronizer topology.
@@ -110,6 +124,22 @@ export interface PayerProofOptions {
    * an apparent attack; the truth is their own dependency is down.
    */
   onLookupError?: (party: string, err: unknown) => void;
+  /**
+   * Called when the hash recompute throws. The payment is refused as
+   * `signature_invalid` either way, so this is the only place to tell a graph
+   * the hasher refuses (`PreparedTransactionGraphError`: someone sent bad bytes)
+   * from any other error (our hasher failing on input it should handle, such as
+   * a participant ahead of the pinned library).
+   */
+  onRecomputeError?: (err: unknown, payer: string) => void;
+}
+
+/** The `inline_hash_recompute_failed_total` kind for a recompute that threw:
+ *  `budget` before `graph`, since a budget error is also a graph error. */
+export function recomputeFailureKind(err: unknown): "graph" | "budget" | "error" {
+  if (err instanceof PreparedTransactionBudgetError) return "budget";
+  if (err instanceof PreparedTransactionGraphError) return "graph";
+  return "error";
 }
 
 export interface PayerProofInput {
@@ -175,12 +205,15 @@ export function createPayerProofVerifier(
     let recomputed: Buffer;
     try {
       recomputed = Buffer.from(
-        await recomputeHash(input.preparedTransactionBytes.toString("base64")),
+        await recomputeHash(input.preparedTransactionBytes.toString("base64"), {
+          maxSteps: PAYMENT_MAX_HASH_STEPS,
+        }),
         "base64"
       );
-    } catch {
+    } catch (err) {
       // A recompute that failed proves nothing; it never falls back to trusting
       // the claimed hash.
+      opts.onRecomputeError?.(err, input.payer);
       return NO;
     }
     if (recomputed.length !== claimed.length) return NO;
