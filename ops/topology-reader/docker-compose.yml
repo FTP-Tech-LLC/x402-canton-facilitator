@@ -1,0 +1,51 @@
+# Topology reader, deployed BESIDE the Canton participant.
+#
+# Deliberately its OWN compose project, not an edit to the validator's
+# compose.yaml: the validator bundle is replaced wholesale on every Splice
+# upgrade (the docs require swapping compose.yaml and start.sh, not just
+# IMAGE_TAG), so anything added to that file is lost on the next upgrade.
+#
+# UPGRADE GOTCHA, inherited not introduced: the validator's start.sh RECREATES
+# the network `splice-validator_splice_validator`, and fails with "network has
+# active endpoints" if containers from other projects are attached. That
+# already applies to x402-participant-bridge. The order is:
+#
+#   docker compose -f ops/topology-reader/docker-compose.yml down
+#   docker network disconnect -f splice-validator_splice_validator x402-participant-bridge
+#   ./start.sh ...
+#   docker network connect splice-validator_splice_validator x402-participant-bridge
+#   docker restart x402-participant-bridge
+#   docker compose -f ops/topology-reader/docker-compose.yml up -d
+name: x402-topology-reader
+
+services:
+  topology-reader:
+    # Pre-built and tagged, matching how the facilitator is deployed on this
+    # box. Build with:
+    #   docker build -t x402-topology-reader:<tag> packages/topology-reader
+    image: x402-topology-reader:${READER_TAG:?set it in .env}
+    container_name: x402-topology-reader
+    restart: unless-stopped
+    environment:
+      # The participant's admin gRPC, reachable by service DNS inside the
+      # validator's network. Unauthenticated and node-local by design, which is
+      # exactly why this service exists instead of exposing it to the
+      # facilitator.
+      CANTON_ADMIN_API_ADDRESS: splice-validator-participant-1:5002
+      TOPOLOGY_READER_TOKEN: ${TOPOLOGY_READER_TOKEN:?set it in .env}
+    ports:
+      # VPN interface ONLY, matching x402-participant-bridge. Never 0.0.0.0:
+      # this endpoint reads topology for any party on the network.
+      - "10.8.0.1:8099:8099"
+    networks:
+      - validator
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8099/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  validator:
+    name: splice-validator_splice_validator
+    external: true

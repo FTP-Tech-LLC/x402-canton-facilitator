@@ -25,11 +25,12 @@ Dev Fund grant ([canton-foundation/canton-dev-fund PR #78](https://github.com/ca
 | `packages/facilitator` | the Fastify service (routes, Canton settle/verify, agent-wallet relay) |
 | `packages/core` | wire types and verify-before-sign decoders for the `exact` scheme (npm `@ftptech/x402-canton-core`) |
 | `packages/ledger` | JSON Ledger API v2 + Scan client (npm `@ftptech/x402-canton-ledger`) |
+| `packages/topology-reader` | the small service beside the participant that serves a party's signing keys to the facilitator; the participant's admin API stays private |
 | `specs/scheme_exact_canton.md` | the protocol spec, as merged upstream in [x402-foundation/x402](https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_canton.md) |
 | `docs/deployment.md` | how to stand it up, and every setting |
 | `docs/COMPATIBILITY.md` | runtime, Canton, wire and package compatibility |
 | `docs/MAINTENANCE-PLAYBOOK.md` | upgrades, ledger-API checklist, incident response |
-| `ops/` | compose and env templates: `testnet/`, `devnet/` (on the validator host), `mainnet-standalone/` (dedicated host with Caddy) |
+| `ops/` | compose and env templates: `testnet/`, `devnet/` (on the validator host), `mainnet-standalone/` (dedicated host with Caddy), `topology-reader/` |
 
 The upstream spec covers Canton Coin. CIP-56 tokens are an extension of
 this facilitator: a 402 names the token in `asset` and
@@ -48,7 +49,7 @@ You need:
 - an SV Scan URL and Postgres 16.
 
 ```bash
-# configure packages/facilitator/.env (minimum: docs/deployment.md#minimum), then:
+# configure packages/facilitator/.env (docs/deployment.md#configure), then:
 docker compose -f packages/facilitator/docker-compose.production.yml up -d --build
 curl http://127.0.0.1:4022/ready
 curl http://127.0.0.1:4022/supported

@@ -1,0 +1,10 @@
+ghcr.io/digital-asset/decentralized-canton-sync/docker/canton-participant:0.6.13
+/app/protobuf/community (42 protos, Canton 3.5.9)
+vendored 2026-08-08
+
+scalapb/scalapb.proto is NOT from the image: Canton's protos import it for Scala
+codegen options, but the image ships only Canton's own tree, so protoc there
+picks it up from a jar. Vendored separately from
+https://raw.githubusercontent.com/scalapb/ScalaPB/master/protobuf/scalapb/scalapb.proto
+(Apache-2.0). It carries codegen options only and has no effect on the wire —
+but without it the import does not resolve and NOTHING loads.
