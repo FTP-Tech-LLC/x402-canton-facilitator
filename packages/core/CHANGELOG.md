@@ -1,5 +1,11 @@
 # @ftptech/x402-canton-core
 
+## 1.9.1
+
+### Patch Changes
+
+- 32ec950: Registry transfers: a pending TransferOffer is found by its template. A transfer that did not opt into the offer shape refuses any; one that did (a swap to a pool without a preapproval) admits one, and only if it carries the root transfer's sender, receiver, amount, instrument, deadline and meta.
+
 ## 1.9.0
 
 ### Minor Changes

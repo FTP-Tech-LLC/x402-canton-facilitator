@@ -2414,6 +2414,11 @@ function readMemo(value: Uint8Array): string | undefined {
 function readTransferMeta(chosenValue: Uint8Array): Map<string, string> | undefined {
   const transferVal = entryByDeclOrder(recordEntries(chosenValue), 1, "transfer")?.value;
   if (!transferVal) return undefined;
+  return readTransferRecordMeta(transferVal);
+}
+
+/** The meta map of a Transfer record (see readTransferMeta). */
+function readTransferRecordMeta(transferVal: Uint8Array): Map<string, string> | undefined {
   const t = recordEntries(transferVal);
   const metaE = t.length > 7 ? entryByDeclOrder(t, 7, "meta") : undefined;
   if (!metaE) return undefined;
@@ -2886,9 +2891,9 @@ const REGISTRY_HOLDING_TEMPLATE = "Utility.Registry.Holding.V0.Holding:Holding";
 // pool takes. It is admitted ONLY when the caller opts in via `allowRegistryOffer`,
 // and then the create set is pinned to {owner Holdings} + EXACTLY ONE TransferOffer
 // (the same `REGISTRY_TRANSFER_OFFER_TEMPLATE` the accept/claim path already knows,
-// defined below). The offer's recipient is bounded to the pinned receiver by the
-// foreign-party backstop, and amount/instrument/inputs stay pinned by the root, so
-// a non-opting caller keeps the strict behaviour (offer creates refused) and the
+// defined below). The offer's transfer must carry the root's sender, receiver,
+// amount, instrument, deadline and meta (assertOfferMatchesRoot). A non-opting
+// caller keeps the strict behaviour (offer creates refused) and the
 // payment / plain-withdraw paths are unchanged.
 
 const TRANSFER_CONSEQUENCE_CHOICES = [
@@ -3091,6 +3096,25 @@ export function assertPreparedTransferMatches(
       `relay-prepared transfer does not match intent: ${mismatches.join("; ")} — ` +
         `refusing to sign (possible tampered/compromised relay redirecting funds)`
     );
+  }
+
+  // THE PENDING OFFER, found by its template rather than by the internal
+  // transfer's label: both come from the relay's bytes, and a relabeled or
+  // removed internal-transfer node must not switch this check off. A transfer
+  // that did not opt into the offer shape creates no offer; one that did
+  // creates at most one, and it carries the root's terms. Checked after the
+  // intent pins, so a redirected root keeps its own message.
+  const pendingOffers = decoded.nodes.filter(
+    (n) => n.create?.templateQualifiedName === REGISTRY_TRANSFER_OFFER_TEMPLATE
+  ).length;
+  if (pendingOffers > 0) {
+    if (!registryOfferIntent) {
+      throw new PreparedTransferMismatchError(
+        `relay-prepared transfer creates a pending ${REGISTRY_TRANSFER_OFFER_TEMPLATE} although it did not ` +
+          `opt into the offer shape — refusing to sign`
+      );
+    }
+    assertOfferMatchesRoot(decoded, t, ex.chosenValue);
   }
 
   // The admin/dso must never be aliased to a money role — otherwise a relay could
@@ -3351,6 +3375,55 @@ function assertDeliveryMatchesRoot(
           "the root's sender, receiver, amount and instrument — refusing to sign"
       );
     }
+  }
+}
+
+/**
+ * The opted-in offer shape (a swap to a pool that holds no preapproval)
+ * delivers through one pending TransferOffer that the receiver accepts later.
+ * The root pins sender, receiver, amount, instrument, deadline and meta, but
+ * nothing tied the offer to them: real MainNet CBTC offer bytes whose offer
+ * alone named another receiver, amount or deadline were accepted and signed on
+ * the swap path. The offer's transfer must carry exactly the root's terms. Its
+ * inputs are the registry's own (it locks the root's inputs into one holding
+ * first), so they are not compared.
+ */
+function assertOfferMatchesRoot(
+  decoded: DecodedPrepared,
+  t: ExtractedTransfer,
+  rootChosenValue: Uint8Array
+): void {
+  const offers = decoded.nodes.filter(
+    (n) => n.create?.templateQualifiedName === REGISTRY_TRANSFER_OFFER_TEMPLATE
+  );
+  const arg = offers.length === 1 ? offers[0]!.create!.argument : undefined;
+  const transferVal =
+    arg !== undefined ? entryByDeclOrder(recordEntries(arg), 2, "transfer")?.value : undefined;
+  if (transferVal === undefined) {
+    throw new PreparedTransferMismatchError(
+      "registry offer transfer: the pending offer's transfer could not be read — refusing to sign"
+    );
+  }
+  const d = readTransferRecord(transferVal);
+  const rootMeta = readTransferMeta(rootChosenValue);
+  const offerMeta = readTransferRecordMeta(transferVal);
+  const sameMeta =
+    rootMeta === undefined || offerMeta === undefined
+      ? rootMeta === offerMeta
+      : rootMeta.size === offerMeta.size && [...rootMeta].every(([k, v]) => offerMeta.get(k) === v);
+  if (
+    d.sender !== t.sender ||
+    d.receiver !== t.receiver ||
+    canonicalAmount(d.amount) !== canonicalAmount(t.amount) ||
+    d.instrumentId !== t.instrumentId ||
+    d.instrumentAdmin !== t.instrumentAdmin ||
+    d.executeBeforeMs !== t.executeBeforeMs ||
+    !sameMeta
+  ) {
+    throw new PreparedTransferMismatchError(
+      "registry offer transfer's pending offer does not carry the root's sender, receiver, amount, " +
+        "instrument, deadline and meta — refusing to sign"
+    );
   }
 }
 
