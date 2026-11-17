@@ -57,6 +57,8 @@ import {
 import { createPayerProofVerifier, recomputeFailureKind } from "./canton/payer-proof.js";
 import { createReadProofGuard, type ReadProofGuard } from "./routes/read-proof.js";
 import { createTopologyReaderLookup } from "./canton/topology-reader-client.js";
+import { checkTopologyReader } from "./canton/reader-readiness.js";
+import { createLastKnownKeys } from "./canton/last-known-keys.js";
 import { createParticipantRouter, participantId, type ParticipantRouter } from "./participant-router.js";
 
 export interface Services {
@@ -269,6 +271,8 @@ export interface Services {
    *  CANTON_SECONDARY_PARTICIPANT_URL is set); relay calls for a party go
    *  through it. `client`/`userId` above are its primary. */
   router: ParticipantRouter;
+  /** See config.onboardTopologyProtocolVersion. */
+  onboardTopologyProtocolVersion: number | undefined;
   /** Co-host for new wallets (see config.onboardCoHostParticipantUid). */
   onboardCoHost:
     | { participantUid: string; client: CantonClient; userId: string; grantPartyRights: boolean }
@@ -438,6 +442,19 @@ export function buildServices(config: FacilitatorConfig): Services {
           token: config.topologyReaderToken,
         })
       : undefined;
+  // The payer proof alone may fall back to the keys a payer's last verified
+  // payment used when no reader gives a usable answer (canton/last-known-keys.ts).
+  // Signed relay reads keep the plain lookup: they have their own cache and
+  // breaker.
+  const lastKnownKeys =
+    topologyKeyLookup && config.topologyReaderStaleMaxMs > 0
+      ? createLastKnownKeys({
+          maxStaleMs: config.topologyReaderStaleMaxMs,
+          onServedStale: () => metrics.recordInlineKeyLookup("stale"),
+        })
+      : undefined;
+  const payerKeyLookup =
+    topologyKeyLookup && lastKnownKeys ? lastKnownKeys.wrap(topologyKeyLookup) : topologyKeyLookup;
   // ONE payer-proof verifier, shared by both carriages. The inline arm and the
   // legacy pay/commit must judge a signature by exactly the same rule; two
   // instances built from the same arguments would be the same today and drift
@@ -454,7 +471,11 @@ export function buildServices(config: FacilitatorConfig): Services {
         //
         // Unconfigured → no lookup → the verifier refuses every inline payment.
         // Fail-closed, and the state a deploy is in until the reader is up.
-        ...(topologyKeyLookup ? { fetchPayerSigningKey: topologyKeyLookup } : {}),
+        ...(payerKeyLookup ? { fetchPayerSigningKey: payerKeyLookup } : {}),
+        onLookupOk: () => metrics.recordInlineKeyLookup("ok"),
+        ...(lastKnownKeys
+          ? { onVerified: (party: string, keys: Buffer[]) => lastKnownKeys.remember(party, keys) }
+          : {}),
         // A reader outage refuses every inline payment as
         // `signature_invalid`, which on the wire is indistinguishable from
         // someone forging signatures at us. Counted, not logged: during an
@@ -535,6 +556,24 @@ export function buildServices(config: FacilitatorConfig): Services {
       await scan.getAmuletRulesFresh();
       return { ok: true };
     },
+    // Every inline payment needs the payer's key from a topology reader, and a
+    // reader outage used to show only as a run of `signature_invalid`.
+    ...(topologyKeyLookup
+      ? {
+          topology_reader: () =>
+            checkTopologyReader(topologyKeyLookup, config.facilitatorParty, lastKnownKeys),
+        }
+      : {}),
+    // Settle records consumed payments and attribution there; it keeps going
+    // when the database fails, so the failure has to show here.
+    ...(dbExecutor
+      ? {
+          db: async (): Promise<ReadinessCheckResult> => {
+            await dbExecutor.query("select 1");
+            return { ok: true };
+          },
+        }
+      : {}),
   });
 
   // Hoisted so the inline Rule 7 (registry-utility arm) can reuse the SAME
@@ -579,6 +618,7 @@ export function buildServices(config: FacilitatorConfig): Services {
     },
     facilitatorMemberId: config.facilitatorMemberId,
     router,
+    onboardTopologyProtocolVersion: config.onboardTopologyProtocolVersion,
     // New wallets also on the secondary participant (config.onboardCoHostParticipantUid).
     onboardCoHost:
       config.onboardCoHostParticipantUid && router.secondary

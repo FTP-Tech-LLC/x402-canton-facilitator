@@ -101,6 +101,23 @@ describe("wallet relay routes", () => {
     await a.close();
   });
 
+  it("onboard/prepare pins the topology protocol version when configured, and only then", async () => {
+    const pinned = svc({ onboardTopologyProtocolVersion: 36 });
+    const a = await build(pinned);
+    expect((await a.inject({ method: "POST", url: "/v1/wallet/onboard/prepare", payload: pk })).statusCode).toBe(200);
+    expect(pinned.client.generateExternalPartyTopology).toHaveBeenCalledWith(
+      expect.objectContaining({ protocolVersion: 36 })
+    );
+    await a.close();
+    const auto = svc();
+    const b = await build(auto);
+    expect((await b.inject({ method: "POST", url: "/v1/wallet/onboard/prepare", payload: pk })).statusCode).toBe(200);
+    expect(vi.mocked(auto.client.generateExternalPartyTopology).mock.calls[0]![0]).not.toHaveProperty(
+      "protocolVersion"
+    );
+    await b.close();
+  });
+
   it("onboard/prepare missing fields → 400", async () => {
     const a = await build(svc());
     const r = await a.inject({ method: "POST", url: "/v1/wallet/onboard/prepare", payload: { partyHint: "agent" } });

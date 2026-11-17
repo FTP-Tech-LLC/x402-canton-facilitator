@@ -16,12 +16,25 @@
 import type { PayerSigningKeyLookup } from "./payer-proof.js";
 
 export interface TopologyReaderClientOptions {
-  /** Base URL of the reader, e.g. http://10.8.0.1:8099 */
-  baseUrl: string;
+  /**
+   * Base URL of the reader, e.g. http://10.8.0.1:8099, or several in order of
+   * preference. Topology is the synchronizer's, so any participant's reader
+   * answers the same question; a second one only matters when the first is down.
+   */
+  baseUrl: string | readonly string[];
   /** Shared secret. The reader refuses to start without one. */
   token: string;
   /** Per-lookup timeout. A hung topology read must not hold a /verify. */
   timeoutMs?: number;
+  /**
+   * After this many `unavailable` answers in a row a reader is skipped for
+   * `cooldownMs`, then tried again by one lookup. Without it a reader that
+   * drops packets costs every payment the full timeout. Default 3.
+   */
+  failuresToOpen?: number;
+  /** How long an open reader is skipped. Default 10 s. */
+  cooldownMs?: number;
+  now?: () => number;
   fetchImpl?: typeof fetch;
 }
 
@@ -78,10 +91,66 @@ export function createTopologyReaderLookup(
   opts: TopologyReaderClientOptions
 ): PayerSigningKeyLookup {
   const timeoutMs = opts.timeoutMs ?? 4_000;
+  const failuresToOpen = opts.failuresToOpen ?? 3;
+  const cooldownMs = opts.cooldownMs ?? 10_000;
+  const now = opts.now ?? Date.now;
   const doFetch = opts.fetchImpl ?? fetch;
-  const base = opts.baseUrl.replace(/\/+$/, "");
+  const bases = (typeof opts.baseUrl === "string" ? [opts.baseUrl] : [...opts.baseUrl])
+    .map((b) => b.trim().replace(/\/+$/, ""))
+    .filter((b) => b.length > 0);
+  if (bases.length === 0) {
+    throw new Error("topology reader: at least one base URL is required");
+  }
+  // Per reader: `unavailable` answers in a row, and until when it is skipped.
+  const state = new Map(bases.map((b) => [b, { failures: 0, openUntil: 0 }]));
 
   return async (party: string): Promise<Buffer[]> => {
+    let firstOutage: unknown;
+    let readerError: unknown;
+    let asked = 0;
+    for (const base of bases) {
+      const s = state.get(base)!;
+      if (s.failures >= failuresToOpen) {
+        if (now() < s.openUntil) continue;
+        // Half-open: this lookup probes the reader, and the others keep
+        // skipping it until the probe has had its full timeout.
+        s.openUntil = now() + timeoutMs;
+      }
+      asked++;
+      try {
+        const keys = await lookupOne(base, party);
+        s.failures = 0;
+        return keys;
+      } catch (err) {
+        const reason = err instanceof TopologyLookupError ? err.reason : undefined;
+        if (reason === "no_key") {
+          // Topology ANSWERED. Another reader reads the same synchronizer
+          // topology, so asking it would be a delay, not a second opinion.
+          s.failures = 0;
+          throw err;
+        }
+        if (reason === "unavailable") {
+          s.failures++;
+          if (s.failures >= failuresToOpen) s.openUntil = now() + cooldownMs;
+          firstOutage ??= err;
+        } else {
+          readerError ??= err;
+        }
+      }
+    }
+    if (asked === 0) {
+      throw new TopologyLookupError(
+        "every topology reader is cooling down after repeated failures; cannot verify this payer",
+        "unavailable"
+      );
+    }
+    // `unavailable` is the one reason the pay/commit gate exempts, so it is
+    // thrown only when no reader answered at all. A misconfigured reader next
+    // to a down one is still our own breakage, never an outage.
+    throw readerError ?? firstOutage;
+  };
+
+  async function lookupOne(base: string, party: string): Promise<Buffer[]> {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
     // The timer is cleared in ONE outer finally, after the body is consumed.
@@ -92,13 +161,14 @@ export function createTopologyReaderLookup(
     // /settle waits here, a single stalled reader would pin request handlers
     // instead of failing fast and closed.
     try {
-      return await lookupWithin(party, ac);
+      return await lookupWithin(base, party, ac);
     } finally {
       clearTimeout(timer);
     }
-  };
+  }
 
   async function lookupWithin(
+    base: string,
     party: string,
     ac: AbortController
   ): Promise<Buffer[]> {

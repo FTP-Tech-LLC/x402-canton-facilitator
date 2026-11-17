@@ -1777,6 +1777,8 @@ interface TaggedLeaves {
   parties: string[];
   /** Input contracts only: the contract's signatories, authenticated with it. */
   signatories?: string[];
+  /** Input `FeaturedAppRight` only: its dso, provider and operational parties. */
+  featuredRight?: ExtractedFeaturedAppRight;
 }
 
 /** `module:entity` of the DA Registry Utility instrument configuration. */
@@ -1879,10 +1881,15 @@ function collectSplitPartyLeaves(decoded: DecodedPrepared, rootNodeId: string): 
     const parties: string[] = [];
     collectPartyLeaves(ic.argument, parties, 0);
     if (parties.length > 0) {
+      const featuredRight =
+        ic.templateQualifiedName === FEATURED_APP_RIGHT_TEMPLATE
+          ? extractFeaturedAppRight(ic.argument)
+          : undefined;
       inputArgs.push({
         templateQualifiedName: ic.templateQualifiedName,
         parties,
         signatories: ic.signatories,
+        ...(featuredRight !== undefined ? { featuredRight } : {}),
       });
     }
   }
@@ -1937,7 +1944,11 @@ function assertNoForeignParties(
    *  buckets ONLY, exactly like a trusted admin — registry infra are signatories/
    *  observers, never money owners (the consequence-choice whitelist + pinned
    *  receiver keep that true). Empty → byte-identical to the Amulet behaviour. */
-  trustedRegistryParties: ReadonlySet<string> = new Set()
+  trustedRegistryParties: ReadonlySet<string> = new Set(),
+  /** Whose FeaturedAppRight may carry operational parties (see
+   *  providersOpsParties): the matched provider, or the receiver when it
+   *  provably provides its own preapproval. */
+  featuredRightProvider: string | undefined = preapprovalProvider
 ): void {
   const foreign: string[] = [];
   /** Templates at which the matched provider legitimately appears INSIDE a
@@ -2028,6 +2039,7 @@ function assertNoForeignParties(
     ) {
       continue;
     }
+    const opsParties = providersOpsParties(bucket, featuredRightProvider, adminDso, adminDsoTrusted);
     for (const p of bucket.parties) {
       if (allowed.has(p)) continue;
       if (adminDso !== undefined && adminDsoTrusted && p === adminDso) continue;
@@ -2040,6 +2052,7 @@ function assertNoForeignParties(
       ) {
         continue;
       }
+      if (opsParties.has(p)) continue;
       foreign.push(p);
     }
   }
@@ -2134,6 +2147,73 @@ function extractTransferPreapproval(
   return { dso: dso.value, receiver: receiver.value, provider: provider.value };
 }
 
+/** A `Splice.Amulet:FeaturedAppRight` argument, read by declaration order. */
+interface ExtractedFeaturedAppRight {
+  dso: string;
+  provider: string;
+  opsParties: string[];
+}
+
+/**
+ * Read a FeaturedAppRight: [0] dso [1] provider [2] activityWeight [3] appKind
+ * [4] opsParties. Splice 0.10 (splice-amulet 0.1.25) added [3] and [4]; a right
+ * created before it ends earlier, and a missing or None opsParties is [].
+ */
+function extractFeaturedAppRight(argument: Uint8Array): ExtractedFeaturedAppRight | undefined {
+  let entries;
+  try {
+    entries = recordEntries(argument);
+  } catch {
+    return undefined;
+  }
+  const dsoE = entryByDeclOrder(entries, 0, "dso");
+  const providerE = entryByDeclOrder(entries, 1, "provider");
+  if (!dsoE || !providerE) return undefined;
+  const dso = leafOf(dsoE.value);
+  const provider = leafOf(providerE.value);
+  if (dso?.kind !== "party" || provider?.kind !== "party") return undefined;
+  const opsParties: string[] = [];
+  const opsE = entryByDeclOrder(entries, 4, "opsParties");
+  if (opsE) collectPartyLeaves(opsE.value, opsParties, 0);
+  return { dso: dso.value, provider: provider.value, opsParties };
+}
+
+const NO_PARTIES: ReadonlySet<string> = new Set();
+
+/**
+ * Operational parties a payment may carry inside the preapproval provider's own
+ * featured-app right.
+ *
+ * Since Splice 0.10 a FeaturedAppRight can name operational parties whose
+ * submissions count as the app's own. On MainNet the DSO sets them (the grant
+ * and the config-update instruction); on DevNet an app can set them itself.
+ * They sit in that contract's argument only: the right is `signatory dso,
+ * observer provider`, fetched as an input when the preapproval provider is
+ * featured, and none of them owns or receives anything in the payment. Without
+ * this, ops parties on a provider's right would make every payment to its
+ * merchants fail here.
+ *
+ * Admitted only in a right signed by the trusted DSO alone whose provider is
+ * the proven preapproval provider (or the receiver, when it provides its own),
+ * and only in that contract's argument. In a created Amulet, the root transfer
+ * or any other contract they stay foreign.
+ */
+function providersOpsParties(
+  bucket: TaggedLeaves,
+  rightProvider: string | undefined,
+  adminDso: string | undefined,
+  adminDsoTrusted: boolean
+): ReadonlySet<string> {
+  const right = bucket.featuredRight;
+  if (right === undefined || rightProvider === undefined) return NO_PARTIES;
+  if (adminDso === undefined || !adminDsoTrusted) return NO_PARTIES;
+  if (bucket.templateQualifiedName !== FEATURED_APP_RIGHT_TEMPLATE) return NO_PARTIES;
+  if (right.provider !== rightProvider || right.dso !== adminDso) return NO_PARTIES;
+  const sigs = bucket.signatories ?? [];
+  if (sigs.length !== 1 || sigs[0] !== adminDso) return NO_PARTIES;
+  return new Set(right.opsParties);
+}
+
 /**
  * Prove that this transfer delivers through a standard TransferPreapproval and
  * return ITS provider, or undefined when nothing may be granted. See the block
@@ -2192,6 +2272,48 @@ function matchPreapprovalProvider(
   if (!delivered) return undefined;
 
   return pre.provider;
+}
+
+/**
+ * The receiver, when it provably provides its own preapproval for this transfer:
+ * exactly one preapproval input, for this receiver and DSO, with provider ==
+ * receiver, signed by exactly {dso, receiver}, and spent by a send exercise on
+ * that contract id. undefined otherwise. Splice fetches the provider's
+ * FeaturedAppRight in that case too, so its ops parties need the same narrow
+ * admission (see providersOpsParties). Never throws.
+ */
+function selfProvidedPreapprovalReceiver(
+  decoded: DecodedPrepared,
+  expectedReceiver: string,
+  instrumentAdmin: string
+): string | undefined {
+  const candidates = decoded.inputContracts.filter(
+    (ic) => ic.templateQualifiedName === PREAPPROVAL_TEMPLATE
+  );
+  if (candidates.length !== 1) return undefined;
+  const ic = candidates[0]!;
+  if (ic.argument === undefined || ic.contractId === undefined) return undefined;
+  let pre: ExtractedTransferPreapproval | undefined;
+  try {
+    pre = extractTransferPreapproval(ic.argument);
+  } catch {
+    return undefined;
+  }
+  if (pre === undefined) return undefined;
+  if (pre.receiver !== expectedReceiver || pre.dso !== instrumentAdmin) return undefined;
+  if (pre.provider !== pre.receiver || pre.receiver === pre.dso) return undefined;
+  const sigs = new Set(ic.signatories);
+  if (ic.signatories.length !== 2 || sigs.size !== 2 || !sigs.has(pre.dso) || !sigs.has(pre.receiver)) {
+    return undefined;
+  }
+  const delivered = decoded.nodes.some(
+    (n) =>
+      n.exercise !== undefined &&
+      PREAPPROVAL_SEND_CHOICES.has(n.exercise.choiceId) &&
+      n.exercise.templateQualifiedName === PREAPPROVAL_TEMPLATE &&
+      n.exercise.contractId === ic.contractId
+  );
+  return delivered ? pre.receiver : undefined;
 }
 
 /**
@@ -3198,7 +3320,8 @@ export function assertPreparedTransferMatches(
     2 /* expectedAdmin + instrumentId.admin */,
     expect.instrumentAdmin !== undefined /* trusted iff caller pinned it */,
     preapprovalProvider,
-    expect.trustedRegistryParties ?? new Set()
+    expect.trustedRegistryParties ?? new Set(),
+    preapprovalProvider ?? selfProvidedPreapprovalReceiver(decoded, expect.receiver, t.instrumentAdmin)
   );
 
   assertDeliveryMatchesRoot(decoded, t, expect);

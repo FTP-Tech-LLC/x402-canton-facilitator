@@ -3,9 +3,6 @@ import Fastify from "fastify";
 import type { LedgerTransaction } from "@ftptech/x402-canton-ledger";
 import { registerWalletRoutes, type WalletRelayServices } from "./wallet.js";
 import {
-  type TcUpdate,
-  linkSettlementsToFills,
-  linkSettlementsWithLookback,
   parseTradecraftUpdatesQuery,
   summarizeTradecraftTransaction,
   tradecraftHelperTemplate,
@@ -493,217 +490,6 @@ describe("fill outputs from the venue's batch helper", () => {
   });
 });
 
-/** Summaries as the relay builds them, for the linking rules. */
-const filledAt = (
-  offset: number,
-  orderCid: string,
-  out: string,
-  opts: { sell?: string | null; ammId?: string | null; outId?: typeof EXAG; kind?: "filled" | "archived"; noOutput?: boolean } = {}
-): TcUpdate => {
-  const sell = opts.sell === undefined ? "6.0000000000" : opts.sell;
-  const ammId = opts.ammId === undefined ? "TC CC/eXAG LP" : opts.ammId;
-  return {
-    offset,
-    updateId: `u${offset}`,
-    orders: [
-      {
-        kind: opts.kind ?? "filled",
-        orderCid,
-        choice: opts.kind === "archived" ? "Order_SomethingNew" : "Order_Complete",
-        ...(ammId !== null ? { ammId } : {}),
-        ...(sell !== null ? { sell: { instrument: CC, amount: sell } } : {}),
-        ...(opts.noOutput || opts.kind === "archived" ? {} : { output: { instrument: opts.outId ?? EXAG, amount: out } }),
-      },
-    ],
-    allocations: [],
-    withdrawals: [],
-  };
-};
-const tradeAllocs = (offset: number, trade: string, sent: string, got: string, ammId = "TC CC/eXAG LP"): TcUpdate["allocations"] => [
-  { allocationCid: `cc${offset}${trade}`, ammId, instrument: CC, fundingAfter: {}, legs: [{ side: "send", amount: sent, instrumentId: "Amulet", counterparty: VAULT, transferLegId: `${trade}-from-actor` }] },
-  { allocationCid: `ex${offset}${trade}`, ammId, instrument: EXAG, fundingAfter: {}, legs: [{ side: "receive", amount: got, instrumentId: "eXAG", counterparty: VAULT, transferLegId: `${trade}-to-actor` }] },
-];
-const settledAt = (offset: number, trade: string, sent: string, got: string, ammId = "TC CC/eXAG LP"): TcUpdate => ({
-  offset,
-  updateId: `u${offset}`,
-  orders: [],
-  allocations: tradeAllocs(offset, trade, sent, got, ammId),
-  withdrawals: [],
-});
-const tiedTo = (u: TcUpdate) => u.allocations.flatMap((c) => c.legs.map((l) => l.orderCid));
-
-describe("linkSettlementsToFills", () => {
-  it("ties both legs of a trade to the one fill with that output and input", () => {
-    const s = settledAt(31, "T1", "6.0000000000", "0.0114641650");
-    linkSettlementsToFills([filledAt(30, "o1", "0.0114641650", { sell: "6.0000000000", ammId: "TC CC/eXAG LP" }), s]);
-    expect(tiedTo(s)).toEqual(["o1", "o1"]);
-  });
-
-  it("ties each trade of one batch to its own order, whatever the settlement order, also two trades in one transaction", () => {
-    const a = settledAt(32, "TB", "6.0000000000", "0.0114638532");
-    const b = settledAt(33, "TA", "6.0000000000", "0.0114641650");
-    linkSettlementsToFills([filledAt(30, "o1", "0.0114641650"), filledAt(30, "o2", "0.0114638532"), a, b]);
-    expect([tiedTo(a), tiedTo(b)]).toEqual([["o2", "o2"], ["o1", "o1"]]);
-    const both: TcUpdate = { offset: 41, updateId: "u41", orders: [], allocations: [...tradeAllocs(41, "TC", "6.0000000000", "0.0200000001"), ...tradeAllocs(41, "TD", "6.0000000000", "0.0200000002")], withdrawals: [] };
-    linkSettlementsToFills([filledAt(40, "o3", "0.0200000001"), filledAt(40, "o4", "0.0200000002"), both]);
-    expect(tiedTo(both)).toEqual(["o3", "o3", "o4", "o4"]);
-  });
-
-  it("ties nothing when two fills before the settlement share its output; a later fill does not count", () => {
-    const s = settledAt(31, "T1", "6.0000000000", "0.0114641650");
-    linkSettlementsToFills([filledAt(29, "o1", "0.0114641650"), filledAt(30, "o2", "0.011464165"), s]);
-    expect(tiedTo(s)).toEqual([undefined, undefined]);
-    // MainNet 2026-10-18: two CBTC fills got 0.0000073805, twenty minutes
-    // apart. The first settlement sees one fill with its output; the second
-    // sees two (one tied already) and stays untied.
-    const first = settledAt(21, "T0", "6.0000000000", "0.0000073805");
-    const second = settledAt(31, "T1", "6.0000000000", "0.0000073805");
-    linkSettlementsToFills([filledAt(20, "o5", "0.0000073805"), first, filledAt(30, "o6", "0.0000073805"), second]);
-    expect([tiedTo(first), tiedTo(second)]).toEqual([["o5", "o5"], [undefined, undefined]]);
-  });
-
-  it("ties nothing when a fill in the settlement's own transaction shares its output", () => {
-    const sameTx: TcUpdate = { ...filledAt(31, "oT", "0.0114641650"), allocations: tradeAllocs(31, "T1", "6.0000000000", "0.0114641650") };
-    linkSettlementsToFills([filledAt(30, "oX", "0.0114641650"), sameTx]);
-    expect(tiedTo(sameTx)).toEqual([undefined, undefined]);
-  });
-
-  it("ties no fill whose pool and input are not known", () => {
-    const s = settledAt(31, "T1", "6.0000000000", "0.0114641650");
-    linkSettlementsToFills([filledAt(30, "o1", "0.0114641650", { sell: null, ammId: null }), s]);
-    expect(tiedTo(s)).toEqual([undefined, undefined]);
-  });
-
-  it("does not tie a settlement before or in the same transaction as the fill, on another pool or input, nor top-ups, nor a trade id on two legs of one side", () => {
-    const early = settledAt(30, "T0", "6.0000000000", "0.0114641650");
-    const otherPool = settledAt(41, "T2", "6.0000000000", "0.0100000000", "TC CC/eXAU LP");
-    const otherInput = settledAt(42, "T3", "7.0000000000", "0.0200000000");
-    const topUp: TcUpdate = {
-      offset: 43,
-      updateId: "u43",
-      orders: [],
-      allocations: [{ allocationCid: "t1", ammId: "TC CC/eXAG LP", instrument: CC, fundingAfter: {}, legs: [{ side: "receive", amount: "6.0000000000", instrumentId: "Amulet", counterparty: P, transferLegId: "top-up-leg" }] }],
-      withdrawals: [],
-    };
-    const sameTx: TcUpdate = { ...filledAt(44, "o4", "0.0300000000"), allocations: tradeAllocs(44, "T4", "6.0000000000", "0.0300000000") };
-    const doubled: TcUpdate = {
-      offset: 46,
-      updateId: "u46",
-      orders: [],
-      allocations: [...tradeAllocs(46, "T5", "6.0000000000", "0.0400000000"), ...tradeAllocs(46, "T5", "7.0000000000", "0.0400000001")],
-      withdrawals: [],
-    };
-    linkSettlementsToFills([
-      early,
-      filledAt(31, "o1", "0.0114641650"),
-      filledAt(40, "o2", "0.0100000000", { ammId: "TC CC/eXAG LP" }),
-      filledAt(40, "o3", "0.0200000000", { sell: "6.0000000000" }),
-      otherPool,
-      otherInput,
-      topUp,
-      sameTx,
-      filledAt(45, "o5", "0.0400000000"),
-      doubled,
-    ]);
-    expect([tiedTo(early), tiedTo(otherPool), tiedTo(otherInput), tiedTo(topUp), tiedTo(sameTx), tiedTo(doubled)]).toEqual([
-      [undefined, undefined],
-      [undefined, undefined],
-      [undefined, undefined],
-      [undefined],
-      [undefined, undefined],
-      [undefined, undefined, undefined, undefined],
-    ]);
-  });
-});
-
-describe("linkSettlementsWithLookback", () => {
-  // A fill as the ledger shows it to the party, its order created before.
-  // An order created and filled before the page, as the ledger shows it.
-  const fillTx = (offset: number, cid: string, out: string) =>
-    tx(offset, [
-      created(cid, ORDER_T, ccOrder("6.0000000000")),
-      helper(EXAG, [[cid, out]]),
-      exercised(cid, ORDER_T, "Order_Complete", {}, "r"),
-    ]);
-
-  it("reads the window before the page whole, then ties a fill found there", async () => {
-    const page = [settledAt(50_001, "T1", "6.0000000000", "0.0114641650")];
-    const read = vi.fn(async () => ({ transactions: [fillTx(49_990, "o1", "0.0114641650")], rows: 1 }));
-    expect(await linkSettlementsWithLookback(P, page, 50_000, read)).toEqual({ reads: 1, complete: true });
-    expect(read).toHaveBeenCalledWith(40_000, 50_000, 200);
-    expect(tiedTo(page[0]!)).toEqual(["o1", "o1"]);
-  });
-
-  it("does not tie on the page alone: a fill with the same output just before it leaves the trade untied", async () => {
-    const page = [filledAt(50_002, "o2", "0.0000076000"), settledAt(50_005, "T1", "6.0000000000", "0.0000076000")];
-    const read = vi.fn(async () => ({ transactions: [fillTx(49_995, "o1", "0.0000076000")], rows: 1 }));
-    expect(await linkSettlementsWithLookback(P, page, 50_000, read)).toEqual({ reads: 1, complete: true });
-    expect(tiedTo(page[1]!)).toEqual([undefined, undefined]);
-  });
-
-  it("pages through a full read, and ties nothing when the window is not read whole", async () => {
-    const page = [settledAt(50_001, "T1", "6.0000000000", "0.0114641650")];
-    const read = vi
-      .fn()
-      .mockResolvedValueOnce({ transactions: [], rows: 200, lastOffset: 45_000 })
-      .mockResolvedValueOnce({ transactions: [fillTx(49_990, "o1", "0.0114641650")], rows: 1 });
-    expect(await linkSettlementsWithLookback(P, page, 50_000, read)).toEqual({ reads: 2, complete: true });
-    expect(read.mock.calls).toEqual([[40_000, 50_000, 200], [45_000, 50_000, 200]]);
-    expect(tiedTo(page[0]!)).toEqual(["o1", "o1"]);
-
-    const busy = [filledAt(50_000, "o9", "0.0114641650"), settledAt(50_001, "T1", "6.0000000000", "0.0114641650")];
-    const full = vi.fn(async (from: number) => ({ transactions: [], rows: 200, lastOffset: from + 100 }));
-    expect(await linkSettlementsWithLookback(P, busy, 50_000, full)).toEqual({ reads: 3, complete: false });
-    expect(tiedTo(busy[1]!)).toEqual([undefined, undefined]);
-  });
-
-  it("stops when the read budget or the deadline refuses, and ties nothing", async () => {
-    const read = vi.fn();
-    const page = [filledAt(50_000, "o9", "0.0114641650"), settledAt(50_001, "T1", "6.0000000000", "0.0114641650")];
-    expect(await linkSettlementsWithLookback(P, page, 50_000, read, { allowRead: () => false })).toEqual({ reads: 0, complete: false });
-    expect(await linkSettlementsWithLookback(P, page, 50_000, read, { deadlineMs: -1 })).toEqual({ reads: 0, complete: false });
-    expect(read).not.toHaveBeenCalled();
-    expect(tiedTo(page[1]!)).toEqual([undefined, undefined]);
-  });
-
-  it("ties nothing when what was read holds a fill without an output or an order closed by an unknown choice", async () => {
-    const page = [settledAt(50_001, "T1", "6.0000000000", "0.0114641650")];
-    const noOutput = tx(49_980, [created("o0", ORDER_T, ccOrder("6.0000000000")), exercised("o0", ORDER_T, "Order_Complete", {}, "r")]);
-    const read = vi.fn(async () => ({ transactions: [noOutput, fillTx(49_990, "o1", "0.0114641650")], rows: 2 }));
-    expect(await linkSettlementsWithLookback(P, page, 50_000, read)).toEqual({ reads: 1, complete: false });
-    expect(tiedTo(page[0]!)).toEqual([undefined, undefined]);
-    const odd = [filledAt(10, "o2", "0.0114641650", { kind: "archived" }), filledAt(11, "o1", "0.0114641650"), settledAt(12, "T1", "6.0000000000", "0.0114641650")];
-    expect(await linkSettlementsWithLookback(P, odd, 0, vi.fn())).toEqual({ reads: 0, complete: false });
-    expect(tiedTo(odd[2]!)).toEqual([undefined, undefined]);
-    const flagged = [{ ...filledAt(11, "o1", "0.0114641650"), anomalies: [{ detail: "x: Order_Complete with no acsDelta" }] }, settledAt(12, "T1", "6.0000000000", "0.0114641650")];
-    expect(await linkSettlementsWithLookback(P, flagged, 0, vi.fn())).toEqual({ reads: 0, complete: false });
-  });
-
-  it("known limit: an unread unsettled fill's settlement takes a read fill with the same terms, and the chain stops there", async () => {
-    // The old fill is before the window. Its settlement lands on the page
-    // before B fills: it takes A. A's settlement then sees A and B, B's sees
-    // both too: neither is tied.
-    const page = [
-      settledAt(50_001, "TOLD", "6.0000000000", "0.0000073805"),
-      filledAt(50_010, "oB", "0.0000073805"),
-      settledAt(50_020, "TA", "6.0000000000", "0.0000073805"),
-      settledAt(50_030, "TB", "6.0000000000", "0.0000073805"),
-    ];
-    const read = vi.fn(async () => ({ transactions: [fillTx(49_990, "oA", "0.0000073805")], rows: 1 }));
-    await linkSettlementsWithLookback(P, page, 50_000, read);
-    expect([tiedTo(page[0]!), tiedTo(page[2]!), tiedTo(page[3]!)]).toEqual([["oA", "oA"], [undefined, undefined], [undefined, undefined]]);
-  });
-
-  it("ties on the page alone only from the ledger's start, and reads nothing for a page with no trade", async () => {
-    const read = vi.fn();
-    const fromStart = [filledAt(10, "o1", "0.0114641650"), settledAt(11, "T1", "6.0000000000", "0.0114641650")];
-    expect(await linkSettlementsWithLookback(P, fromStart, 0, read)).toEqual({ reads: 0, complete: true });
-    expect(tiedTo(fromStart[1]!)).toEqual(["o1", "o1"]);
-    expect(await linkSettlementsWithLookback(P, [filledAt(10, "o1", "0.0114641650")], 5, read)).toEqual({ reads: 0, complete: true });
-    expect(read).not.toHaveBeenCalled();
-  });
-});
-
 describe("GET /v1/wallet/:party/tradecraft-updates with orderCids", () => {
   const ownAlloc = (cid: string, instrumentId: string) =>
     created(cid, `${PKG}:Splice.AmuletAllocationV2:AmuletAllocationV2`, {}, allocView(P, { "tradecraft.fi/amm-id": "TC CC/eXAG LP", "tradecraft.fi/instrument-id": instrumentId }, {}));
@@ -722,13 +508,12 @@ describe("GET /v1/wallet/:party/tradecraft-updates with orderCids", () => {
     ownAlloc("e-new", "eXAG"),
   ]);
   const fill = tx(450, [created("o1", ORDER_T, ccOrder("6.0000000000")), helper(EXAG, [["o1", "0.0114641650"]]), exercised("o1", ORDER_T, "Order_Complete", {}, "r")]);
-  function app(readBefore: () => Promise<unknown>, readRateMaxPerIp?: number) {
-    const getUpdatesPage = vi.fn(async (q: { beginExclusive: number }) =>
-      q.beginExclusive === 500 ? { transactions: [settlement], rows: 1, lastOffset: 501 } : readBefore()
-    );
+  /** The allocations the settlement spends, as the party's setup created them. */
+  const setup = tx(100, [ownAlloc("c-old", "Amulet"), ownAlloc("e-old", "eXAG")]);
+  function relay(getUpdatesPage: unknown, end: () => number, readRateMaxPerIp?: number) {
     const s = {
       client: {
-        getLedgerEnd: vi.fn(async () => ({ offset: 1000 })),
+        getLedgerEnd: vi.fn(async () => ({ offset: end() })),
         getUpdatesPage,
         getPartyDetails: vi.fn(async (party: string) => ({ isLocal: party === P })),
       },
@@ -743,7 +528,13 @@ describe("GET /v1/wallet/:party/tradecraft-updates with orderCids", () => {
       ...(readRateMaxPerIp !== undefined ? { readRateMaxPerIp } : {}),
     } as unknown as WalletRelayServices;
     const a = Fastify();
-    return { ready: registerWalletRoutes(a, s).then(() => a), getUpdatesPage };
+    return registerWalletRoutes(a, s).then(() => a);
+  }
+  function app(readBefore: () => Promise<unknown>, readRateMaxPerIp?: number) {
+    const getUpdatesPage = vi.fn(async (q: { beginExclusive: number }) =>
+      q.beginExclusive === 500 ? { transactions: [settlement], rows: 1, lastOffset: 501 } : readBefore()
+    );
+    return { ready: relay(getUpdatesPage, () => 1000, readRateMaxPerIp), getUpdatesPage };
   }
   const url = (q: string) => `/v1/wallet/${encodeURIComponent(P)}/tradecraft-updates?after=500${q}`;
   const legsOf = (body: { updates: Array<{ allocations: Array<{ legs: Array<{ orderCid?: string }> }> }> }) =>
@@ -758,7 +549,7 @@ describe("GET /v1/wallet/:party/tradecraft-updates with orderCids", () => {
   });
 
   it("ties a settlement to a fill read before the page when asked", async () => {
-    const { ready, getUpdatesPage } = app(async () => ({ transactions: [fill], rows: 1, lastOffset: 450 }));
+    const { ready, getUpdatesPage } = app(async () => ({ transactions: [setup, fill], rows: 2, lastOffset: 450 }));
     const body = (await (await ready).inject({ method: "GET", url: url("&orderCids=true") })).json();
     expect(legsOf(body)).toEqual(["o1", "o1"]);
     expect(body.orderCidsComplete).toBe(true);
@@ -776,7 +567,7 @@ describe("GET /v1/wallet/:party/tradecraft-updates with orderCids", () => {
   });
 
   it("charges each read before the page to the caller's read budget", async () => {
-    // Every read before the page is full, so the lookup would take three. A
+    // Every read before the page is full, so the index would take more. A
     // budget of two a minute pays for the request and one of them.
     const { ready, getUpdatesPage } = app(async () => ({ transactions: [], rows: 200, lastOffset: 100 }), 2);
     const a = await ready;
@@ -797,5 +588,210 @@ describe("GET /v1/wallet/:party/tradecraft-updates with orderCids", () => {
     const { ready } = app(async () => ({ transactions: [], rows: 0 }));
     expect((await (await ready).inject({ method: "GET", url: url("&orderCids=yes") })).statusCode).toBe(400);
     expect(parseTradecraftUpdatesQuery({ orderCids: "false" })).toMatchObject({ ok: true, orderCids: false });
+  });
+
+  describe("from the party's fill index", () => {
+    const OUT = "0.0114641650";
+    const OUT2 = "0.0222222222";
+    const fillOf = (offset: number, cid: string, out: string) =>
+      tx(offset, [created(cid, ORDER_T, ccOrder("6.0000000000")), helper(EXAG, [[cid, out]]), exercised(cid, ORDER_T, "Order_Complete", {}, "r")]);
+    const createdAt = (offset: number, cid: string) => tx(offset, [created(cid, ORDER_T, ccOrder("6.0000000000"))]);
+    /** A fill whose create is in another read: the participant marks it the party's. */
+    const filledLater = (offset: number, cid: string, out: string) =>
+      tx(offset, [helper(EXAG, [[cid, out]]), acs(exercised(cid, ORDER_T, "Order_Complete", {}, "r"), true)]);
+    /** The allocations these trades' settlements spend, as the party's setup created them. */
+    const setupFor = (...trades: string[]) => tx(1, trades.flatMap((t) => [ownAlloc(`c-${t}-old`, "Amulet"), ownAlloc(`e-${t}-old`, "eXAG")]));
+    const settlementOf = (offset: number, trade: string, out: string) =>
+      tx(offset, [
+        legSettle(`c-${trade}-old`, `c-${trade}`, "SenderSide", "6.0000000000", "Amulet", `${trade}-from-actor`),
+        ownAlloc(`c-${trade}`, "Amulet"),
+        legSettle(`e-${trade}-old`, `e-${trade}`, "ReceiverSide", out, "eXAG", `${trade}-to-actor`),
+        ownAlloc(`e-${trade}`, "eXAG"),
+      ]);
+    /** A participant that answers each range from these transactions. */
+    function ledger(txs: LedgerTransaction[], end: () => number, gate?: (q: { beginExclusive: number; endInclusive: number }) => Promise<void>) {
+      const getUpdatesPage = vi.fn(async (q: { beginExclusive: number; endInclusive: number; limit: number }) => {
+        await gate?.(q);
+        const rows = txs.filter((t) => t.offset > q.beginExclusive && t.offset <= q.endInclusive).sort((x, y) => x.offset - y.offset).slice(0, q.limit);
+        return { transactions: rows, rows: rows.length, lastOffset: rows.at(-1)?.offset };
+      });
+      const ready = relay(getUpdatesPage, end);
+      const get = async (after: number, more = "") =>
+        (await (await ready).inject({ method: "GET", url: `/v1/wallet/${encodeURIComponent(P)}/tradecraft-updates?after=${after}&orderCids=true${more}` })).json();
+      return { get, getUpdatesPage };
+    }
+    const allLegs = (body: { updates: Array<{ allocations: Array<{ legs: Array<{ orderCid?: string }> }> }> }) =>
+      body.updates.flatMap((u) => u.allocations.flatMap((c) => c.legs.map((l) => l.orderCid)));
+    const atTime = async (t: string, run: () => Promise<void>) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date(t));
+      try {
+        await run();
+      } finally {
+        vi.useRealTimers();
+      }
+    };
+
+    it("ties a settlement two days after its fill for a reader that follows the ledger, with no read beyond its pages", async () => {
+      let end = 35_000;
+      const { get, getUpdatesPage } = ledger(
+        [setupFor("T1", "T2"), fillOf(450, "o1", OUT), settlementOf(501, "T1", OUT), fillOf(36_000, "o2", OUT2), settlementOf(76_000, "T2", OUT2)],
+        () => end
+      );
+      expect(allLegs(await get(0))).toEqual(["o1", "o1"]);
+      end = 50_000;
+      expect(await get(35_000)).toMatchObject({ next: 50_000, orderCidsComplete: true });
+      end = 90_000;
+      const body = await get(50_000);
+      expect([allLegs(body), body.orderCidsComplete]).toEqual([["o2", "o2"], true]);
+      expect(getUpdatesPage).toHaveBeenCalledTimes(3);
+    });
+
+    it("builds the index from the ledger's start for a reader that starts late, then answers by lookup", async () => {
+      const { get, getUpdatesPage } = ledger([setupFor("T1"), fillOf(450, "o1", OUT), settlementOf(40_501, "T1", OUT)], () => 50_000);
+      expect(allLegs(await get(30_000))).toEqual(["o1", "o1"]);
+      expect(getUpdatesPage.mock.calls[1]?.[0]).toMatchObject({ beginExclusive: 0, endInclusive: 30_000, limit: 200 });
+      expect(allLegs(await get(30_000))).toEqual(["o1", "o1"]);
+      expect(getUpdatesPage).toHaveBeenCalledTimes(3);
+    });
+
+    it("reads nothing for the index on a page with no trade to tag", async () => {
+      const { get, getUpdatesPage } = ledger([fillOf(450, "o1", OUT), fillOf(30_500, "o2", OUT2)], () => 50_000);
+      expect(await get(30_000)).toMatchObject({ orderCidsComplete: true });
+      expect(getUpdatesPage).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not tie a settlement to a newer fill with the same terms while an older one is unsettled", async () => {
+      // A window of the 10k offsets before the page would see only the newer fill.
+      const { get } = ledger([setupFor("T1"), fillOf(450, "oOld", OUT), fillOf(25_001, "oNew", OUT), settlementOf(35_000, "T1", OUT)], () => 50_000);
+      const body = await get(34_999);
+      expect([allLegs(body), body.orderCidsComplete]).toEqual([[undefined, undefined], true]);
+    });
+
+    it("takes an order's terms from its create in an earlier read of the history", async () => {
+      const filler = Array.from({ length: 300 }, (_, i) => tx(i + 101, []));
+      const { get } = ledger([setupFor("T1"), createdAt(100, "o1"), ...filler, filledLater(450, "o1", OUT), settlementOf(30_100, "T1", OUT)], () => 50_000);
+      expect(allLegs(await get(30_000))).toEqual(["o1", "o1"]);
+    });
+
+    it("tags a full page and goes on from where it stopped", async () => {
+      const { get } = ledger(
+        [setupFor("T1", "T2"), fillOf(450, "o1", OUT), settlementOf(30_100, "T1", OUT), fillOf(30_200, "o2", OUT2), settlementOf(30_300, "T2", OUT2)],
+        () => 50_000
+      );
+      const first = await get(30_000, "&limit=1");
+      expect([first.next, first.complete, allLegs(first), first.orderCidsComplete]).toEqual([30_100, false, ["o1", "o1"], true]);
+      const second = await get(30_100, "&limit=2");
+      expect([second.next, second.complete, allLegs(second), second.orderCidsComplete]).toEqual([30_300, false, ["o2", "o2"], true]);
+    });
+
+    it("says the order ids are not complete while the index catches up over several requests", async () => {
+      const filler = Array.from({ length: 1_200 }, (_, i) => tx(i + 2, []));
+      const { get, getUpdatesPage } = ledger([setupFor("T1"), ...filler, fillOf(1_300, "o1", OUT), settlementOf(40_501, "T1", OUT)], () => 50_000);
+      const first = await get(30_000);
+      expect([allLegs(first), first.orderCidsComplete]).toEqual([[undefined, undefined], false]);
+      // The page and five reads for the index.
+      expect(getUpdatesPage).toHaveBeenCalledTimes(6);
+      const second = await get(30_000);
+      expect([allLegs(second), second.orderCidsComplete]).toEqual([["o1", "o1"], true]);
+      expect(getUpdatesPage).toHaveBeenCalledTimes(9);
+    });
+
+    it("stops reading for the index at the deadline, and the next request goes on", async () => {
+      await atTime("2026-11-09T00:00:00Z", async () => {
+        const filler = Array.from({ length: 400 }, (_, i) => tx(i + 2, []));
+        // Each read for the index takes six seconds.
+        const { get, getUpdatesPage } = ledger([setupFor("T1"), ...filler, fillOf(500, "o1", OUT), settlementOf(40_501, "T1", OUT)], () => 50_000, async (q) => {
+          if (q.beginExclusive < 30_000) vi.setSystemTime(new Date(Date.now() + 6_000));
+        });
+        expect((await get(30_000)).orderCidsComplete).toBe(false);
+        expect((await get(30_000)).orderCidsComplete).toBe(false);
+        expect(allLegs(await get(30_000))).toEqual(["o1", "o1"]);
+        expect(getUpdatesPage).toHaveBeenCalledTimes(6);
+      });
+    });
+
+    it("gives no order ids for good when the party's history holds a record the index cannot read", async () => {
+      const odd = tx(100, [created("oZ", ORDER_T, ccOrder("6.0000000000")), exercised("oZ", ORDER_T, "Order_SomethingNew", {}, "r")]);
+      const { get, getUpdatesPage } = ledger([setupFor("T1"), odd, fillOf(29_500, "o1", OUT), settlementOf(30_100, "T1", OUT)], () => 50_000);
+      for (let i = 0; i < 2; i++) {
+        const body = await get(30_000);
+        expect([allLegs(body), body.orderCidsComplete]).toEqual([[undefined, undefined], false]);
+      }
+      // The page and the index's read, then the page alone.
+      expect(getUpdatesPage).toHaveBeenCalledTimes(3);
+    });
+
+    it("gives no order ids for a party whose history here starts after its first allocation (an ACS import)", async () => {
+      // No setup: the settlement spends allocations from before the party's history here.
+      const { get } = ledger([fillOf(450, "o1", OUT), settlementOf(30_100, "T1", OUT)], () => 50_000);
+      const body = await get(30_000);
+      expect([allLegs(body), body.orderCidsComplete]).toEqual([[undefined, undefined], false]);
+    });
+
+    it("after a failed read for the index, says so and reads for it again a minute later", async () => {
+      await atTime("2026-11-09T00:00:00Z", async () => {
+        let fail = true;
+        const { get, getUpdatesPage } = ledger([setupFor("T1"), fillOf(450, "o1", OUT), settlementOf(30_100, "T1", OUT)], () => 50_000, async (q) => {
+          if (q.beginExclusive === 0 && fail) {
+            fail = false;
+            throw new Error("participant timeout");
+          }
+        });
+        expect((await get(30_000)).orderCidsComplete).toBe(false);
+        expect((await get(30_000)).orderCidsComplete).toBe(false);
+        expect(getUpdatesPage.mock.calls.filter(([q]) => q.beginExclusive === 0)).toHaveLength(1);
+        vi.setSystemTime(new Date("2026-11-09T00:01:01Z"));
+        expect(allLegs(await get(30_000))).toEqual(["o1", "o1"]);
+      });
+    });
+
+    it("serves two requests at once: one reads the index while the other extends it, and both tie", async () => {
+      let release!: () => void;
+      const opened = new Promise<void>((r) => (release = r));
+      let end = 35_000;
+      const { get, getUpdatesPage } = ledger(
+        [setupFor("T1", "T2"), fillOf(450, "o1", OUT), settlementOf(30_100, "T1", OUT), fillOf(36_000, "o2", OUT2), settlementOf(45_000, "T2", OUT2)],
+        () => end,
+        async (q) => {
+          if (q.beginExclusive === 35_000 && q.endInclusive === 40_000) await opened;
+        }
+      );
+      expect(allLegs(await get(0))).toEqual(["o1", "o1"]);
+      end = 50_000;
+      const slow = get(40_000);
+      await vi.waitFor(() => expect(getUpdatesPage).toHaveBeenCalledTimes(3));
+      const quick = await get(35_000);
+      expect([allLegs(quick), quick.orderCidsComplete]).toEqual([["o2", "o2"], true]);
+      release();
+      const late = await slow;
+      expect([allLegs(late), late.orderCidsComplete]).toEqual([["o2", "o2"], true]);
+    });
+
+    it("drops the index when another request sees the ledger go back, even if it grew past the index since", async () => {
+      let end = 50_000;
+      const txs = [setupFor("T1"), fillOf(450, "o1", OUT), settlementOf(40_501, "T1", OUT)];
+      const { get } = ledger(txs, () => end);
+      expect(allLegs(await get(30_000))).toEqual(["o1", "o1"]);
+      txs.splice(0, txs.length, setupFor("T9"), fillOf(450, "o9", OUT));
+      end = 1_000;
+      expect(await get(0)).toMatchObject({ orderCidsComplete: true });
+      txs.push(settlementOf(59_000, "T9", OUT));
+      end = 60_000;
+      const body = await get(0);
+      expect([allLegs(body), body.orderCidsComplete]).toEqual([["o9", "o9"], true]);
+    });
+
+    it("drops the index when the ledger goes back, and builds it again", async () => {
+      let end = 50_000;
+      const txs = [setupFor("T1"), fillOf(450, "o1", OUT), settlementOf(40_501, "T1", OUT)];
+      const { get } = ledger(txs, () => end);
+      expect(allLegs(await get(30_000))).toEqual(["o1", "o1"]);
+      // A reset: offsets start again, with another history.
+      txs.splice(0, txs.length, setupFor("T9"), fillOf(450, "o9", OUT), settlementOf(20_000, "T9", OUT));
+      end = 30_000;
+      const body = await get(0);
+      expect([allLegs(body), body.orderCidsComplete]).toEqual([["o9", "o9"], true]);
+    });
   });
 });

@@ -508,6 +508,10 @@ export class CantonClient {
     otherConfirmingParticipantUids?: string[];
     confirmationThreshold?: number;
     observingParticipantUids?: string[];
+    /** Serialize the topology for this protocol version instead of the
+     *  synchronizer's (Canton 3.7.1+). 36 keeps the v30 format that every
+     *  agent wallet up to 2.8 can check, also on a PV 37 synchronizer. */
+    protocolVersion?: number;
   }): Promise<{
     partyId: string;
     publicKeyFingerprint: string;

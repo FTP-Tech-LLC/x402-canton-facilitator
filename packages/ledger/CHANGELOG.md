@@ -1,5 +1,11 @@
 # @ftptech/x402-canton-ledger
 
+## 0.6.6
+
+### Patch Changes
+
+- `generateExternalPartyTopology` takes `protocolVersion` (Canton 3.7.1+), so a relay can keep the v30 topology format on a protocol version 37 synchronizer.
+
 ## 0.6.5
 
 ### Patch Changes

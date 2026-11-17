@@ -23,7 +23,7 @@
  * venue settles each fill later in a transaction of its own, which sends
  * exactly the order's input from the party's allocation and pays `output` into
  * the other one. Those legs carry no order id, so the relay ties a settlement
- * to a fill by those exact amounts (see `linkSettlementsToFills`).
+ * to a fill by those exact amounts (see tradecraft-fill-index.ts).
  */
 import type { ActiveContractsFilter, LedgerTransaction } from "@ftptech/x402-canton-ledger";
 
@@ -463,180 +463,18 @@ export async function summarizeTradecraftPage(party: string, transactions: reado
 
 /** The trade a leg belongs to, from its id; undefined for a top-up or an id
  *  of another shape. */
-function tradeOf(transferLegId: string | undefined): string | undefined {
+export function tradeOf(transferLegId: string | undefined): string | undefined {
   return transferLegId?.match(/^(.+)-(from|to)-actor$/)?.[1];
 }
 
 /** One spelling per amount: `"0.0114640"` and `"0.011464"` are the same. */
-function canonAmount(x: string): string {
+export function canonAmount(x: string): string {
   const [i = "", f = ""] = x.split(".");
   const frac = f.replace(/0+$/, "");
   return `${i.replace(/^0+(?=\d)/, "")}${frac ? `.${frac}` : ""}`;
 }
 
-function sameAmount(a: string, b: string): boolean {
-  return canonAmount(a) === canonAmount(b);
-}
-
 /** Whether these updates hold a settled trade (a leg with a trade id). */
-function hasTrade(updates: readonly TcUpdate[]): boolean {
+export function hasTrade(updates: readonly TcUpdate[]): boolean {
   return updates.some((u) => u.allocations.some((c) => c.legs.some((l) => tradeOf(l.transferLegId) !== undefined)));
-}
-
-/** Records this read cannot weigh: a fill with no output read, an order
- *  closed by a choice the relay does not interpret, or any record of the
- *  party's it could not read. Each could be a settlement's order without being
- *  seen as one. */
-function hasUnreadableFill(updates: readonly TcUpdate[]): boolean {
-  return updates.some(
-    (u) => (u.anomalies?.length ?? 0) > 0 || u.orders.some((o) => (o.kind === "filled" && !o.output) || o.kind === "archived")
-  );
-}
-
-/**
- * Tie each settled trade to the party's fill it settles, in place.
- *
- * A trade is the pair of legs with one trade id: the `receive` leg pays the
- * order's output, the `send` leg takes its input. It is tied only when exactly
- * one fill before the settlement has that output (instrument and amount),
- * counting fills already tied, and that fill is not tied yet, has known terms
- * (its create is in `updates`), and the trade's pool and input are the
- * fill's. Small outputs do repeat (two CBTC fills of 6 CC each got
- * 0.0000073805 on MainNet, 2026-10-18): when two fills before a settlement
- * share its output, neither is tied, so a trade whose own fill was read is
- * never tied to another one. A wrong order id is worse than none.
- */
-export function linkSettlementsToFills(updates: readonly TcUpdate[]): void {
-  type Fill = {
-    orderCid: string;
-    offset: number;
-    ammId?: string;
-    sell?: { instrument: Instrument; amount: string };
-    tied?: boolean;
-  };
-  const key = (instrumentId: string, amount: string) => `${instrumentId} ${canonAmount(amount)}`;
-  const known = new Map<string, Pick<TcOrderEvent, "ammId" | "sell">>();
-  for (const u of updates) {
-    for (const o of u.orders) if (o.kind === "created" && (o.ammId !== undefined || o.sell)) known.set(o.orderCid, o);
-  }
-  const fills = new Map<string, Fill[]>();
-  for (const u of updates) {
-    for (const o of u.orders) {
-      if (o.kind !== "filled" || !o.output) continue;
-      const k = key(o.output.instrument.id, o.output.amount);
-      const t = known.get(o.orderCid);
-      const ammId = o.ammId ?? t?.ammId;
-      const sell = o.sell ?? t?.sell;
-      fills.set(k, [
-        ...(fills.get(k) ?? []),
-        { orderCid: o.orderCid, offset: u.offset, ...(ammId !== undefined ? { ammId } : {}), ...(sell ? { sell } : {}) },
-      ]);
-    }
-  }
-  for (const u of [...updates].sort((a, b) => a.offset - b.offset)) {
-    type Side = { leg: TcAllocationLeg; ammId: string };
-    const trades = new Map<string, { receive?: Side; send?: Side; doubled?: boolean }>();
-    for (const c of u.allocations) {
-      for (const leg of c.legs) {
-        const trade = tradeOf(leg.transferLegId);
-        if (trade === undefined) continue;
-        const t = trades.get(trade) ?? {};
-        // One trade id on two legs of one side is not one trade: tie neither.
-        if (t[leg.side]) t.doubled = true;
-        t[leg.side] = { leg, ammId: c.ammId };
-        trades.set(trade, t);
-      }
-    }
-    for (const t of trades.values()) {
-      const { receive, send } = t;
-      if (!receive || !send || t.doubled) continue;
-      // A fill in the settlement's own transaction counts against a tie but
-      // cannot take one.
-      const before = (fills.get(key(receive.leg.instrumentId, receive.leg.amount)) ?? []).filter((f) => f.offset <= u.offset);
-      const fill = before.length === 1 ? before[0] : undefined;
-      if (
-        !fill ||
-        fill.offset >= u.offset ||
-        fill.tied ||
-        fill.ammId !== receive.ammId ||
-        fill.ammId !== send.ammId ||
-        fill.sell === undefined ||
-        fill.sell.instrument.id !== send.leg.instrumentId ||
-        !sameAmount(fill.sell.amount, send.leg.amount)
-      ) {
-        continue;
-      }
-      fill.tied = true;
-      receive.leg.orderCid = fill.orderCid;
-      send.leg.orderCid = fill.orderCid;
-    }
-  }
-}
-
-/** How far before a page the relay reads the party's fills, in ledger
- *  offsets, and in at most how many reads. */
-export const TC_LINK_LOOKBACK_SPAN = 10_000;
-export const TC_LINK_LOOKBACK_READS = 3;
-
-/**
- * Tie the page's settled trades to fills (see `linkSettlementsToFills`).
- *
- * A fill before the page can still be unsettled, and the relay can only weigh
- * the fills it has read. So unless the page starts at the ledger's start,
- * nothing is tied until the `TC_LINK_LOOKBACK_SPAN` offsets before the page
- * have been read whole: at most `TC_LINK_LOOKBACK_READS` reads of
- * `TC_UPDATES_MAX_LIMIT` rows, each allowed by `allowRead` (the caller's read
- * budget), started within `deadlineMs`. Nothing is tied either when what was
- * read holds a fill whose output could not be read or an order closed by an
- * unknown choice. `complete` says whether the ties could be weighed; when not,
- * the page goes out with no order ids.
- *
- * Known limit: a fill the relay has not read is not weighed. That is a fill
- * older than the window that is still unsettled (a settlement backlog of
- * hours has happened), or one from before the party's history on this
- * participant (a party added by an ACS import). If exactly one fill read
- * before its settlement has the same pool, input and output to the tenth
- * decimal, that settlement is tied to it, and that fill's own settlement then
- * stays untied. An order id is the best reading of what was read, not proof.
- * Closing this needs the unsettled fills carried from page to page in the
- * cursor.
- */
-export async function linkSettlementsWithLookback(
-  party: string,
-  page: readonly TcUpdate[],
-  after: number,
-  read: (
-    beginExclusive: number,
-    endInclusive: number,
-    limit: number
-  ) => Promise<{ transactions: readonly LedgerTransaction[]; rows: number; lastOffset?: number | undefined }>,
-  opts: { allowRead?: () => boolean; deadlineMs?: number } = {}
-): Promise<{ reads: number; complete: boolean }> {
-  for (const u of page) for (const c of u.allocations) for (const l of c.legs) delete l.orderCid;
-  if (!hasTrade(page)) return { reads: 0, complete: true };
-  if (after <= 0) {
-    if (hasUnreadableFill(page)) return { reads: 0, complete: false };
-    linkSettlementsToFills(page);
-    return { reads: 0, complete: true };
-  }
-  const started = Date.now();
-  const earlier: LedgerTransaction[] = [];
-  let cursor = Math.max(0, after - TC_LINK_LOOKBACK_SPAN);
-  let reads = 0;
-  while (reads < TC_LINK_LOOKBACK_READS) {
-    if (opts.deadlineMs !== undefined && Date.now() - started > opts.deadlineMs) break;
-    if (opts.allowRead && !opts.allowRead()) break;
-    const back = await read(cursor, after, TC_UPDATES_MAX_LIMIT);
-    reads++;
-    earlier.push(...back.transactions);
-    if (back.rows < TC_UPDATES_MAX_LIMIT) {
-      const before = await summarizeTradecraftPage(party, earlier);
-      if (hasUnreadableFill(before) || hasUnreadableFill(page)) return { reads, complete: false };
-      linkSettlementsToFills([...before, ...page]);
-      return { reads, complete: true };
-    }
-    if (back.lastOffset === undefined || back.lastOffset <= cursor) break;
-    cursor = back.lastOffset;
-  }
-  return { reads, complete: false };
 }
