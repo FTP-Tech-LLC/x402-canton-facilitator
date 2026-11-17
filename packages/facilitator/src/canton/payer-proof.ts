@@ -48,7 +48,7 @@ import {
  * budget refuses it in about 2 ms, and the costliest payment within it (dots
  * again) hashes in about 30 ms.
  */
-const PAYMENT_MAX_HASH_STEPS = 10_000;
+export const PAYMENT_MAX_HASH_STEPS = 10_000;
 
 /**
  * Reads an external party's raw Ed25519 signing keys from synchronizer topology.

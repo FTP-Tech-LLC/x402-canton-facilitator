@@ -33,7 +33,7 @@ import {
 } from "@ftptech/x402-canton-core";
 import type { DecodedInlinePayload, FacilitatorRequest } from "@ftptech/x402-canton-core";
 import { recomputeHash } from "@ftptech/x402-canton-ledger";
-import { canonicalTxHashHex } from "../canton/payer-proof.js";
+import { canonicalTxHashHex, PAYMENT_MAX_HASH_STEPS } from "../canton/payer-proof.js";
 import { ScanBudgetRefusedError } from "../scan-budget.js";
 
 /** How much future an `executeBefore` must have left to be worth relaying.
@@ -130,7 +130,13 @@ export async function inlineRepeatOf(
       ...(typeof extra.memo === "string" && extra.memo.length > 0 ? { memo: extra.memo } : {}),
       nowMs: Number(pt.preparationTime / 1000n),
     });
-    const key = Buffer.from(await recomputeHash(preparedB64), "base64").toString("hex");
+    // The same step budget as the payer proof: an unbudgeted hash let a crafted
+    // repeat (a dotted name with tens of thousands of parts) hold /settle for
+    // a few hundred milliseconds. Honest payments need under 4 000 steps.
+    const key = Buffer.from(
+      await recomputeHash(preparedB64, { maxSteps: PAYMENT_MAX_HASH_STEPS }),
+      "base64"
+    ).toString("hex");
     return { key, payer };
   } catch {
     return null;
