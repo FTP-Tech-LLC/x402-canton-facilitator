@@ -27,11 +27,13 @@ export interface FacilitatorConfig {
    *   - unset            → `"loopback"` (127.0.0.1/8 + ::1/128) — safe default.
    *   - `"false"`        → no proxy trusted (`req.ip` = socket peer).
    *   - `"true"`         → trust the whole chain (UNSAFE; logs a startup warn).
-   *   - an integer `"N"` → trust N hops (proxy-addr hop count).
+   *   - an integer `"N"` → refused at startup: Fastify 5.12 reads a hop count
+   *                        as trust-nobody, which would silently turn `req.ip`
+   *                        into the proxy's address.
    *   - anything else    → comma-separated IP/CIDR/keyword list of trusted
    *                        proxies (e.g. `"10.0.0.0/8"` or `"loopback,10.1.2.3"`).
    */
-  trustProxy: boolean | number | string | string[];
+  trustProxy: boolean | string | string[];
   network: "canton:devnet" | "canton:testnet" | "canton:mainnet";
   participantUrl: string;            // JSON Ledger API v2 base URL
   facilitatorParty: string;          // our facilitator party id
@@ -133,9 +135,18 @@ export interface FacilitatorConfig {
    *
    * Absent → no key source → the verifier refuses every inline payment. That is
    * the correct fail-closed default and is what a deploy does today.
+   *
+   * CANTON_X402_TOPOLOGY_READER_URL may list several readers, comma-separated,
+   * in order of preference. They share one token.
    */
-  topologyReaderUrl: string | undefined;
+  topologyReaderUrl: string[] | undefined;
   topologyReaderToken: string | undefined;
+  /**
+   * How long the last keys a reader returned for a payer may stand in when no
+   * reader answers (CANTON_X402_TOPOLOGY_READER_STALE_HOURS, default 168,
+   * 0 turns it off). See canton/last-known-keys.ts.
+   */
+  topologyReaderStaleMaxMs: number;
   /**
    * Which merchants the INLINE carriage will burn our own traffic for.
    *
@@ -440,6 +451,15 @@ export interface FacilitatorConfig {
    */
   onboardCoHostParticipantUid: string | undefined;
   /**
+   * Protocol version new wallets' topology is serialized for
+   * (`CANTON_X402_ONBOARD_TOPOLOGY_PV`). Default 36: the v30 format agent
+   * wallets up to 2.8 decode before signing. A PV 37 synchronizer (the
+   * 12.12.2026 LSU) still accepts it, while its own default, v31, moves the
+   * party's keys to a field those wallets refuse. `auto` omits the field and
+   * lets the participant pick.
+   */
+  onboardTopologyProtocolVersion: number | undefined;
+  /**
    * Grant our ledger user CanActAs on each wallet onboarded, on the primary
    * (`CANTON_GRANT_PARTY_RIGHTS`, default true). Set false where the user holds
    * CanReadAsAnyParty + CanExecuteAsAnyParty instead: per-party grants are then
@@ -679,7 +699,7 @@ export type DiscoveryResource = {
  */
 export function parseTrustProxy(
   raw: string | undefined
-): boolean | number | string[] {
+): boolean | string[] {
   // Default: trust only the loopback proxy (the documented Caddy/Nginx deploys
   // front the facilitator from 127.0.0.1). This is the SAFE default — a
   // client-forged XFF left of the proxy's appended real-client entry is
@@ -688,8 +708,15 @@ export function parseTrustProxy(
   const v = raw.trim();
   if (v.toLowerCase() === "false") return false;
   if (v.toLowerCase() === "true") return true; // UNSAFE; warned at startup.
-  // A bare non-negative integer → hop count.
-  if (/^\d+$/.test(v)) return Number(v);
+  // A bare integer used to be a hop count. Refuse it rather than let it mean
+  // something else now.
+  if (/^\d+$/.test(v)) {
+    throw new Error(
+      `CANTON_X402_TRUST_PROXY="${v}": a hop count is no longer accepted. Fastify 5.12 ` +
+        "treats a number as trust-nobody, so req.ip would silently become the proxy. " +
+        "Set the proxy's IP/CIDR or a preset such as uniquelocal or loopback."
+    );
+  }
   // Otherwise a comma-separated IP/CIDR/keyword list of trusted proxies.
   return v
     .split(",")
@@ -1168,8 +1195,25 @@ export function loadConfig(): FacilitatorConfig {
       const raw = Number(process.env.CANTON_X402_SETTLE_BREAKER_MIN_SAMPLES);
       return Number.isFinite(raw) && raw >= 1 ? raw : 10;
     })(),
-    topologyReaderUrl: process.env.CANTON_X402_TOPOLOGY_READER_URL,
+    topologyReaderUrl: (() => {
+      const list = (process.env.CANTON_X402_TOPOLOGY_READER_URL ?? "")
+        .split(",")
+        .map((u) => u.trim())
+        .filter((u) => u.length > 0);
+      return list.length > 0 ? list : undefined;
+    })(),
     topologyReaderToken: process.env.CANTON_X402_TOPOLOGY_READER_TOKEN,
+    topologyReaderStaleMaxMs: (() => {
+      const raw = process.env.CANTON_X402_TOPOLOGY_READER_STALE_HOURS;
+      if (raw === undefined || raw.trim() === "") return 168 * 3_600_000;
+      const hours = Number(raw);
+      if (!Number.isInteger(hours) || hours < 0) {
+        throw new Error(
+          `CANTON_X402_TOPOLOGY_READER_STALE_HOURS must be a whole number of hours, 0 to turn it off (got "${raw}")`
+        );
+      }
+      return hours * 3_600_000;
+    })(),
     inlineMerchantPolicy: (() => {
       const raw = process.env.CANTON_X402_INLINE_MERCHANT_POLICY;
       if (raw === undefined || raw.trim() === "") return "open" as const;
@@ -1336,6 +1380,16 @@ export function loadConfig(): FacilitatorConfig {
     oidcScope: process.env.OIDC_SCOPE,
     ledgerApiAudience: process.env.LEDGER_API_AUDIENCE,
     onboardCoHostParticipantUid: coHostUid,
+    onboardTopologyProtocolVersion: (() => {
+      const raw = (process.env.CANTON_X402_ONBOARD_TOPOLOGY_PV ?? "").trim();
+      if (raw === "") return 36;
+      if (raw.toLowerCase() === "auto") return undefined;
+      const pv = Number(raw);
+      if (!Number.isInteger(pv) || pv < 1) {
+        throw new Error(`CANTON_X402_ONBOARD_TOPOLOGY_PV must be a protocol version such as 36, or auto (got "${raw}")`);
+      }
+      return pv;
+    })(),
     grantPartyRights: process.env.CANTON_GRANT_PARTY_RIGHTS !== "false",
     secondaryParticipant: secondaryUrl
       ? {

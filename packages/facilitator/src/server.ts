@@ -54,7 +54,6 @@ async function main(): Promise<void> {
     // limit once a wallet holds many amulets. /verify and /settle bodies stay
     // small and are rate-limited, so the wider limit is not an abuse surface.
     bodyLimit: 8 * 1024 * 1024,
-    disableRequestLogging: false,
     // The facilitator runs behind a reverse proxy (Caddy/Nginx). `trustProxy`
     // controls how Fastify resolves `req.ip` from X-Forwarded-For — this is the
     // rate-limit key for /verify and the 2nd key for /settle, so it must NOT be
@@ -71,7 +70,7 @@ async function main(): Promise<void> {
       "CANTON_X402_TRUST_PROXY=true trusts the ENTIRE X-Forwarded-For chain — " +
         "req.ip becomes client-forgeable and the /verify + /settle IP rate-limits " +
         "can be evaded by rotating X-Forwarded-For. Set it to your proxy's IP/CIDR " +
-        "(or a hop count, or leave unset for loopback-only) instead."
+        "(or a preset such as uniquelocal, or leave unset for loopback-only) instead."
     );
   }
 

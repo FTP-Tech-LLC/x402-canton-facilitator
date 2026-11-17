@@ -124,6 +124,12 @@ export interface PayerProofOptions {
    * an apparent attack; the truth is their own dependency is down.
    */
   onLookupError?: (party: string, err: unknown) => void;
+  /** Called when the key lookup returned keys, so the outcome metric can
+   *  show the share of lookups that failed, not only their count. */
+  onLookupOk?: (party: string) => void;
+  /** Called with the payer's usable keys once its signature verified against
+   *  one of them (canton/last-known-keys.ts keeps them for reader outages). */
+  onVerified?: (party: string, keys: Buffer[]) => void;
   /**
    * Called when the hash recompute throws. The payment is refused as
    * `signature_invalid` either way, so this is the only place to tell a graph
@@ -229,6 +235,7 @@ export function createPayerProofVerifier(
     let published: Buffer[];
     try {
       published = await opts.fetchPayerSigningKey(input.payer);
+      opts.onLookupOk?.(input.payer);
     } catch (err) {
       // A lookup that failed is "cannot verify", never "no keys, so accept".
       // Say so out loud: the refusal that reaches the client is
@@ -277,6 +284,7 @@ export function createPayerProofVerifier(
         // Ed25519 signs the message directly, so the algorithm argument is null
         // and the "message" is the recomputed digest the payer signed.
         if (cryptoVerify(null, recomputed, key, signature)) {
+          opts.onVerified?.(input.payer, usable);
           return {
             verified: true,
             preparedTxHashHex: recomputed.toString("hex"),

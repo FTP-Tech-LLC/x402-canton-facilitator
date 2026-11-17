@@ -102,10 +102,14 @@ describe("reader → verifier, end to end on the key format", () => {
       "base64"
     );
 
+    let oks = 0;
     const verify = createPayerProofVerifier({
       fetchPayerSigningKey: reader(() =>
         json({ party: PARTY, keys: [{ derBase64: spki.toString("base64") }] })
       ),
+      onLookupOk: () => {
+        oks++;
+      },
     });
 
     const r = await verify({
@@ -117,6 +121,7 @@ describe("reader → verifier, end to end on the key format", () => {
     });
     expect(r.verified).toBe(true);
     expect(r.preparedTxHashHex).toBe(digest.toString("hex"));
+    expect(oks).toBe(1);
   });
 
   it("refuses a key that is not an Ed25519 SPKI, whatever the reader claims", async () => {
@@ -250,3 +255,129 @@ describe("every lookup failure names why", () => {
     }
   });
 })
+
+describe("several readers", () => {
+  const ok = () => json({ party: PARTY, keys: [{ derBase64: DER }] });
+  const down = () => new Response("", { status: 503 });
+
+  function readers(
+    handlers: Record<string, () => Response | Promise<Response>>,
+    extra: { now?: () => number; failuresToOpen?: number; cooldownMs?: number } = {}
+  ) {
+    const asked: string[] = [];
+    const lookup = createTopologyReaderLookup({
+      baseUrl: Object.keys(handlers),
+      token: "tok",
+      ...extra,
+      fetchImpl: (async (u: string) => {
+        const base = Object.keys(handlers).find((b) => u.startsWith(b))!;
+        asked.push(base);
+        return handlers[base]!();
+      }) as never,
+    });
+    return { lookup, asked };
+  }
+
+  it("asks the next reader when the first one is down", async () => {
+    const { lookup, asked } = readers({ "http://a:1": down, "http://b:1": ok });
+    const keys = await lookup(PARTY);
+    expect(keys[0]!.toString("base64")).toBe(DER);
+    expect(asked).toEqual(["http://a:1", "http://b:1"]);
+  });
+
+  it("takes no_key from the first reader as final", async () => {
+    const { lookup, asked } = readers({
+      "http://a:1": () => json({ keys: [] }),
+      "http://b:1": ok,
+    });
+    await expect(lookup(PARTY)).rejects.toMatchObject({ reason: "no_key" });
+    expect(asked).toEqual(["http://a:1"]);
+  });
+
+  it("reports a broken reader next to a down one as reader_error, never as an outage", async () => {
+    const { lookup } = readers({
+      "http://a:1": down,
+      "http://b:1": () => new Response("", { status: 401 }),
+    });
+    await expect(lookup(PARTY)).rejects.toMatchObject({ reason: "reader_error" });
+  });
+
+  it("skips a reader after 3 outages in a row and tries it again after the cooldown", async () => {
+    let t = 1_000;
+    const { lookup, asked } = readers(
+      { "http://a:1": down, "http://b:1": ok },
+      { now: () => t, cooldownMs: 10_000 }
+    );
+    for (let i = 0; i < 3; i++) await lookup(PARTY);
+    asked.length = 0;
+    await lookup(PARTY);
+    expect(asked).toEqual(["http://b:1"]);
+    t += 10_001;
+    asked.length = 0;
+    await lookup(PARTY);
+    expect(asked).toEqual(["http://a:1", "http://b:1"]);
+  });
+
+  it("fails fast, as an outage, when every reader is cooling down", async () => {
+    const t = 1_000;
+    const { lookup, asked } = readers({ "http://a:1": down }, { now: () => t });
+    for (let i = 0; i < 3; i++) {
+      await expect(lookup(PARTY)).rejects.toMatchObject({ reason: "unavailable" });
+    }
+    asked.length = 0;
+    await expect(lookup(PARTY)).rejects.toMatchObject({ reason: "unavailable" });
+    expect(asked).toEqual([]);
+  });
+
+  it("forgets past outages once a reader answers", async () => {
+    let fail = true;
+    const { lookup, asked } = readers({
+      "http://a:1": () => (fail ? down() : ok()),
+      "http://b:1": ok,
+    });
+    await lookup(PARTY);
+    await lookup(PARTY);
+    fail = false;
+    await lookup(PARTY);
+    fail = true;
+    await lookup(PARTY);
+    await lookup(PARTY);
+    asked.length = 0;
+    await lookup(PARTY);
+    expect(asked).toEqual(["http://a:1", "http://b:1"]);
+  });
+
+  it("after the cooldown lets one lookup probe a dead reader while the others skip it", async () => {
+    let t = 1_000;
+    let release: (() => void) | undefined;
+    let probes = 0;
+    const lookup = createTopologyReaderLookup({
+      baseUrl: ["http://a:1", "http://b:1"],
+      token: "tok",
+      now: () => t,
+      cooldownMs: 10_000,
+      fetchImpl: (async (u: string) => {
+        if (u.startsWith("http://b:1")) return ok();
+        if (t < 2_000) return down();
+        probes++;
+        // The probe hangs until released, like a reader that drops packets.
+        await new Promise<void>((r) => (release = r));
+        return down();
+      }) as never,
+    });
+    for (let i = 0; i < 3; i++) await lookup(PARTY);
+    t = 20_000;
+    const first = lookup(PARTY);
+    await new Promise((r) => setTimeout(r, 0));
+    const others = await Promise.all(Array.from({ length: 5 }, () => lookup(PARTY)));
+    expect(others).toHaveLength(5);
+    expect(probes).toBe(1);
+    release!();
+    await first;
+  });
+
+  it("refuses an empty reader list at construction", () => {
+    expect(() => createTopologyReaderLookup({ baseUrl: [" ", ""], token: "tok" })).toThrow();
+  });
+});
+

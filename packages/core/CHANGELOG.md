@@ -1,5 +1,11 @@
 # @ftptech/x402-canton-core
 
+## 1.9.2
+
+### Patch Changes
+
+- A preapproval provider's own `FeaturedAppRight` may carry operational parties (`opsParties`, Splice 0.10 / splice-amulet 0.1.25, MainNet from 2026-12-01). They are admitted in that right's argument only, when the DSO alone signed it and its provider is the proven preapproval provider (or the receiver providing its own). Everywhere else they stay foreign. Without this, ops parties on a provider's right would make every payment to its merchants fail.
+
 ## 1.9.1
 
 ### Patch Changes

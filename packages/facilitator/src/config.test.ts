@@ -55,6 +55,7 @@ const OPTIONAL = [
   "CANTON_SECONDARY_OIDC_CLIENT_SECRET",
   "CANTON_SECONDARY_LEDGER_API_AUDIENCE",
   "CANTON_X402_ONBOARD_CO_HOST_UID",
+  "CANTON_X402_ONBOARD_TOPOLOGY_PV",
   "CANTON_GRANT_PARTY_RIGHTS",
   "CANTON_SECONDARY_GRANT_PARTY_RIGHTS",
   "CANTON_X402_SETTLE_ANSWERS",
@@ -180,6 +181,19 @@ describe("loadConfig", () => {
     process.env.CANTON_X402_ONBOARD_CO_HOST_UID = NODE2_UID;
     process.env.CANTON_FACILITATOR_MEMBER_ID = `PAR::${NODE2_UID}`;
     expect(() => loadConfig()).toThrow(/must be the secondary/);
+  });
+
+  it("new wallets' topology is pinned to PV 36 unless told otherwise", () => {
+    minimal();
+    expect(loadConfig().onboardTopologyProtocolVersion).toBe(36);
+    process.env.CANTON_X402_ONBOARD_TOPOLOGY_PV = "37";
+    expect(loadConfig().onboardTopologyProtocolVersion).toBe(37);
+    process.env.CANTON_X402_ONBOARD_TOPOLOGY_PV = "auto";
+    expect(loadConfig().onboardTopologyProtocolVersion).toBeUndefined();
+    for (const bad of ["0", "-1", "36.5", "v36"]) {
+      process.env.CANTON_X402_ONBOARD_TOPOLOGY_PV = bad;
+      expect(() => loadConfig(), bad).toThrow(/CANTON_X402_ONBOARD_TOPOLOGY_PV/);
+    }
   });
 
   it("per-party rights grants are on by default and can be turned off per participant", () => {
@@ -955,10 +969,10 @@ describe("parseTrustProxy (security: forgeable req.ip mitigation)", () => {
     expect(parseTrustProxy("True")).toBe(true);
   });
 
-  it("a bare integer → hop count (number)", () => {
-    expect(parseTrustProxy("1")).toBe(1);
-    expect(parseTrustProxy("2")).toBe(2);
-    expect(parseTrustProxy("0")).toBe(0);
+  it("a bare integer is refused: Fastify 5.12 reads a hop count as trust-nobody", () => {
+    for (const v of ["0", "1", "2"]) {
+      expect(() => parseTrustProxy(v), v).toThrow(/hop count is no longer accepted/);
+    }
   });
 
   it("a single CIDR/IP/keyword → one-element trust list", () => {

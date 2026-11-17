@@ -37,12 +37,12 @@ import {
 } from "../rate-limit.js";
 import { clientIp, hasTrustedKey, ipBucket, timingSafeEqualStr } from "./common.js";
 import {
-  linkSettlementsWithLookback,
   parseTradecraftUpdatesQuery,
   summarizeTradecraftPage,
   tradecraftReadIds,
   tradecraftUpdatesFilter,
 } from "./tradecraft-updates.js";
+import { TcFillIndexes, tagFromFillIndex } from "./tradecraft-fill-index.js";
 import { FaucetService, FaucetPreSubmitError, type FaucetSubmit } from "../canton/faucet.js";
 import { UnfundedFeePartyError } from "../canton/preapproval.js";
 import { SubmissionOutcomeUnknownError } from "../canton/transfer-factory.js";
@@ -219,6 +219,9 @@ export interface WalletRelayServices {
         hosts(party: string): Promise<boolean | undefined>;
       }
     | undefined;
+  /** Protocol version new wallets' topology is serialized for (see
+   *  config.onboardTopologyProtocolVersion). Absent: the participant's own. */
+  onboardTopologyProtocolVersion?: number | undefined;
   /** Co-host new wallets on this second participant too (both confirm,
    *  threshold 1), so they never need replicating. Absent: primary only. */
   onboardCoHost?:
@@ -1167,6 +1170,12 @@ export async function registerWalletRoutes(
         ...(svc.onboardCoHost
           ? { otherConfirmingParticipantUids: [svc.onboardCoHost.participantUid], confirmationThreshold: 1 }
           : { confirmationThreshold: 0 }),
+        // Pinned so the wallet gets a topology format it can check: after a
+        // protocol upgrade the participant's default moves the party's keys
+        // to a field older wallets refuse to sign.
+        ...(svc.onboardTopologyProtocolVersion !== undefined
+          ? { protocolVersion: svc.onboardTopologyProtocolVersion }
+          : {}),
       });
       // The relay just built this party for this key (the namespace IS the
       // key's fingerprint). Remember it for read proofs; trusted only once the
@@ -2194,8 +2203,8 @@ export async function registerWalletRoutes(
     }
   });
 
-  /** Time the order-id lookup may start new reads in (each read has its own timeout). */
-  const TC_LINK_DEADLINE_MS = 5_000;
+  /** Each party's settlements tied to its fills, over its whole history. */
+  const fillIndexes = new TcFillIndexes();
 
   // ── A party's Tradecraft queued-mode history ──
   //    Fills, cancellations and settlements, so a trader can tell a filled
@@ -2208,8 +2217,14 @@ export async function registerWalletRoutes(
   //    carries its output from the venue's batch helper of the same package,
   //    which the read adds on its own. With `orderCids=true` a settlement leg
   //    also carries the order it settles when the amounts leave one choice,
-  //    and `orderCidsComplete` says whether the records before the page could
-  //    be read for that (see linkSettlementsWithLookback).
+  //    weighed against every fill of the party's since the ledger's start
+  //    (see tradecraft-fill-index.ts). `orderCidsComplete: false` says the
+  //    page was not weighed. Mostly for now: the relay is still reading the
+  //    party's history (after a restart) or a read failed; read the page
+  //    again later. It stays false for a page older than the ties the relay
+  //    keeps, and for every page once the party's history holds a record the
+  //    relay cannot read or starts after its first Tradecraft allocation (a
+  //    party added by an ACS import).
   //
   //    Only for a party this facilitator hosts. With read rights for any
   //    party, the participant would answer for a stranger too, from what it
@@ -2270,27 +2285,30 @@ export async function registerWalletRoutes(
       const filter = tradecraftUpdatesFilter(party, ids);
       const page = await readUpdates({ filter, beginExclusive: q.after, endInclusive: end, limit: q.limit });
       const complete = page.rows < q.limit;
+      // Resume from here. A full page may stop mid-range; an exhausted range
+      // resumes at the ledger end it was read against.
+      const next = complete ? end : (page.lastOffset ?? q.after);
       const updates = await summarizeTradecraftPage(party, page.transactions);
       // On request, tie settlements to the fills they settle. That needs the
-      // party's records before the page too: at most three more reads, each
-      // charged to the caller's read budget. When they fail or are refused,
-      // the page still goes out, only without order ids.
+      // party's records before the page too. Its fill index holds them once it
+      // has reached the page, so a reader that follows the ledger pays no more
+      // reads; an index behind the page reads the rest, each read charged to
+      // the caller's read budget. When it cannot finish, the page still goes
+      // out, only without order ids.
       let orderCidsComplete: boolean | undefined;
       if (q.orderCids) {
         try {
-          const linked = await linkSettlementsWithLookback(
-            party,
-            updates,
-            q.after,
-            (beginExclusive, endInclusive, limit) => readUpdates({ filter, beginExclusive, endInclusive, limit }),
-            { allowRead: () => readBudget(req), deadlineMs: TC_LINK_DEADLINE_MS }
-          );
-          orderCidsComplete = linked.complete;
+          orderCidsComplete = await tagFromFillIndex(fillIndexes, { participant, party }, { after: q.after, next, end, updates }, {
+            read: (beginExclusive, endInclusive, limit) => readUpdates({ filter, beginExclusive, endInclusive, limit }),
+            ledgerEnd: async () => (await client.getLedgerEnd()).offset,
+            allowRead: () => readBudget(req),
+            warn: (detail, message) => req.log.warn({ party, ...detail }, `wallet relay tradecraft-updates: ${message}`),
+          });
         } catch (err) {
-          for (const u of updates) for (const c of u.allocations) for (const l of c.legs) delete l.orderCid;
           orderCidsComplete = false;
-          req.log.warn({ party, err: err instanceof Error ? err.message : String(err) }, "wallet relay tradecraft-updates: could not read before the page to tie settlements to fills");
+          req.log.warn({ party, err: err instanceof Error ? err.message : String(err) }, "wallet relay tradecraft-updates: could not tie settlements to fills");
         }
+        if (!orderCidsComplete) for (const u of updates) for (const c of u.allocations) for (const l of c.legs) delete l.orderCid;
       }
       const unread = updates.flatMap((u) => (u.anomalies ?? []).map((a) => `${u.offset}: ${a.detail}`));
       const unknownChoices = updates.flatMap((u) => u.orders.filter((o) => o.kind === "archived").map((o) => `${u.offset}: ${o.choice}`));
@@ -2305,9 +2323,7 @@ export async function registerWalletRoutes(
         participant,
         withdrawalsRead,
         after: q.after,
-        // Resume from here. A full page may stop mid-range; an exhausted range
-        // resumes at the ledger end it was read against.
-        next: complete ? end : (page.lastOffset ?? q.after),
+        next,
         ledgerEnd: end,
         complete,
         ...(orderCidsComplete !== undefined ? { orderCidsComplete } : {}),

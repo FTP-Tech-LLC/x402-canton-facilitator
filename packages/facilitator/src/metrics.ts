@@ -93,7 +93,7 @@ export type SendOutcome =
  * nothing usable. Both refuse the payment — correctly — but only one of them
  * is our outage, and on the wire they are the same refusal.
  */
-export type InlineKeyLookupOutcome = "ok" | "unavailable" | "no_key";
+export type InlineKeyLookupOutcome = "ok" | "stale" | "unavailable" | "no_key";
 
 /**
  * Why the payer-proof hash recompute failed, labelled on
@@ -234,7 +234,7 @@ export function createMetrics(opts?: {
 
   const inlineKeyLookupTotal = new Counter({
     name: "x402_facilitator_inline_key_lookup_total",
-    help: "payer signing-key lookups against the topology reader, by outcome: ok, unavailable (our reader could not answer), no_key (the party publishes none)",
+    help: "payer signing-key lookups against the topology reader, by outcome: ok (keys returned, fresh or last known), stale (no reader gave a usable answer, down or misconfigured, and the keys of this payer's last verified payment were used; also counted in ok), unavailable (no reader could answer and no usable copy), no_key (the party publishes none)",
     labelNames: ["outcome"] as const,
     registers: [registry],
   });
